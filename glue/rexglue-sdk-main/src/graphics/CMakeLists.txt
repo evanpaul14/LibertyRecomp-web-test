@@ -140,6 +140,12 @@ function(rexgpu_configure_plugin target export_name)
     endif()
 endfunction()
 
+# GPU plugins are dlopen()ed at runtime. The web build has no plugin loader
+# and no GPU backend yet (WebGPU is future work), so it runs headless.
+if(EMSCRIPTEN)
+    return()
+endif()
+
 add_library(rexgpu-xenos SHARED
     plugin_main.cpp
     ${REXGPU_XENOS_SOURCES}
