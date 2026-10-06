@@ -22,7 +22,7 @@
 #include <ranges>
 #include <vector>
 
-#if REX_PLATFORM_MAC
+#if REX_PLATFORM_MAC || REX_PLATFORM_WEB
 #include <sys/select.h>
 #endif
 
