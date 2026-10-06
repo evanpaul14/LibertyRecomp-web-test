@@ -28,9 +28,9 @@ endif()
 #   -sMEMORY64        64-bit linear memory (the guest needs a full 4 GB window)
 #   -pthread          guest threads map to Web Workers on SharedArrayBuffer
 #   -fwasm-exceptions native wasm exception handling (toml++/CLI11/std throw)
-#   -msimd128 -msse4.2  recompiled SSE intrinsics lower to WASM SIMD128 via
-#                     Emscripten's x86 compatibility headers
-set(_LIBERTY_WEB_FLAGS "-sMEMORY64=1 -pthread -fwasm-exceptions -msimd128 -msse4.2")
+#   -msimd128         WASM SIMD128; SIMDe (used by the recompiled VMX code)
+#                     maps its SSE-style API onto it natively
+set(_LIBERTY_WEB_FLAGS "-sMEMORY64=1 -pthread -fwasm-exceptions -msimd128")
 set(CMAKE_C_FLAGS_INIT   "${_LIBERTY_WEB_FLAGS}")
 set(CMAKE_CXX_FLAGS_INIT "${_LIBERTY_WEB_FLAGS}")
 set(CMAKE_EXE_LINKER_FLAGS_INIT "${_LIBERTY_WEB_FLAGS}")

@@ -137,6 +137,19 @@ struct CRRegister {
     eq = !un && (left == right);
   }
 
+#if defined(SIMDE_WASM_SIMD128_NATIVE) && !defined(SIMDE_X86_SSE2_NATIVE)
+  // On WebAssembly SIMDe maps both simde__m128 and simde__m128i to v128_t,
+  // so the two overloads below would collide. The codegen always pairs the
+  // float form with imm 0xF (4 lanes) and the byte form with imm 0xFFFF
+  // (16 lanes), so pick the movemask width from imm instead.
+  inline void setFromMask(v128_t mask, int imm) noexcept {
+    int m = imm == 0xFFFF ? simde_mm_movemask_epi8(mask) : simde_mm_movemask_ps(mask);
+    lt = m == imm;
+    gt = 0;
+    eq = m == 0;
+    so = 0;
+  }
+#else
   inline void setFromMask(simde__m128 mask, int imm) noexcept {
     int m = simde_mm_movemask_ps(mask);
     lt = m == imm;
@@ -152,6 +165,7 @@ struct CRRegister {
     eq = m == 0;
     so = 0;
   }
+#endif
 };
 
 //=============================================================================

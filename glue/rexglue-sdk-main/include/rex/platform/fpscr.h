@@ -82,6 +82,34 @@ struct FPSCRPlatform {
   }
 };
 
+#elif defined(__wasm__)
+
+// WebAssembly has no FP control register: arithmetic is always
+// round-to-nearest-even, denormals are never flushed and traps never fire.
+// Keep a per-thread virtual control word so guest reads of FPSCR return what
+// the guest last wrote, but the rounding and flush modes have no effect on
+// host arithmetic.
+struct FPSCRPlatform {
+  // Layout mirrors the AArch64 FPCR bits so the shared mask logic applies.
+  static constexpr size_t RoundShift = 22;
+  static constexpr size_t RoundMaskVal = 3 << RoundShift;
+  static constexpr size_t FlushMask = (1 << 19) | (1 << 24);
+  static constexpr size_t GuestToHost[] = {0 << RoundShift, 3 << RoundShift, 1 << RoundShift,
+                                           2 << RoundShift};
+  static constexpr u32 ExceptionMask = 0;
+
+  static inline u32& virtual_csr() noexcept {
+    static thread_local u32 csr = 0;
+    return csr;
+  }
+
+  static inline u32 getcsr() noexcept { return virtual_csr(); }
+
+  static inline void setcsr(u32 csr) noexcept { virtual_csr() = csr; }
+
+  static inline void InitHostExceptions(u32&) noexcept {}
+};
+
 #else
 #error "Missing implementation for FPSCR."
 #endif
