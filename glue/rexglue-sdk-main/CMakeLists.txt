@@ -23,7 +23,13 @@ option(REXGLUE_BUILD_TESTS       "Build PPC instruction and unit tests" OFF)
 option(REXGLUE_BUILD_GTA4_RECOMP "Build the bundled GTA IV recomp application" OFF)
 option(REXGLUE_ENABLE_SANITIZERS "Enable UndefinedBehaviorSanitizer" OFF)
 option(REXGLUE_ENABLE_FIDELITYFX "Enable optional AMD FidelityFX integration (experimental)" OFF)
-option(REXGLUE_ENABLE_TRACY                "Enable Tracy profiler integration" ON)
+# Tracy needs native sockets and its own sampling thread, so it is off on web.
+if(EMSCRIPTEN)
+    set(_REXGLUE_TRACY_DEFAULT OFF)
+else()
+    set(_REXGLUE_TRACY_DEFAULT ON)
+endif()
+option(REXGLUE_ENABLE_TRACY                "Enable Tracy profiler integration" ${_REXGLUE_TRACY_DEFAULT})
 option(REXGLUE_ENABLE_PERF_COUNTERS        "Enable lightweight perf counter registry and overlay" ON)
 # Propagate profiling defines globally (compiled out in Release)
 if(REXGLUE_ENABLE_TRACY)
@@ -36,7 +42,12 @@ endif()
 # Graphics backend selection
 # D3D12: Windows only, ON by default.
 # Vulkan: Cross-platform, ON by default on Linux, OFF by default on Windows.
-if(WIN32)
+# Web (Emscripten): neither is available in a browser. The web build runs
+# headless until a WebGPU backend exists (see docs/WEB_BUILDING.md).
+if(EMSCRIPTEN)
+    set(REXGLUE_USE_D3D12 OFF)
+    set(REXGLUE_USE_VULKAN OFF CACHE BOOL "" FORCE)
+elseif(WIN32)
     option(REXGLUE_USE_D3D12  "Enable D3D12 graphics backend" ON)
     option(REXGLUE_USE_VULKAN "Enable Vulkan graphics backend" OFF)
 else()
@@ -44,7 +55,7 @@ else()
     option(REXGLUE_USE_VULKAN "Enable Vulkan graphics backend" ON)
 endif()
 
-if(NOT REXGLUE_USE_D3D12 AND NOT REXGLUE_USE_VULKAN)
+if(NOT EMSCRIPTEN AND NOT REXGLUE_USE_D3D12 AND NOT REXGLUE_USE_VULKAN)
     message(FATAL_ERROR "At least one graphics backend must be enabled (REXGLUE_USE_D3D12 or REXGLUE_USE_VULKAN)")
 endif()
 
@@ -100,9 +111,10 @@ if(CMAKE_CXX_COMPILER_VERSION VERSION_LESS "18.0")
     message(FATAL_ERROR "ReXGlue requires Clang 18 or newer (found ${CMAKE_CXX_COMPILER_VERSION})")
 endif()
 
-# Enforce x64 architecture
+# Enforce a 64-bit target. On the web this means wasm64 (-sMEMORY64), which
+# is required anyway: the 4 GB guest address space does not fit in wasm32.
 if(NOT CMAKE_SIZEOF_VOID_P EQUAL 8)
-    message(FATAL_ERROR "ReXGlue only supports 64‑bit architectures (x86_64 or ARM64)")
+    message(FATAL_ERROR "ReXGlue only supports 64‑bit architectures (x86_64, ARM64, or wasm64 via toolchains/web-emscripten.cmake)")
 endif()
 
 # Set C++23 standard
@@ -112,7 +124,9 @@ set(CMAKE_CXX_EXTENSIONS OFF)
 set(CMAKE_DEBUG_POSTFIX d)
 set(CMAKE_RELWITHDEBINFO_POSTFIX rd)
 
-if(NOT WIN32)
+if(EMSCRIPTEN)
+    # wasm has no code models and no PIC requirement for a single module.
+elseif(NOT WIN32)
     # Use appropriate code model based on architecture
     if(CMAKE_SYSTEM_PROCESSOR MATCHES "AMD64|x86_64" AND NOT APPLE)
         # Large code model on Linux x86_64 for linking with very large recompiled executables (35MB+).
@@ -147,7 +161,10 @@ if(APPLE AND CMAKE_OSX_ARCHITECTURES)
     list(GET CMAKE_OSX_ARCHITECTURES 0 REX_TARGET_PROCESSOR)
 endif()
 
-if(WIN32)
+if(EMSCRIPTEN)
+    set(REX_PLATFORM "web-wasm64")
+    add_compile_definitions(REX_PLATFORM_WEB=1)
+elseif(WIN32)
     if(REX_TARGET_PROCESSOR MATCHES "AMD64|x86_64")
         set(REX_PLATFORM "win-amd64")
     elseif(REX_TARGET_PROCESSOR MATCHES "aarch64|ARM64|arm64")
