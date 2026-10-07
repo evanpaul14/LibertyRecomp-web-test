@@ -36,7 +36,26 @@ REXCVAR_DEFINE_UINT32(webgpu_frame_limit, 60, "GPU",
                       "Web build: most frames presented per second (0 = unlimited)");
 
 namespace rex::graphics::gta4_webgpu {
+// The render thread's pending yield (see YieldToEventLoop).
+void (*yield_resume)(void*) = nullptr;
+void* yield_self = nullptr;
+
+extern "C" EMSCRIPTEN_KEEPALIVE void liberty_gpu_resume_drain() {
+  if (yield_resume) yield_resume(yield_self);
+}
+
 namespace {
+// Posts a message to this worker so liberty_gpu_resume_drain runs as a new
+// task, after the current one ends and the browser shows the canvas.
+EM_JS(void, liberty_gpu_yield, (), {
+  if (!globalThis.libertyGpuYield) {
+    var channel = new MessageChannel();
+    channel.port1.onmessage = () => _liberty_gpu_resume_drain();
+    globalThis.libertyGpuYield = channel;
+  }
+  globalThis.libertyGpuYield.port2.postMessage(0);
+});
+
 using namespace gta4_native;
 
 constexpr size_t kMaximumQueuedCommands = 65536;
@@ -631,20 +650,49 @@ void Gta4WebGpuGraphicsSystem::WatchdogThunk(void* self) {
   }
   if (!stalled) return;
   REXLOG_WARN("gta4-webgpu: render queue stalled: {} commands ({} presents) queued, "
-              "waiting on GPU={}, drain scheduled={}, next command type={}, last type={}",
+              "waiting on GPU={}, drain scheduled={}, yield pending={}, next command type={}, "
+              "last type={}",
               queued, presents, waiting, system->drain_scheduled_.load(),
-              next_type, system->last_type_);
-  // A lost wake leaves the queue idle; drain it from here.
-  if (!waiting) system->Drain();
+              system->yield_pending_, next_type, system->last_type_);
+  // A lost wake or yield message leaves the queue idle; drain it from here.
+  if (system->yield_pending_)
+    ResumeThunk(system);
+  else if (!waiting)
+    system->Drain();
 }
 
 void Gta4WebGpuGraphicsSystem::DrainThunk(void* self) {
   auto* system = static_cast<Gta4WebGpuGraphicsSystem*>(self);
+  // A wake that arrives during a yield is covered by the resume. Leaving
+  // drain_scheduled_ set stops game threads from queueing more wakes, which
+  // would keep this thread's mailbox (and so the current task) busy.
+  if (system->yield_pending_) return;
   system->drain_scheduled_.store(false, std::memory_order_release);
   system->Drain();
 }
 
+void Gta4WebGpuGraphicsSystem::ResumeThunk(void* self) {
+  auto* system = static_cast<Gta4WebGpuGraphicsSystem*>(self);
+  system->yield_pending_ = false;
+  system->drain_scheduled_.store(false, std::memory_order_release);
+  system->Drain();
+}
+
+void Gta4WebGpuGraphicsSystem::YieldToEventLoop() {
+  // The canvas shows a frame only when this worker's current task ends.
+  // ScheduleDrain cannot end it: Emscripten runs tasks proxied to a thread
+  // while it is executing that thread's mailbox in the same task, so with
+  // work always queued the task never ended and the canvas froze. A
+  // MessageChannel message is a new task.
+  yield_pending_ = true;
+  drain_scheduled_.store(true, std::memory_order_release);
+  yield_resume = &ResumeThunk;
+  yield_self = this;
+  liberty_gpu_yield();
+}
+
 void Gta4WebGpuGraphicsSystem::Drain() {
+  if (yield_pending_) return;
   for (;;) {
     std::unique_ptr<Work> work;
     {
@@ -676,7 +724,7 @@ void Gta4WebGpuGraphicsSystem::Drain() {
     if (status == Renderer::Status::kPending) return;
     if (status == Renderer::Status::kYield) {
       // Return to the event loop so the canvas can show the frame.
-      ScheduleDrain();
+      YieldToEventLoop();
       return;
     }
   }

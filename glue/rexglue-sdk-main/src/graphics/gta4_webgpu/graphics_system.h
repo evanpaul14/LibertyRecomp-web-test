@@ -79,8 +79,10 @@ class Gta4WebGpuGraphicsSystem final : public system::IGraphicsSystem {
   static void* RenderThreadMain(void* self);
   static void DrainThunk(void* self);
   static void WatchdogThunk(void* self);
+  static void ResumeThunk(void* self);
   void Drain();
   void ScheduleDrain();
+  void YieldToEventLoop();
 
   memory::Memory* memory_ = nullptr;
   const ShaderArchive* archive_ = nullptr;
@@ -118,6 +120,9 @@ class Gta4WebGpuGraphicsSystem final : public system::IGraphicsSystem {
   uint64_t presents_executed_ = 0;  // Under queue_mutex_.
   uint64_t watchdog_executed_ = 0;  // Render thread only.
   uint64_t watchdog_presents_ = 0;  // Render thread only.
+  // Render thread only: a present returned to the event loop and the drain
+  // resumes from ResumeThunk; drain_scheduled_ stays set until then.
+  bool yield_pending_ = false;
   uint32_t watchdog_idle_ticks_ = 0;  // Render thread only.
 
   pthread_t render_thread_{};
