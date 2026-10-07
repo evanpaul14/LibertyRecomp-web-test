@@ -2,7 +2,9 @@
 
 #include <algorithm>
 #include <bit>
+#include <chrono>
 #include <cstring>
+#include <thread>
 
 #include <emscripten/emscripten.h>
 #include <emscripten/proxying.h>
@@ -15,6 +17,7 @@
 #include <rex/graphics/gta4_native/tv_trace.h>
 #include <rex/graphics/pipeline/texture/info.h>
 #include <rex/graphics/pipeline/texture/util.h>
+#include <rex/cvar.h>
 #include <rex/logging.h>
 #include <rex/system/function_dispatcher.h>
 #include <rex/system/xmemory.h>
@@ -26,6 +29,9 @@
 #include "renderer_state.h"
 #include "shader_archive.h"
 #include "simd_bytes.h"
+
+REXCVAR_DEFINE_UINT32(webgpu_frame_limit, 60, "GPU",
+                      "Web build: most frames presented per second (0 = unlimited)");
 
 namespace rex::graphics::gta4_webgpu {
 namespace {
@@ -676,8 +682,25 @@ bool Gta4WebGpuGraphicsSystem::SubmitTitleCommand(uint32_t title_id, uint32_t ab
                    uint32_t(header.type), failures_, error);
     return false;
   }
+  if (header.type == CommandType::kPresent) PacePresent();
   Enqueue(std::move(work), header.type == CommandType::kPresent);
   return true;
+}
+
+void Gta4WebGpuGraphicsSystem::PacePresent() {
+  // Nothing else limits the frame rate: the canvas does not block on vsync,
+  // and Node has no canvas. Loading screens otherwise present thousands of
+  // frames a second, which only burns CPU the streaming threads need.
+  const uint32_t limit = REXCVAR_GET(webgpu_frame_limit);
+  if (!limit) return;
+  const double interval = 1000.0 / limit;
+  double now = emscripten_get_now();
+  if (now < next_present_ms_) {
+    std::this_thread::sleep_for(std::chrono::duration<double, std::milli>(next_present_ms_ - now));
+    now = emscripten_get_now();
+  }
+  // A frame that ran late starts a new schedule rather than being made up.
+  next_present_ms_ = (now - next_present_ms_ > interval ? now : next_present_ms_) + interval;
 }
 
 bool Gta4WebGpuGraphicsSystem::ExecuteTitleCommand(uint32_t title_id, uint32_t abi,

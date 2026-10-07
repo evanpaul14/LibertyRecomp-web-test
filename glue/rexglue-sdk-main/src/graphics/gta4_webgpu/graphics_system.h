@@ -73,6 +73,7 @@ class Gta4WebGpuGraphicsSystem final : public system::IGraphicsSystem {
   const uint8_t* GuestPhysical(uint32_t address, size_t size) const;
   void ForgetResource(uint32_t handle);
   void Enqueue(std::unique_ptr<Work> work, bool present);
+  void PacePresent();
 
   // Render thread.
   static void* RenderThreadMain(void* self);
@@ -100,6 +101,7 @@ class Gta4WebGpuGraphicsSystem final : public system::IGraphicsSystem {
   double capture_ms_ = 0, snapshot_ms_ = 0, buffer_capture_ms_ = 0, texture_capture_ms_ = 0, report_start_ms_ = 0;
   uint64_t captured_bytes_ = 0, snapshots_ = 0, snapshot_copies_ = 0;
   double blocked_ms_ = 0;
+  double next_present_ms_ = 0;  // Earliest time of the next present (presenting thread).
   std::shared_ptr<std::vector<uint8_t>> last_device_;
   uint32_t last_device_address_ = 0;
 
