@@ -31,29 +31,28 @@ mapped); this file is for whoever continues the work.
   yet; SwiftShader and the game also share the same 4 CPU cores.
 - All 2062 title shader variants translate to WGSL (`tools/webgpu`) and pass
   Tint validation; the archive is checked in and embedded.
-- In headless Chromium the browser build still starts and stops at the install
-  check (no game files). The canvas hand-off to the render worker and surface
-  setup were verified with a standalone prototype; WebGPU canvas contents cannot
-  be screenshotted in this container, so the browser picture is unverified.
+- Without game files the browser build stops at the install check. With
+  `tools/web/serve.py` serving an installed game (`/game/` + manifest, mounted
+  lazily by `res/web/index.html`), it reaches gameplay (see below).
 - `rex-web-memory-test` (26 checks: alias folding, byte order, heaps, MMIO,
   returned-pointer aliases) passes under Node 24.
 - **Real browser (Chrome on an M1 Mac, 2026-10-07).** With game files served by
   `tools/web/serve.py` (installed from a disc image extracted to a folder; the
   installer cannot map a 7.8 GB `.iso` under Node), the build reaches gameplay
   in Chrome. The loading screen draws correctly. Gameplay frames (11–15k draws)
-  run at about 5 fps, and in Chrome they looked black; the tab was in the
-  background for part of that run, so this is not confirmed. Under Node with
-  Dawn on Metal the same code draws the intro credits correctly, then that run
-  stopped progressing (one core spinning) right after a 2.7 s burst of
-  pipeline compiles.
+  run at about 5 fps, and in Chrome they looked black. That run predates the
+  clock, hang, stencil-rebuild and downsample-resolve fixes below, all of which
+  apply to the browser too; the black gameplay is most likely the stencil bug.
+  Not rechecked in Chrome since.
 - **Profiling.** `--webgpu_perf_report=true` logs render-thread and capture
   timing every 5 s as warnings. Use it with `--diagnostics=true
   --diagnostics_categories=logging --log_level=warn`: other diagnostics print
   a line per draw, and every line blocks the game thread until the page's
   main thread handles it. In the browser that alone held gameplay below 1 fps.
-- Next step candidates, in suggested order: re-checking Chrome with the clock,
-  hang and stencil-rebuild fixes below (the black gameplay seen there is likely
-  the same stencil bug), then coronas outdoors. Ask the user.
+- Next step candidates, in suggested order: re-check Chrome with the fixes
+  below (picture, frame rate, no stall), then a game-file picker, then
+  performance (pipeline compiles off the render thread, device-block deltas).
+  Ask the user.
 - **Node graphics session (Dawn on Metal, M1 Mac, 2026-10-07).**
   - *Fixed: black loading screens.* Emscripten has no `CLOCK_MONOTONIC_RAW`;
     `clock_getres`/`clock_gettime` failed and, with asserts compiled out, the
@@ -95,14 +94,25 @@ mapped); this file is for whoever continues the work.
     to 0x80 and writes 0xFF with a fixed-function stencil Replace where packed
     depth is nonzero (no shader stencil export needed). The intro cutscenes now
     render lit. The draw trace also logs stencil state, and handoffs are traced.
-  - *Unchecked: coronas.* Lamp coronas looked like hard white shapes before the
-    fix; not rechecked outdoors since.
-  - *Packed depth aliases (unverified):* `RegisterVirtualResource` with
-    `packed_depth_source` is honored; resolved depth is stored as `rg32float`
-    (depth, stencil) and an alias texture is rebuilt as A8R8G8B8 like
-    `gta4_native/packed_depth_alias_ps.glsl`. It caused no GPU errors but did not
-    change the black ground in the one frame checked, and it is not yet confirmed
-    that the title takes this path.
+  - *Fixed: hard white lamp shapes.* These were not coronas (the corona shader
+    62DFF2DBDC8ED5D6 adds soft glows correctly). The bloom/exposure chain
+    downsamples by resolving a 4x MSAA view (e.g. 512x384) of a 1x surface's
+    EDRAM (1024x768); the resolve picked the 1x surface and copied its top-left
+    quarter unscaled, so bloom held the frame's top-left quarter at 2x and lit
+    a ghost of each lamp at twice its screen position, over anything in front.
+    `Resolve` now maps the requested view's samples onto the owner surface and
+    averages them (`resolve_color`, as `gta4_native/resolve_convert_ps.glsl`).
+    Found with `--webgpu_trace_pixel`, which lists the draws that changed a texel.
+  - *Packed depth aliases:* `RegisterVirtualResource` with `packed_depth_source`
+    is honored; resolved depth is stored as `rg32float` (depth, stencil) and an
+    alias texture is rebuilt as A8R8G8B8 like
+    `gta4_native/packed_depth_alias_ps.glsl`. The title does take this path: the
+    full-screen lighting draw samples one (an RGBA8 GPU texture in slot 5 that no
+    resolve writes). Its contents have not been checked against Metal.
+  - *Not checked:* in the overhead shot of the ship's hold (around frame 6240)
+    large areas are black around the characters; probably just an unlit hold,
+    unverified. One texture (read by a full-screen pass whose output is never
+    resolved) is never produced; harmless so far.
   - *Render-thread watchdog:* every 5 s it logs `render queue stalled` (and drains
     the queue) when queued work stops moving, and dumps the wait trace after 15 s
     and 60 s without a present.
@@ -122,7 +132,8 @@ mapped); this file is for whoever continues the work.
 | GPU threading | One render pthread owns the device and runs from the JS event loop (needed for `mapAsync` and canvas presentation), woken via `emscripten_proxy_async`. Game threads capture device block/buffers/textures at submit (`Capture` in `graphics_system.cpp`) | `gta4_webgpu/graphics_system.cpp`, `work.h` |
 | Shaders | Stock SPIR-V → GLSL (SPIRV-Cross) → rewrite BDA constants to one UBO (VS 0, PS 4096, shared 8192, spec word 8192+0x500) and bindless to fixed slots → glslang → spirv-opt → naga → WGSL. naga undoes the Vulkan y-flip itself | `tools/webgpu/spirv_to_wgsl.py`, `LibertyRecompLib/shader/webgpu_shader_archive.bin` |
 | Vertex data | Every attribute decoded to `float32x4` on the CPU per buffer generation (shaders read vec4 floats; WebGPU cannot feed integer formats to them) | `gta4_webgpu/vertex_decode.h`, `resources.cpp` |
-| Render targets | Single-sampled; resolved depth stored as `rg32float` (depth, stencil), with packed A8R8G8B8 aliases rebuilt on demand; resolves pick the latest surface at the same EDRAM placement | `gta4_webgpu/resources.cpp`, `passes.cpp` |
+| Render targets | Single-sampled; resolved depth stored as `rg32float` (depth, stencil), with packed A8R8G8B8 aliases rebuilt on demand; resolves pick the latest surface at the same EDRAM placement, and map samples when its MSAA layout differs from the resolved view (`resolve_color`) | `gta4_webgpu/resources.cpp`, `passes.cpp`, `renderer.cpp` |
+| Depth handoff | Depth from the resolved snapshot (`source_texture`); `kRebuildSceneCoverage` clears stencil to 0x80 and writes 0xFF via stencil Replace where packed depth is nonzero, as the Metal renderer | `gta4_webgpu/passes.cpp` (`Handoff`) |
 | Canvas | `<canvas id="liberty-gpu">` is transferred to the render worker as an OffscreenCanvas (pre-js `res/web/webgpu_canvas.js`); SDL's `#canvas` stays on top for input | `gta4_webgpu/canvas.cpp`, `res/web/index.html` |
 | Main loop | `-sPROXY_TO_PTHREAD`; COOP/COEP needed (`tools/web/serve.py`) | `gta4-recomp/CMakeLists.txt` |
 | Apple-only bridges, community MP | Report unavailable / not built on web | `gta4-recomp/src/web/web_platform_bridges.cpp` |
@@ -205,6 +216,33 @@ XDG_DATA_HOME=<data> node out/web/LibertyRecomp/LibertyRecomp.js --diagnostics=t
 # Dawn on Metal and 60 fps pacing the intro starts around frame 5000-6000.
 ```
 
+On the user's Mac (Dawn on Metal; no `VK_ICD_FILENAMES`), with the scratchpad
+Dawn package named under Rebuilding:
+
+```bash
+N=<scratchpad>/npm/node_modules
+NODE_PATH=$N LIBERTY_DAWN_NODE=$N/webgpu XDG_DATA_HOME=$HOME/.local/share \
+node out/web-node/LibertyRecomp/LibertyRecomp.js --diagnostics=true \
+  --diagnostics_categories=logging --log_level=info \
+  --webgpu_frame_dump_path=<dir>/f --webgpu_frame_dump_interval=120 \
+  --webgpu_trace_frame=6000 --webgpu_trace_pixel=565,150
+```
+
+- The outdoor intro (ship's deck, skyline, lamps) is around frames 5500-7400,
+  the indoor cutscenes from about 7600. Frame numbers drift by a shot or so
+  between runs, so compare runs by scene, not only by number.
+- `--webgpu_trace_pixel=X,Y` (with a traced frame) logs `webgpu-pixel:` lines:
+  each draw that changed that texel of its first color target, old -> new raw
+  texel bytes (the back buffer is RGBA16F: four little-endian halves).
+- `--webgpu_skip_pixel_shader=HASH,...` drops draws by pixel shader hash, to
+  see what an effect contributes (compare dumps with and without).
+- The draw trace logs each draw's stencil state
+  (`stencil=enable/func/ref/mask/writemask ops=fail,depthfail,pass`); resolves
+  log the requested/owner MSAA sample types, and handoffs their policy.
+- Shader hashes map to WGSL in the archive; the archive format is
+  `LRWGSL02` (zlib) with per-record hash, stage, variant and code, which a short
+  Python script can unpack to read a shader.
+
 ## Known gaps
 
 - Renderer gaps (all handled by the Metal renderer, which is the reference):
@@ -242,7 +280,9 @@ XDG_DATA_HOME=<data> node out/web/LibertyRecomp/LibertyRecomp.js --diagnostics=t
 1. **In-browser game files.** A file or folder picker (File System Access API /
    OPFS), mounted so the existing `gta4::install::Install()` can read it;
    reuse the non-interactive install path in `GTA4App::OnFinalizePaths`. Files
-   are 7–8 GB, so stream them rather than preloading into MEMFS.
+   are 7–8 GB, so stream them rather than preloading into MEMFS. (Local runs
+   already stream an installed game from `serve.py`; the lazy mount in
+   `res/web/index.html` is a model for this.)
 2. **WebGPU renderer.** Done as a title-command renderer (the same interface
    the desktop gta4-native and gta4-metal renderers use, not Xenos emulation).
    Follow-ups: profile a gameplay frame first (split SwiftShader time vs
