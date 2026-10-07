@@ -260,6 +260,7 @@ struct Renderer::State {
   std::unordered_map<Words, std::pair<wgpu::BindGroup, uint64_t>, WordsHash> texture_groups;
 
   uint64_t frame = 0;
+  uint32_t submitted_frame = 0;  // The title's number of the last presented frame.
   uint64_t content_serial = 0;
   uint64_t draws = 0, frame_draws = 0, skipped_draws = 0;
   // Per-frame diagnostics, reported with presents.

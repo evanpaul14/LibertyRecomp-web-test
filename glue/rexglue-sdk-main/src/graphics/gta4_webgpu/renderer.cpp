@@ -594,7 +594,8 @@ Renderer::Status Renderer::Execute(Work& work, std::string& error) {
   std::optional<ScopedTimer> timer;
   if (type != CommandType::kPresent) timer.emplace(s.timing.execute_ms);
   if (uint32_t(type) < s.stats.commands.size()) ++s.stats.commands[uint32_t(type)];
-  s.trace = REXCVAR_GET(webgpu_trace_frame) && s.frame + 1 == REXCVAR_GET(webgpu_trace_frame);
+  s.trace = REXCVAR_GET(webgpu_trace_frame) &&
+            s.submitted_frame + 1 == REXCVAR_GET(webgpu_trace_frame);
   if (s.trace && type != CommandType::kDrawPrimitive && type != CommandType::kDrawIndexedPrimitive &&
       type != CommandType::kDrawPrimitiveUp)
     REXLOG_INFO("webgpu-trace: command type={}", uint32_t(type));

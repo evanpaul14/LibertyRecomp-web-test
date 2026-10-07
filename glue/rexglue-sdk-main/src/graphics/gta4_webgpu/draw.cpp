@@ -629,13 +629,23 @@ bool Renderer::State::Draw(const Work& work, std::string& error) {
       if (handle) {
         std::string texture_error;
         resource = SampledTexture(handle, fetch, work.textures[slot], texture_error);
-        if (trace || (!resource && !texture_error.empty() && ++texture_failures <= 32))
+        if (trace || (!resource && !texture_error.empty() && ++texture_failures <= 32)) {
+          size_t bytes = 0, nonzero = 0;
+          if (const auto& capture = work.textures[slot]; capture && !capture->mips.empty()) {
+            bytes = capture->mips[0].bytes.size();
+            nonzero = size_t(std::count_if(capture->mips[0].bytes.begin(),
+                                           capture->mips[0].bytes.end(),
+                                           [](uint8_t value) { return value != 0; }));
+          }
           REXLOG_INFO("webgpu-texture: slot={} handle={:08X} captured={} resource={} {}x{} "
-                      "format={} gpu={} error={}",
+                      "format={} gpu={} guest-format={} mip0={}/{} nonzero error={}",
                       slot, handle, bool(work.textures[slot]), bool(resource),
                       resource ? resource->width : 0, resource ? resource->height : 0,
                       resource ? uint32_t(resource->format) : 0,
-                      resource && resource->gpu_produced, texture_error);
+                      resource && resource->gpu_produced,
+                      resource ? uint32_t(resource->info.format) : 0, nonzero, bytes,
+                      texture_error);
+        }
       }
       if (pipeline->texture_mask & bit) {
         const bool cube = pipeline->cube_mask & bit;
@@ -745,7 +755,7 @@ bool Renderer::State::Draw(const Work& work, std::string& error) {
                 "color0={:08X}/{}x{} depth={:08X} viewport={},{},{},{},{},{} scissor={},{},{},{} "
                 "writes={:X} blend0={:08X} depth-test={}/{} attr0={},{},{},{} c208={},{},{},{} "
                 "textures={:X}",
-                vertex.hash, pixel ? pixel->hash : 0, type, count, indexed, up,
+                vertex.hash, pixel ? pixel->hash : 0, type, vertex_count, indexed, up,
                 targets.colors[0] ? targets.colors[0]->descriptor.handle : 0,
                 targets.colors[0] ? targets.colors[0]->width : 0,
                 targets.colors[0] ? targets.colors[0]->height : 0,
@@ -754,6 +764,34 @@ bool Renderer::State::Draw(const Work& work, std::string& error) {
                 fixed.color_write_mask, fixed.blend_controls[0], fixed.depth_enable,
                 fixed.depth_function, position[0], position[1], position[2], position[3], c0[0],
                 c0[1], c0[2], c0[3], pipeline->texture_mask);
+    // The first vertex's decoded inputs, and the nonzero pixel constants.
+    std::string detail;
+    for (const auto& input : inputs) {
+      const uint8_t* base =
+          up ? work.up_vertices.data()
+             : work.streams[input.stream] ? work.streams[input.stream]->bytes.data() +
+                                                streams[input.stream].offset
+                                          : nullptr;
+      if (!base) continue;
+      for (uint32_t v = 0; v < (up ? std::min(vertex_count, 6u) : 1u); ++v) {
+        for (size_t i = 0; i < input.elements.size(); ++i) {
+          float value[4];
+          DecodeVertexElement(input.elements[i]->type,
+                              base + size_t(v) * up_stride + input.elements[i]->offset, value);
+          detail += fmt::format(" v{}in{}({:X})={},{},{},{}", v, input.locations[i],
+                                input.elements[i]->type, value[0], value[1], value[2], value[3]);
+        }
+      }
+    }
+    if (pixel) {
+      for (uint32_t i = 0; i < kPixelConstantBytes / 16; ++i) {
+        float value[4];
+        std::memcpy(value, uniform.data() + kUniformPixelOffset + i * 16, sizeof(value));
+        if (value[0] || value[1] || value[2] || value[3])
+          detail += fmt::format(" c{}={},{},{},{}", i, value[0], value[1], value[2], value[3]);
+      }
+    }
+    REXLOG_INFO("webgpu-trace: inputs{}", detail);
   }
   if (!BeginPass(targets, error)) return false;
   // Every pass call crosses from wasm into the browser's WebGPU, so state that

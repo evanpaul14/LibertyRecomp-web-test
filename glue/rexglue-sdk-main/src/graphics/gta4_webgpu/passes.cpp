@@ -298,12 +298,14 @@ Renderer::Status Renderer::State::Present(const Work& work, std::string& error) 
   }
   stats = {};
   frame_draws = 0;
+  submitted_frame = c.submitted_frame;
 
   if (source) PresentToCanvas(*source, error);
   const std::string dump_path = REXCVAR_GET(webgpu_frame_dump_path);
   const uint32_t interval = std::max(1u, REXCVAR_GET(webgpu_frame_dump_interval));
+  // The traced frame is always dumped, so its picture matches its trace.
   const bool dump = !dump_path.empty() && source && c.width && c.height &&
-                    c.submitted_frame % interval == 0;
+                    (c.submitted_frame % interval == 0 || trace);
   if (!dump) {
     Flush(error);
     acknowledge();
