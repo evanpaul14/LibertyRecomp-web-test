@@ -9,6 +9,9 @@
 #include <unordered_map>
 #include <vector>
 
+#include <emscripten/emscripten.h>
+#include <rex/cvar.h>
+#include <rex/logging.h>
 #include <webgpu/webgpu_cpp.h>
 #include <xxhash.h>
 
@@ -20,6 +23,8 @@
 #include "../gta4_native/core/draw_state.h"
 #include "renderer.h"
 #include "shader_archive.h"
+
+REXCVAR_DECLARE(bool, webgpu_perf_report);
 
 namespace rex::graphics::gta4_webgpu {
 
@@ -46,6 +51,7 @@ struct SurfaceResource {
 struct TextureResource {
   wgpu::Texture texture;
   wgpu::TextureView view;  // Sampling view (2D, 2D array, cube or 3D).
+  wgpu::TextureView first_layer;  // 2D view of layer 0 of an array, made on first use.
   wgpu::TextureViewDimension dimension = wgpu::TextureViewDimension::e2D;
   wgpu::TextureFormat format = wgpu::TextureFormat::Undefined;
   TextureInfo info{};
@@ -176,7 +182,34 @@ struct Renderer::State {
   wgpu::CommandEncoder encoder;
   wgpu::RenderPassEncoder pass;
   Targets pass_targets;
+  // What the current pass already has bound (raw handles are only compared,
+  // and the objects outlive the pass).
+  struct PassState {
+    WGPURenderPipeline pipeline = nullptr;
+    bool uniforms_set = false;
+    uint32_t uniform_offset = 0;
+    WGPUBindGroup textures = nullptr;
+    struct VertexSlot {
+      WGPUBuffer buffer = nullptr;
+      uint64_t offset = 0, size = 0;
+    };
+    std::array<VertexSlot, 16> vertex_buffers{};
+    bool viewport_set = false, scissor_set = false, stencil_set = false, blend_set = false;
+    std::array<float, 6> viewport{};
+    std::array<uint32_t, 4> scissor{};
+    uint32_t stencil_reference = 0;
+    std::array<float, 4> blend{};
+    WGPUBuffer index_buffer = nullptr;
+    wgpu::IndexFormat index_format = wgpu::IndexFormat::Undefined;
+  } pass_state;
   Arena uniforms, geometry;
+  // Uniform slots already in this batch, by content hash (draws often repeat
+  // the same constants).
+  struct UniformSlot {
+    uint64_t offset = 0;
+    size_t size = 0;
+  };
+  std::unordered_map<uint64_t, UniformSlot> uniform_slots;
   wgpu::BindGroupLayout uniform_layout;
   wgpu::BindGroup uniform_group;  // Recreated when the uniform arena grows.
   wgpu::Buffer zero_vertices;
@@ -191,6 +224,15 @@ struct Renderer::State {
   std::unordered_map<Words, Pipeline, WordsHash> pipelines;
   std::unordered_map<std::string, wgpu::RenderPipeline> utility_pipelines;
   std::unordered_map<Words, wgpu::Sampler, WordsHash> samplers;
+  // Samplers by raw fetch constant and texture mip count, ahead of decoding
+  // the fetch into `samplers`' key.
+  using FetchKey = std::array<uint32_t, 7>;
+  struct FetchKeyHash {
+    size_t operator()(const FetchKey& key) const {
+      return size_t(XXH3_64bits(key.data(), sizeof(key)));
+    }
+  };
+  std::unordered_map<FetchKey, wgpu::Sampler, FetchKeyHash> fetch_samplers;
 
   // Title state carried by commands.
   std::unordered_map<uint32_t, const ShaderRecord*> shaders;
@@ -226,10 +268,42 @@ struct Renderer::State {
     uint32_t clears = 0, resolves = 0;
     std::array<uint32_t, 32> commands{};
   } stats;
+  // Render-thread CPU time (ms) and work done since the last timing report.
+  struct Timing {
+    double execute_ms = 0, pipeline_ms = 0, texture_ms = 0, geometry_ms = 0, submit_ms = 0;
+    double encode_ms = 0, uniform_ms = 0, inputs_ms = 0, bind_ms = 0;
+    uint32_t frames = 0, draws = 0, new_pipelines = 0, new_textures = 0, new_buffers = 0;
+    uint32_t new_groups = 0, uniform_slots = 0, uniform_reused = 0;
+    uint64_t texture_bytes = 0, buffer_bytes = 0;
+    double start_ms = 0;
+  } timing;
   uint64_t gpu_errors = 0;
   bool ready = false;
   bool trace = false;
   uint64_t texture_failures = 0;
+};
+
+// Performance reports go to the info log, or to the warning log with
+// --webgpu_perf_report so they show without the diagnostic flood.
+#define WEBGPU_PERF_LOG(...)                                \
+  do {                                                      \
+    if (REXCVAR_GET(webgpu_perf_report))                    \
+      REXLOG_WARN(__VA_ARGS__);                             \
+    else                                                    \
+      REXLOG_INFO(__VA_ARGS__);                             \
+  } while (0)
+
+// Adds the scope's wall time (ms) to `total`.
+class ScopedTimer {
+ public:
+  explicit ScopedTimer(double& total) : total_(total), start_(emscripten_get_now()) {}
+  ~ScopedTimer() { total_ += emscripten_get_now() - start_; }
+  ScopedTimer(const ScopedTimer&) = delete;
+  ScopedTimer& operator=(const ScopedTimer&) = delete;
+
+ private:
+  double& total_;
+  double start_;
 };
 
 inline uint32_t GuestWord(const uint8_t* bytes, size_t offset) {

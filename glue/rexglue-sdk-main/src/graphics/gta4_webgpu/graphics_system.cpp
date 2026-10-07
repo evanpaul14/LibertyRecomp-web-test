@@ -23,7 +23,9 @@
 #include "../gta4_native/native_texture_image_identity.h"
 #include "canvas.h"
 #include "renderer.h"
+#include "renderer_state.h"
 #include "shader_archive.h"
+#include "simd_bytes.h"
 
 namespace rex::graphics::gta4_webgpu {
 namespace {
@@ -224,16 +226,20 @@ bool Gta4WebGpuGraphicsSystem::SnapshotDevice(Work& work, uint32_t device, std::
     error = "Unmapped guest device state";
     return false;
   }
+  const double start = emscripten_get_now();
+  ++snapshots_;
   // Reuse the previous snapshot while the device block is unchanged; the
   // render thread only reads it.
   if (last_device_ && last_device_address_ == device &&
-      !std::memcmp(last_device_->data(), bytes, kGuestDeviceSize)) {
+      BytesEqual(last_device_->data(), bytes, kGuestDeviceSize)) {
     work.device = last_device_;
   } else {
     last_device_ = std::make_shared<std::vector<uint8_t>>(bytes, bytes + kGuestDeviceSize);
     last_device_address_ = device;
     work.device = last_device_;
+    ++snapshot_copies_;
   }
+  snapshot_ms_ += emscripten_get_now() - start;
   const uint8_t* state = work.device->data();
   for (uint32_t i = 0; i < kRenderTargetCount; ++i)
     work.colors[i] = ReadSurface(LoadBig32(state + kDeviceColorTargets + i * 4));
@@ -255,6 +261,12 @@ std::shared_ptr<const BufferCapture> Gta4WebGpuGraphicsSystem::CaptureBuffer(
     error = "Invalid guest buffer metadata";
     return {};
   }
+  const double start = emscripten_get_now();
+  struct Elapsed {
+    double& total;
+    double start;
+    ~Elapsed() { total += emscripten_get_now() - start; }
+  } elapsed{buffer_capture_ms_, start};
   auto found = buffers_.find(handle);
   if (found != buffers_.end() && !metadata->guest_locked && !dirty_.contains(handle) &&
       found->second->address == metadata->guest_address &&
@@ -271,11 +283,12 @@ std::shared_ptr<const BufferCapture> Gta4WebGpuGraphicsSystem::CaptureBuffer(
   if (found != buffers_.end() && found->second->bytes.size() == metadata->guest_size &&
       found->second->address == metadata->guest_address &&
       (found->second->flags & 0x8000000Fu) == (flags & 0x8000000Fu) &&
-      !std::memcmp(found->second->bytes.data(), payload, metadata->guest_size)) {
+      BytesEqual(found->second->bytes.data(), payload, metadata->guest_size)) {
     dirty_.erase(handle);
     return found->second;
   }
   auto capture = std::make_shared<BufferCapture>();
+  captured_bytes_ += metadata->guest_size;
   capture->generation = next_generation_++;
   capture->flags = flags;
   capture->address = metadata->guest_address;
@@ -292,6 +305,11 @@ std::shared_ptr<const TextureCapture> Gta4WebGpuGraphicsSystem::CaptureTexture(
       NativeTextureImageFetchEqual(found->second->fetch, fetch)) {
     return found->second;
   }
+  struct Elapsed {
+    double& total;
+    double start;
+    ~Elapsed() { total += emscripten_get_now() - start; }
+  } elapsed{texture_capture_ms_, emscripten_get_now()};
   TextureInfo info{};
   if (!TextureInfo::Prepare(fetch, &info) || info.mip_min_level > info.mip_max_level ||
       info.mip_max_level >= xenos::kTextureMaxMips) {
@@ -316,13 +334,17 @@ std::shared_ptr<const TextureCapture> Gta4WebGpuGraphicsSystem::CaptureTexture(
       return {};
     }
     total += size;
+    captured_bytes_ += size;
     capture->mips.push_back({level, std::vector<uint8_t>(bytes, bytes + size)});
   }
   // Reloading identical bytes keeps the generation (no GPU re-upload).
   if (found != textures_.end() && NativeTextureImageFetchEqual(found->second->fetch, fetch) &&
       found->second->mips.size() == capture->mips.size() &&
       std::equal(capture->mips.begin(), capture->mips.end(), found->second->mips.begin(),
-                 [](const auto& a, const auto& b) { return a.bytes == b.bytes; })) {
+                 [](const auto& a, const auto& b) {
+                   return a.bytes.size() == b.bytes.size() &&
+                          BytesEqual(a.bytes.data(), b.bytes.data(), a.bytes.size());
+                 })) {
     dirty_.erase(handle);
     return found->second;
   }
@@ -542,11 +564,16 @@ bool Gta4WebGpuGraphicsSystem::Capture(const void* command, size_t size, Work& w
 void Gta4WebGpuGraphicsSystem::Enqueue(std::unique_ptr<Work> work, bool present) {
   {
     std::unique_lock lock(queue_mutex_);
-    queue_space_.wait(lock, [&] {
+    const auto has_space = [&] {
       return !render_running_ ||
              (queue_.size() < kMaximumQueuedCommands &&
               (!present || queued_presents_ < kMaximumQueuedPresents));
-    });
+    };
+    if (!has_space()) {
+      const double start = emscripten_get_now();
+      queue_space_.wait(lock, has_space);
+      blocked_ms_ += emscripten_get_now() - start;
+    }
     if (!render_running_) return;
     if (present) ++queued_presents_;
     queue_.push_back(std::move(work));
@@ -617,7 +644,30 @@ bool Gta4WebGpuGraphicsSystem::SubmitTitleCommand(uint32_t title_id, uint32_t ab
   bool captured;
   {
     std::lock_guard lock(capture_mutex_);
+    const double start = emscripten_get_now();
     captured = Capture(command, size, *work, error);
+    const double now = emscripten_get_now();
+    capture_ms_ += now - start;
+    if (header.type == CommandType::kPresent) {
+      if (!report_start_ms_) report_start_ms_ = now;
+      if (now - report_start_ms_ >= 5000.0) {
+        double blocked;
+        {
+          std::lock_guard queue_lock(queue_mutex_);
+          blocked = blocked_ms_;
+          blocked_ms_ = 0;
+        }
+        WEBGPU_PERF_LOG("gta4-webgpu: capture over {:.0f} ms: {:.0f} ms capturing (device {:.0f} "
+                    "for {} snapshots, {} copied; buffers {:.0f}, textures {:.0f}; {} KB "
+                    "copied), {:.0f} ms waiting on the render thread",
+                    now - report_start_ms_, capture_ms_, snapshot_ms_, snapshots_,
+                    snapshot_copies_, buffer_capture_ms_, texture_capture_ms_,
+                    captured_bytes_ / 1024, blocked);
+        capture_ms_ = snapshot_ms_ = buffer_capture_ms_ = texture_capture_ms_ = 0;
+        captured_bytes_ = snapshots_ = snapshot_copies_ = 0;
+        report_start_ms_ = now;
+      }
+    }
   }
   if (!captured) {
     ++failures_;

@@ -4,6 +4,7 @@
 #include <bit>
 #include <cmath>
 #include <cstring>
+#include <optional>
 
 #include <fmt/format.h>
 
@@ -15,6 +16,7 @@
 #include "../gta4_native/native_fixed_function_policy.h"
 #include "../gta4_native/native_shader_booleans.h"
 #include "../gta4_native/native_triangle_fan.h"
+#include "simd_bytes.h"
 #include "vertex_decode.h"
 
 namespace rex::graphics::gta4_webgpu {
@@ -93,7 +95,9 @@ Pipeline* Renderer::State::DrawPipeline(
   const uint32_t texture_mask = vertex.texture_mask | (pixel ? pixel->texture_mask : 0);
   const uint32_t cube_mask = vertex.cube_mask | (pixel ? pixel->cube_mask : 0);
   const uint32_t sampler_mask = vertex.sampler_mask | (pixel ? pixel->sampler_mask : 0);
-  Words key{uint32_t(vertex.hash), uint32_t(vertex.hash >> 32),
+  Words key;
+  key.reserve(96);
+  key = {uint32_t(vertex.hash), uint32_t(vertex.hash >> 32),
             pixel ? uint32_t(pixel->hash) : 0u, pixel ? uint32_t(pixel->hash >> 32) : 0u,
             late, topology, strip_format, texture_mask, cube_mask, sampler_mask};
   for (uint32_t i = 0; i < kRenderTargetCount; ++i) {
@@ -125,6 +129,8 @@ Pipeline* Renderer::State::DrawPipeline(
     key.push_back(0xFFFFFFFFu);
   }
   if (auto found = pipelines.find(key); found != pipelines.end()) return &found->second;
+  ScopedTimer timer(timing.pipeline_ms);
+  ++timing.new_pipelines;
 
   auto vertex_module = Module(vertex, false, error);
   wgpu::ShaderModule pixel_module;
@@ -242,7 +248,10 @@ Pipeline* Renderer::State::DrawPipeline(
     descriptor.fragment = &fragment;
   }
   result.pipeline = device.CreateRenderPipeline(&descriptor);
-  if (pipelines.size() >= 8192) pipelines.clear();
+  if (pipelines.size() >= 8192) {
+    pipelines.clear();
+    pass_state.pipeline = nullptr;  // A new pipeline could reuse the handle.
+  }
   return &pipelines.emplace(std::move(key), std::move(result)).first->second;
 }
 
@@ -452,7 +461,9 @@ bool Renderer::State::Draw(const Work& work, std::string& error) {
     std::vector<uint32_t> locations;
     std::vector<const VertexElement*> elements;
   };
+  std::optional<ScopedTimer> inputs_timer(std::in_place, timing.inputs_ms);
   std::vector<StreamInputs> inputs;
+  inputs.reserve(4);
   std::vector<uint32_t> defaults;
   for (uint32_t location = 0; location < vertex.attributes.size(); ++location) {
     const uint32_t semantic = vertex.attributes[location];
@@ -583,6 +594,7 @@ bool Renderer::State::Draw(const Work& work, std::string& error) {
     attributes.push_back(std::move(list));
   }
   if (up && type == 8) count *= 2;
+  inputs_timer.reset();
 
   auto* pipeline = DrawPipeline(targets, fixed, vertex, pixel, late, specialization,
                                 uint32_t(topology), strip_format, layouts, attributes,
@@ -592,8 +604,10 @@ bool Renderer::State::Draw(const Work& work, std::string& error) {
   // Shared constants, then textures.
   core::SharedConstants shared{};
   wgpu::BindGroup texture_group;
+  std::optional<ScopedTimer> bind_timer(std::in_place, timing.bind_ms);
   if (pipeline->textures) {
     Words group_key;
+    group_key.reserve(2 + kTextureStageCount * 4);
     const auto key_pointer = [&](const void* pointer) {
       const uint64_t value = reinterpret_cast<uintptr_t>(pointer);
       group_key.push_back(uint32_t(value));
@@ -601,6 +615,7 @@ bool Renderer::State::Draw(const Work& work, std::string& error) {
     };
     key_pointer(pipeline->textures.Get());
     std::vector<wgpu::BindGroupEntry> entries;
+    entries.reserve(kTextureStageCount * 2);
     for (uint32_t slot = 0; slot < kTextureStageCount; ++slot) {
       const uint32_t bit = 1u << slot;
       if (!((pipeline->texture_mask | pipeline->sampler_mask) & bit)) continue;
@@ -629,10 +644,13 @@ bool Renderer::State::Draw(const Work& work, std::string& error) {
           if (cube == (resource->dimension == wgpu::TextureViewDimension::Cube) &&
               resource->dimension != wgpu::TextureViewDimension::e3D) {
             if (resource->dimension == wgpu::TextureViewDimension::e2DArray) {
-              wgpu::TextureViewDescriptor layer{};
-              layer.dimension = wgpu::TextureViewDimension::e2D;
-              layer.arrayLayerCount = 1;
-              view = resource->texture.CreateView(&layer);
+              if (!resource->first_layer) {
+                wgpu::TextureViewDescriptor layer{};
+                layer.dimension = wgpu::TextureViewDimension::e2D;
+                layer.arrayLayerCount = 1;
+                resource->first_layer = resource->texture.CreateView(&layer);
+              }
+              view = resource->first_layer;
             } else {
               view = resource->view;
             }
@@ -654,15 +672,20 @@ bool Renderer::State::Draw(const Work& work, std::string& error) {
     }
     if (auto found = texture_groups.find(group_key); found != texture_groups.end()) {
       texture_group = found->second.first;
+      found->second.second = frame;
     } else {
       wgpu::BindGroupDescriptor descriptor{};
       descriptor.layout = pipeline->textures;
       descriptor.entryCount = entries.size();
       descriptor.entries = entries.data();
       texture_group = device.CreateBindGroup(&descriptor);
+      // The cached group holds its views and samplers, so the pointers in
+      // its key cannot be reused by other objects while it lives.
       texture_groups.emplace(std::move(group_key), std::make_pair(texture_group, frame));
+      ++timing.new_groups;
     }
   }
+  bind_timer.reset();
   for (uint32_t i = 0; i < kRenderTargetCount; ++i)
     shared.color_output[i] =
         NativeColorOutput(work.colors[i].address, targets.colors[i] && (requested_colors & (1u << i)));
@@ -694,15 +717,16 @@ bool Renderer::State::Draw(const Work& work, std::string& error) {
   shared.projection_scale[0] = environment.projection_matrix[0];
   shared.projection_scale[1] = environment.projection_matrix[5];
 
+  std::optional<ScopedTimer> uniform_timer(std::in_place, timing.uniform_ms);
   std::array<uint8_t, kUniformSpecializationOffset + 4> uniform{};
-  core::CopyGuestWordsToHost(uniform.data() + kUniformVertexOffset,
-                             guest.data() + kDeviceVertexConstants, 0x1000);
+  CopySwap32(uniform.data() + kUniformVertexOffset, guest.data() + kDeviceVertexConstants, 0x1000);
   if (pixel)
-    core::CopyGuestWordsToHost(uniform.data() + kUniformPixelOffset,
-                               guest.data() + kDevicePixelConstants, kPixelConstantBytes);
+    CopySwap32(uniform.data() + kUniformPixelOffset, guest.data() + kDevicePixelConstants,
+               kPixelConstantBytes);
   std::memcpy(uniform.data() + kUniformSharedOffset, &shared, sizeof(shared));
   std::memcpy(uniform.data() + kUniformSpecializationOffset, &specialization, 4);
   const uint64_t uniform_offset = PushUniforms(uniform, error);
+  uniform_timer.reset();
   if (uniform_offset == UINT64_MAX) return false;
 
   if (trace) {
@@ -732,24 +756,72 @@ bool Renderer::State::Draw(const Work& work, std::string& error) {
                 c0[1], c0[2], c0[3], pipeline->texture_mask);
   }
   if (!BeginPass(targets, error)) return false;
-  pass.SetPipeline(pipeline->pipeline);
+  // Every pass call crosses from wasm into the browser's WebGPU, so state that
+  // the previous draw in this pass already set is skipped.
+  ScopedTimer encode_timer(timing.encode_ms);
+  auto& bound = pass_state;
+  if (bound.pipeline != pipeline->pipeline.Get()) {
+    pass.SetPipeline(pipeline->pipeline);
+    bound.pipeline = pipeline->pipeline.Get();
+  }
   const uint32_t dynamic_offset = uint32_t(uniform_offset);
-  pass.SetBindGroup(0, uniform_group, 1, &dynamic_offset);
-  if (texture_group) pass.SetBindGroup(1, texture_group);
-  for (uint32_t i = 0; i < bindings.size(); ++i)
+  if (!bound.uniforms_set || bound.uniform_offset != dynamic_offset) {
+    pass.SetBindGroup(0, uniform_group, 1, &dynamic_offset);
+    bound.uniforms_set = true;
+    bound.uniform_offset = dynamic_offset;
+  }
+  if (texture_group && bound.textures != texture_group.Get()) {
+    pass.SetBindGroup(1, texture_group);
+    bound.textures = texture_group.Get();
+  }
+  for (uint32_t i = 0; i < bindings.size(); ++i) {
+    auto& slot = bound.vertex_buffers[i];
+    if (slot.buffer == bindings[i].buffer.Get() && slot.offset == bindings[i].offset &&
+        slot.size == bindings[i].size)
+      continue;
     pass.SetVertexBuffer(i, bindings[i].buffer, bindings[i].offset, bindings[i].size);
-  pass.SetViewport(viewport[0], viewport[1], viewport[2], viewport[3],
-                   std::clamp(viewport[4], 0.0f, 1.0f), std::clamp(viewport[5], 0.0f, 1.0f));
-  pass.SetScissorRect(uint32_t(left), uint32_t(top), uint32_t(right - left),
-                      uint32_t(bottom - top));
-  pass.SetStencilReference(fixed.stencil_reference);
-  const wgpu::Color blend{fixed.blend_constants[0], fixed.blend_constants[1],
-                          fixed.blend_constants[2], fixed.blend_constants[3]};
-  pass.SetBlendConstant(&blend);
+    slot = {bindings[i].buffer.Get(), bindings[i].offset, bindings[i].size};
+  }
+  const std::array<float, 6> viewport_state{viewport[0], viewport[1], viewport[2], viewport[3],
+                                            std::clamp(viewport[4], 0.0f, 1.0f),
+                                            std::clamp(viewport[5], 0.0f, 1.0f)};
+  if (!bound.viewport_set || bound.viewport != viewport_state) {
+    pass.SetViewport(viewport_state[0], viewport_state[1], viewport_state[2], viewport_state[3],
+                     viewport_state[4], viewport_state[5]);
+    bound.viewport = viewport_state;
+    bound.viewport_set = true;
+  }
+  const std::array<uint32_t, 4> scissor{uint32_t(left), uint32_t(top), uint32_t(right - left),
+                                        uint32_t(bottom - top)};
+  if (!bound.scissor_set || bound.scissor != scissor) {
+    pass.SetScissorRect(scissor[0], scissor[1], scissor[2], scissor[3]);
+    bound.scissor = scissor;
+    bound.scissor_set = true;
+  }
+  if (!bound.stencil_set || bound.stencil_reference != fixed.stencil_reference) {
+    pass.SetStencilReference(fixed.stencil_reference);
+    bound.stencil_reference = fixed.stencil_reference;
+    bound.stencil_set = true;
+  }
+  const std::array<float, 4> blend_state{fixed.blend_constants[0], fixed.blend_constants[1],
+                                         fixed.blend_constants[2], fixed.blend_constants[3]};
+  if (!bound.blend_set || bound.blend != blend_state) {
+    const wgpu::Color blend{blend_state[0], blend_state[1], blend_state[2], blend_state[3]};
+    pass.SetBlendConstant(&blend);
+    bound.blend = blend_state;
+    bound.blend_set = true;
+  }
   if (indexed) {
-    pass.SetIndexBuffer(index_buffer, index32 ? wgpu::IndexFormat::Uint32 : wgpu::IndexFormat::Uint16,
-                        index_offset, uint64_t(count) * (index32 ? 4 : 2));
-    pass.DrawIndexed(count, 1, 0, base_vertex, 0);
+    // Bind the whole index buffer and select the range with firstIndex, so
+    // draws from the same buffer share one binding.
+    const uint32_t element = index32 ? 4 : 2;
+    const auto format = index32 ? wgpu::IndexFormat::Uint32 : wgpu::IndexFormat::Uint16;
+    if (bound.index_buffer != index_buffer.Get() || bound.index_format != format) {
+      pass.SetIndexBuffer(index_buffer, format, 0, wgpu::kWholeSize);
+      bound.index_buffer = index_buffer.Get();
+      bound.index_format = format;
+    }
+    pass.DrawIndexed(count, 1, uint32_t(index_offset / element), base_vertex, 0);
   } else {
     pass.Draw(count, 1, up ? 0 : first, 0);
   }

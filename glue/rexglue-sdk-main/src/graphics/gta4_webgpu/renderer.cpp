@@ -1,14 +1,19 @@
 #include "renderer_state.h"
+#include "simd_bytes.h"
 
 #include <algorithm>
 #include <atomic>
 #include <cstring>
+#include <optional>
 
 #include <fmt/format.h>
 
 #include <rex/cvar.h>
 #include <rex/logging.h>
 
+REXCVAR_DEFINE_BOOL(webgpu_perf_report, false, "GPU/Diagnostics",
+                    "Web build: log renderer timing reports as warnings (shown with "
+                    "--log_level=warn)");
 REXCVAR_DEFINE_UINT32(webgpu_trace_frame, 0, "GPU/Diagnostics",
                       "Web build: log every title command of this presented frame");
 
@@ -255,6 +260,7 @@ void Renderer::State::EndPass() {
     pass = nullptr;
   }
   pass_targets = {};
+  pass_state = {};
 }
 
 uint64_t Renderer::State::PushUniforms(std::span<const uint8_t> bytes, std::string& error) {
@@ -263,6 +269,15 @@ uint64_t Renderer::State::PushUniforms(std::span<const uint8_t> bytes, std::stri
   if (bytes.size() > kUniformStride) {
     error = "Uniform block exceeds its slot";
     return UINT64_MAX;
+  }
+  // Identical constants share a slot within the batch (the rest of a slot is
+  // zero, so equal bytes of equal size mean equal bindings).
+  const uint64_t hash = XXH3_64bits(bytes.data(), bytes.size());
+  if (auto found = uniform_slots.find(hash); found != uniform_slots.end() &&
+      found->second.size == bytes.size() &&
+      BytesEqual(uniforms.bytes.data() + found->second.offset, bytes.data(), bytes.size())) {
+    ++timing.uniform_reused;
+    return found->second.offset;
   }
   if (uniforms.bytes.size() + kUniformStride + kUniformBlockSize > uniforms.capacity) {
     if (!uniforms.bytes.empty() && !Flush(error)) return UINT64_MAX;
@@ -287,6 +302,8 @@ uint64_t Renderer::State::PushUniforms(std::span<const uint8_t> bytes, std::stri
   const uint64_t offset = uniforms.bytes.size();
   uniforms.bytes.resize(offset + kUniformStride);
   std::memcpy(uniforms.bytes.data() + offset, bytes.data(), bytes.size());
+  uniform_slots[hash] = {offset, bytes.size()};
+  ++timing.uniform_slots;
   return offset;
 }
 
@@ -316,7 +333,9 @@ uint64_t Renderer::State::PushGeometry(std::span<const uint8_t> bytes, std::stri
 
 bool Renderer::State::Flush(std::string& error) {
   EndPass();
+  uniform_slots.clear();
   if (!encoder) return true;
+  ScopedTimer timer(timing.submit_ms);
   // Arena writes are ordered before the command buffer that reads them.
   if (!uniforms.bytes.empty())
     queue.WriteBuffer(uniforms.buffer, 0, uniforms.bytes.data(), uniforms.bytes.size());
@@ -363,6 +382,7 @@ bool Renderer::State::BeginPass(const Targets& targets, std::string& error) {
   }
   pass = encoder.BeginRenderPass(&descriptor);
   pass_targets = targets;
+  pass_state = {};
   return true;
 }
 
@@ -570,6 +590,9 @@ Renderer::Status Renderer::Execute(Work& work, std::string& error) {
     return Status::kDone;
   }
   const auto type = work.type();
+  // Present reports and resets the stats itself, so it is timed there.
+  std::optional<ScopedTimer> timer;
+  if (type != CommandType::kPresent) timer.emplace(s.timing.execute_ms);
   if (uint32_t(type) < s.stats.commands.size()) ++s.stats.commands[uint32_t(type)];
   s.trace = REXCVAR_GET(webgpu_trace_frame) && s.frame + 1 == REXCVAR_GET(webgpu_trace_frame);
   if (s.trace && type != CommandType::kDrawPrimitive && type != CommandType::kDrawIndexedPrimitive &&

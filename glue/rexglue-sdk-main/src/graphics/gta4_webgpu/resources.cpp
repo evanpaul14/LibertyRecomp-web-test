@@ -16,6 +16,8 @@ namespace {
 using namespace gta4_native;
 
 constexpr uint64_t kCacheRetainFrames = 300;
+// Bind groups keep their textures alive, so unused ones go sooner.
+constexpr uint64_t kGroupRetainFrames = 30;
 
 wgpu::AddressMode Address(xenos::ClampMode mode) {
   switch (mode) {
@@ -230,6 +232,8 @@ bool Renderer::State::Upload(TextureResource& texture, const TextureCapture& cap
     error = "CPU-written packed depth textures are unsupported";
     return false;
   }
+  ScopedTimer timer(timing.texture_ms);
+  ++timing.new_textures;
   std::vector<DecodedSlice> slices;
   if (!DecodeTexture(texture.info, capture, slices, error)) return false;
   const bool compressed = IsCompressed(texture.format);
@@ -255,6 +259,7 @@ bool Renderer::State::Upload(TextureResource& texture, const TextureCapture& cap
     layout.rowsPerImage = slice.rows;
     wgpu::Extent3D size{width, height, volume ? slice.depth : 1};
     queue.WriteTexture(&destination, slice.bytes.data(), slice.bytes.size(), &layout, &size);
+    timing.texture_bytes += slice.bytes.size();
   }
   texture.content_serial = ++content_serial;
   return true;
@@ -278,6 +283,13 @@ std::shared_ptr<TextureResource> Renderer::State::SampledTexture(
 
 wgpu::Sampler Renderer::State::Sampler(const xenos::xe_gpu_texture_fetch_t& fetch,
                                        const TextureResource* texture) {
+  FetchKey fetch_key{};
+  std::memcpy(fetch_key.data(), &fetch, sizeof(uint32_t) * 6);
+  fetch_key[6] = texture ? texture->mip_levels : 0;
+  if (auto found = fetch_samplers.find(fetch_key); found != fetch_samplers.end())
+    return found->second;
+  if (fetch_samplers.size() >= 65536) fetch_samplers.clear();
+  auto& memo = fetch_samplers[fetch_key];
   xenos::ClampMode u, v, w;
   texture_util::GetClampModesForDimension(fetch, u, v, w);
   const auto filter = [](xenos::TextureFilter value) {
@@ -307,7 +319,7 @@ wgpu::Sampler Renderer::State::Sampler(const xenos::xe_gpu_texture_fetch_t& fetc
   const Words key{uint32_t(Address(u)),       uint32_t(Address(v)),  uint32_t(Address(w)),
                   uint32_t(min_filter),       uint32_t(mag_filter),  uint32_t(mip_filter),
                   minimum,                    maximum,               anisotropy};
-  if (auto found = samplers.find(key); found != samplers.end()) return found->second;
+  if (auto found = samplers.find(key); found != samplers.end()) return memo = found->second;
   wgpu::SamplerDescriptor descriptor{};
   descriptor.addressModeU = Address(u);
   descriptor.addressModeV = Address(v);
@@ -320,7 +332,7 @@ wgpu::Sampler Renderer::State::Sampler(const xenos::xe_gpu_texture_fetch_t& fetc
   descriptor.maxAnisotropy = anisotropy;
   auto sampler = device.CreateSampler(&descriptor);
   samplers.emplace(key, sampler);
-  return sampler;
+  return memo = sampler;
 }
 
 wgpu::Buffer Renderer::State::IndexBuffer(const BufferCapture& capture, bool& index32,
@@ -335,6 +347,8 @@ wgpu::Buffer Renderer::State::IndexBuffer(const BufferCapture& capture, bool& in
     found->second.frame = frame;
     return found->second.buffer;
   }
+  ScopedTimer timer(timing.geometry_ms);
+  ++timing.new_buffers;
   const size_t count = capture.bytes.size() / element;
   wgpu::BufferDescriptor descriptor{};
   descriptor.size = std::max<uint64_t>(4, (count * element + 3) & ~uint64_t(3));
@@ -356,6 +370,7 @@ wgpu::Buffer Renderer::State::IndexBuffer(const BufferCapture& capture, bool& in
     }
   }
   buffer.Unmap();
+  timing.buffer_bytes += descriptor.size;
   index_buffers[capture.generation] = {buffer, descriptor.size, frame};
   return buffer;
 }
@@ -383,6 +398,8 @@ wgpu::Buffer Renderer::State::VertexBuffer(const BufferCapture& capture, uint32_
     error = "Vertex stream holds no complete vertex";
     return nullptr;
   }
+  ScopedTimer timer(timing.geometry_ms);
+  ++timing.new_buffers;
   const size_t output_stride = elements.size() * 16;
   wgpu::BufferDescriptor descriptor{};
   descriptor.size = std::max<uint64_t>(16, vertices * output_stride);
@@ -403,6 +420,7 @@ wgpu::Buffer Renderer::State::VertexBuffer(const BufferCapture& capture, uint32_
   }
   buffer.Unmap();
   size = descriptor.size;
+  timing.buffer_bytes += size;
   vertex_buffers[key] = {buffer, size, frame};
   return buffer;
 }
@@ -430,7 +448,8 @@ void Renderer::State::ClearResources() {
 
 void Renderer::State::BeginFrame() {
   ++frame;
-  texture_groups.clear();
+  std::erase_if(texture_groups,
+                [&](const auto& entry) { return frame - entry.second.second > kGroupRetainFrames; });
   std::erase_if(vertex_buffers,
                 [&](const auto& entry) { return frame - entry.second.frame > kCacheRetainFrames; });
   std::erase_if(index_buffers,

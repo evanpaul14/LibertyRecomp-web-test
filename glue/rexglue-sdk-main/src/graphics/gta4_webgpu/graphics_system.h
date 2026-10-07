@@ -95,6 +95,11 @@ class Gta4WebGpuGraphicsSystem final : public system::IGraphicsSystem {
   // and reflection targets): never captured from guest memory.
   std::unordered_set<uint32_t> gpu_textures_;
   uint64_t next_generation_ = 1;
+  // Submitting-thread time (ms) since the last report, under capture_mutex_
+  // except blocked_ms_ (under queue_mutex_).
+  double capture_ms_ = 0, snapshot_ms_ = 0, buffer_capture_ms_ = 0, texture_capture_ms_ = 0, report_start_ms_ = 0;
+  uint64_t captured_bytes_ = 0, snapshots_ = 0, snapshot_copies_ = 0;
+  double blocked_ms_ = 0;
   std::shared_ptr<std::vector<uint8_t>> last_device_;
   uint32_t last_device_address_ = 0;
 

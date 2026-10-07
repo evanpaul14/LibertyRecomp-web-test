@@ -36,8 +36,23 @@ mapped); this file is for whoever continues the work.
   be screenshotted in this container, so the browser picture is unverified.
 - `rex-web-memory-test` (26 checks: alias folding, byte order, heaps, MMIO,
   returned-pointer aliases) passes under Node 24.
-- Next step candidates: **in-browser game-file loading** (needed to see the
-  renderer in a real browser), or renderer fidelity/performance. Ask the user.
+- **Real browser (Chrome on an M1 Mac, 2026-10-07).** With game files served by
+  `tools/web/serve.py` (installed from a disc image extracted to a folder; the
+  installer cannot map a 7.8 GB `.iso` under Node), the build reaches gameplay
+  in Chrome. The loading screen draws correctly. Gameplay frames (11–15k draws)
+  run at about 5 fps, and in Chrome they looked black; the tab was in the
+  background for part of that run, so this is not confirmed. Under Node with
+  Dawn on Metal the same code draws the intro credits correctly, then that run
+  stopped progressing (one core spinning) right after a 2.7 s burst of
+  pipeline compiles.
+- **Profiling.** `--webgpu_perf_report=true` logs render-thread and capture
+  timing every 5 s as warnings. Use it with `--diagnostics=true
+  --diagnostics_categories=logging --log_level=warn`: other diagnostics print
+  a line per draw, and every line blocks the game thread until the page's
+  main thread handles it. In the browser that alone held gameplay below 1 fps.
+- Next step candidates: why Chrome gameplay frames come out black (dump frames
+  with `--webgpu_frame_dump_path` and read them back from MEMFS, with the tab
+  in front), the remaining per-draw cost, and the Node stall. Ask the user.
 
 ## Key design decisions (and where they live)
 
@@ -138,9 +153,18 @@ XDG_DATA_HOME=<data> node out/web/LibertyRecomp/LibertyRecomp.js --diagnostics=t
 - Write watches (page-protection faults) never fire; the renderer trusts the
   title's `ResourceUnlock` notifications plus a byte compare when a capture is
   marked dirty. A buffer the title writes without unlocking would go stale.
-- Performance is untuned: each draw compares/copies the 22 KB device block
-  (the Vulkan renderer sends dirty deltas instead), textures and vertex
-  conversions run on the render thread, and pipelines compile synchronously.
+- Performance: identical uniform blocks share a slot within a batch, redundant
+  pass state is skipped, texture bind groups and samplers are cached across
+  frames, and the hot byte compares and swaps use SIMD128 (Emscripten's libc
+  does them per byte). Measured in Chrome gameplay: ~13 µs of render-thread
+  time per draw (uniforms ~2, encoding ~3, the rest per-draw setup), and the
+  game thread spends ~35% of its time capturing. Still open: device-block
+  dirty deltas instead of 22 KB copies, fewer per-draw allocations, and
+  asynchronous pipeline compiles (native Dawn compiles synchronously, about
+  140 ms per pipeline on Metal).
+- Chrome's audio fails: SDL3's audio callback throws `Cannot mix BigInt and
+  other types` in `CPtrToHeap32Index` (a wasm64 bug in SDL's JavaScript).
+- Frames are not paced: loading screens present 400–4000 frames a second.
 - The shader archive is zlib (12 MB); zstd would be 4.7 MB but needs a wasm zstd.
 - The `0x90000000` view does not mirror `0x80000000` on the web.
 - Guest FP rounding and flush modes are recorded but not applied.

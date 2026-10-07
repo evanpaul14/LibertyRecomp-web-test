@@ -33,9 +33,21 @@
     // tools/web/serve.py and docs/WEB_BUILDING.md.
     const statusEl = document.getElementById('status');
     const logEl = document.getElementById('log');
+    // Log lines from the title's threads block until this page thread has
+    // handled them, so appending must stay cheap: queue them and update the
+    // panel (last MAX_LOG_LINES lines) once per animation frame.
+    const MAX_LOG_LINES = 2000;
+    let logLines = [], logPending = false;
     function append(line) {
-      logEl.textContent += line + '\n';
-      logEl.scrollTop = logEl.scrollHeight;
+      logLines.push(line);
+      if (logPending) return;
+      logPending = true;
+      requestAnimationFrame(() => {
+        logPending = false;
+        if (logLines.length > MAX_LOG_LINES) logLines = logLines.slice(-MAX_LOG_LINES);
+        logEl.textContent = logLines.join('\n');
+        logEl.scrollTop = logEl.scrollHeight;
+      });
     }
     if (!self.crossOriginIsolated) {
       statusEl.textContent =
