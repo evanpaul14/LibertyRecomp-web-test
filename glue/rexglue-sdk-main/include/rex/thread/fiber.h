@@ -14,7 +14,8 @@
 #include <rex/platform.h>
 #include <cstddef>
 
-#if (REX_PLATFORM_LINUX || REX_PLATFORM_MAC) && !REX_PLATFORM_IOS && !REX_PLATFORM_ANDROID
+#if (REX_PLATFORM_LINUX || REX_PLATFORM_MAC) && !REX_PLATFORM_IOS && !REX_PLATFORM_ANDROID && \
+    !REX_PLATFORM_WEB
 #if REX_PLATFORM_MAC && !defined(_XOPEN_SOURCE)
 // Darwin hides the deprecated ucontext APIs unless _XOPEN_SOURCE is defined
 // before including <ucontext.h>.
@@ -55,6 +56,10 @@ struct Fiber {
 
 #if REX_PLATFORM_WIN32
   void* handle_ = nullptr;
+  bool is_thread_fiber_ = false;
+#elif REX_PLATFORM_WEB
+  // WebAssembly cannot switch native stacks without Asyncify or JSPI. Only
+  // thread fibers (ConvertCurrentThread) are supported; see fiber_web.cpp.
   bool is_thread_fiber_ = false;
 #elif REX_PLATFORM_IOS || REX_PLATFORM_ANDROID || REX_PLATFORM_NX
   alignas(16) unsigned char jmpbuf_[512]{};

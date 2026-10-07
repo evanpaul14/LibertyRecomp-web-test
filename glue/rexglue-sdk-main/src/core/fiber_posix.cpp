@@ -17,7 +17,7 @@
 #endif
 
 #include <rex/platform.h>
-#if REX_PLATFORM_LINUX || REX_PLATFORM_MAC
+#if (REX_PLATFORM_LINUX || REX_PLATFORM_MAC) && !REX_PLATFORM_WEB
 
 #include <rex/thread/fiber.h>
 
@@ -81,4 +81,4 @@ void Fiber::Destroy() {
 
 }  // namespace rex::thread
 
-#endif  // REX_PLATFORM_LINUX || REX_PLATFORM_MAC
+#endif  // (REX_PLATFORM_LINUX || REX_PLATFORM_MAC) && !REX_PLATFORM_WEB

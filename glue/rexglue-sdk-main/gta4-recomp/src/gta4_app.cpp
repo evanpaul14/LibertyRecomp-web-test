@@ -751,8 +751,13 @@ void GTA4App::OnPreSetup(rex::RuntimeConfig& config) {
   config.live.community_url = REXCVAR_GET(gta4_community_url);
   config.live.player_name = REXCVAR_GET(gta4_player_name);
   config.live.lan_discovery_port = static_cast<uint16_t>(REXCVAR_GET(gta4_lan_discovery_port));
+#if !REX_PLATFORM_WEB
+  // The community backend needs CURL and OpenSSL. The web build leaves the
+  // factory unset, so selecting community multiplayer reports an error
+  // instead of starting (browser networking is future work).
   config.live.community_backend_factory =
       &LibertyRecomp::Network::CreateCommunityMultiplayerBackend;
+#endif
   config.live.voice_audio_device = gta4::voice::CreateAudioDevice();
   config.live.voice_sample_codec = gta4::voice::CreateSampleCodec();
   const std::weak_ptr<rex::system::xam::IVoiceAudioDevice> voice_device =

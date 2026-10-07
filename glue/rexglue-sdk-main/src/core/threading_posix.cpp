@@ -37,6 +37,10 @@ static_assert(REX_PLATFORM_LINUX || REX_PLATFORM_MAC, "This file is POSIX-only")
 
 #include <sched.h>
 
+#if REX_PLATFORM_WEB
+#include <emscripten/threading.h>
+#endif
+
 #if REX_PLATFORM_ANDROID
 #include <dlfcn.h>
 
@@ -141,6 +145,15 @@ void install_signal_handler(SignalType type) {
 
 // TODO(dougvj)
 void EnableAffinityConfiguration() {}
+
+static void SetPthreadName(pthread_t thread, const std::string& name) {
+#if REX_PLATFORM_WEB
+  // No pthread_setname_np; this names the Web Worker in browser devtools.
+  emscripten_set_thread_name(thread, name.c_str());
+#else
+  pthread_setname_np(thread, name.c_str());
+#endif
+}
 
 // uint64_t ticks() { return mach_absolute_time(); }
 
@@ -673,7 +686,7 @@ class PosixCondition<Thread> : public PosixConditionBase {
     WaitStarted();
     std::unique_lock<std::mutex> lock(state_mutex_);
     if (state_ != State::kUninitialized && state_ != State::kFinished) {
-      pthread_setname_np(thread_, std::string(name).c_str());
+      SetPthreadName(thread_, std::string(name));
 #if REX_PLATFORM_ANDROID
       SetAndroidPreApi26Name(name);
 #endif
@@ -1411,7 +1424,7 @@ void Thread::Exit(int exit_code) {
 }
 
 void set_current_thread_name(const std::string_view name) {
-  pthread_setname_np(pthread_self(), std::string(name).c_str());
+  SetPthreadName(pthread_self(), std::string(name));
 #if REX_PLATFORM_ANDROID
   if (!android_pthread_getname_np_ && current_thread_) {
     current_thread_->condition().SetAndroidPreApi26Name(name);
