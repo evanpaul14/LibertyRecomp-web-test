@@ -45,6 +45,23 @@ fn source_coord(p: vec4<f32>) -> vec2<i32> {
   let rel = (p.xy - params.a.zw) * params.b.xy / params.b.zw;
   return vec2<i32>(params.a.xy + floor(rel));
 }
+// The guest's 24-bit depth encodings (unorm, or 20e4 float when c.x is set).
+fn depth20e4(depth: f32) -> u32 {
+  if (!(depth > 0.0)) { return 0u; }
+  var bits = bitcast<u32>(depth);
+  if (bits >= 0x3FFFFFF8u) { return 0xFFFFFFu; }
+  if (bits < 0x38800000u) {
+    let shift = min(113u - (bits >> 23u), 24u);
+    bits = (0x800000u | (bits & 0x7FFFFFu)) >> shift;
+  } else {
+    bits += 0xC8000000u;
+  }
+  return (bits >> 3u) & 0xFFFFFFu;
+}
+fn packed_depth(depth: f32) -> u32 {
+  return select(u32(round(clamp(depth, 0.0, 1.0) * 16777215.0)), depth20e4(depth),
+                params.c.x != 0.0);
+}
 )";
 constexpr char kCopyColor[] = R"(
 @group(1) @binding(0) var source: texture_2d<f32>;
@@ -66,23 +83,9 @@ constexpr char kCopyDepthToColor[] = R"(
 // fetch constant's swizzle.
 constexpr char kPackedDepthAlias[] = R"(
 @group(1) @binding(0) var source: texture_2d<f32>;
-fn depth20e4(depth: f32) -> u32 {
-  if (!(depth > 0.0)) { return 0u; }
-  var bits = bitcast<u32>(depth);
-  if (bits >= 0x3FFFFFF8u) { return 0xFFFFFFu; }
-  if (bits < 0x38800000u) {
-    let shift = min(113u - (bits >> 23u), 24u);
-    bits = (0x800000u | (bits & 0x7FFFFFu)) >> shift;
-  } else {
-    bits += 0xC8000000u;
-  }
-  return (bits >> 3u) & 0xFFFFFFu;
-}
 @fragment fn fs(@builtin(position) p: vec4<f32>) -> @location(0) vec4<f32> {
   let value = textureLoad(source, vec2<i32>(p.xy), 0);
-  let packed_depth = select(u32(round(clamp(value.r, 0.0, 1.0) * 16777215.0)),
-                            depth20e4(value.r), params.c.x != 0.0);
-  let packed = (packed_depth << 8u) | (u32(value.g) & 255u);
+  let packed = (packed_depth(value.r) << 8u) | (u32(value.g) & 255u);
   let raw = vec4<f32>(vec4<u32>(packed, packed >> 8u, packed >> 16u, packed >> 24u) & vec4<u32>(255u)) / 255.0;
   let swizzle = u32(params.c.y);
   var color: vec4<f32>;
@@ -97,6 +100,24 @@ constexpr char kCopyDepth[] = R"(
 @group(1) @binding(0) var source: texture_depth_2d;
 @fragment fn fs(@builtin(position) p: vec4<f32>) -> @builtin(frag_depth) f32 {
   return textureLoad(source, source_coord(p), 0);
+}
+)";
+// Depth from a resolved snapshot (rg32float, depth in red).
+constexpr char kCopyDepthValues[] = R"(
+@group(1) @binding(0) var source: texture_2d<f32>;
+@fragment fn fs(@builtin(position) p: vec4<f32>) -> @builtin(frag_depth) f32 {
+  return textureLoad(source, vec2<i32>(p.xy), 0).r;
+}
+)";
+// The scene-to-forward handoff, as gta4_native/scene_depth_handoff_ps.glsl:
+// the pass clears stencil to kForwardEmptySceneStencil and its stencil state
+// replaces it with kForwardCoveredSceneStencil wherever packed depth is nonzero.
+constexpr char kSceneDepthHandoff[] = R"(
+@group(1) @binding(0) var source: texture_2d<f32>;
+@fragment fn fs(@builtin(position) p: vec4<f32>) -> @builtin(frag_depth) f32 {
+  let depth = textureLoad(source, vec2<i32>(p.xy), 0).r;
+  if (packed_depth(depth) == 0u) { discard; }
+  return depth;
 }
 )";
 constexpr char kClearColor[] = R"(
@@ -119,12 +140,16 @@ struct UtilityKind {
   // Group 1 source: 0 none, 1 float texture, 2 depth texture, 3 float texture + sampler,
   // 4 depth texture + stencil texture.
   int source;
+  // Writes kForwardCoveredSceneStencil where it passes, over a stencil
+  // cleared to kForwardEmptySceneStencil.
+  bool scene_coverage = false;
 };
 constexpr UtilityKind kUtilities[] = {
     {"copy_color", kCopyColor, 1},     {"copy_depth_to_color", kCopyDepthToColor, 4},
-    {"copy_depth", kCopyDepth, 2},     {"clear_color", kClearColor, 0},
-    {"clear_depth", kClearDepth, 0},   {"present", kPresent, 3},
-    {"packed_depth_alias", kPackedDepthAlias, 1},
+    {"copy_depth", kCopyDepth, 2},     {"copy_depth_values", kCopyDepthValues, 1},
+    {"clear_color", kClearColor, 0},   {"clear_depth", kClearDepth, 0},
+    {"present", kPresent, 3},          {"packed_depth_alias", kPackedDepthAlias, 1},
+    {"scene_depth_handoff", kSceneDepthHandoff, 1, true},
 };
 const UtilityKind* FindUtility(std::string_view name) {
   for (const auto& kind : kUtilities)
@@ -544,10 +569,10 @@ wgpu::RenderPipeline Renderer::State::UtilityPipeline(const std::string& name,
     depth_state.format = depth;
     depth_state.depthWriteEnabled = wgpu::OptionalBool::True;
     depth_state.depthCompare = wgpu::CompareFunction::Always;
-    depth_state.stencilFront = depth_state.stencilBack = {wgpu::CompareFunction::Always,
-                                                          wgpu::StencilOperation::Keep,
-                                                          wgpu::StencilOperation::Keep,
-                                                          wgpu::StencilOperation::Keep};
+    depth_state.stencilFront = depth_state.stencilBack = {
+        wgpu::CompareFunction::Always, wgpu::StencilOperation::Keep, wgpu::StencilOperation::Keep,
+        kind->scene_coverage ? wgpu::StencilOperation::Replace : wgpu::StencilOperation::Keep};
+    depth_state.stencilReadMask = depth_state.stencilWriteMask = kind->scene_coverage ? 0xFF : 0;
     descriptor.depthStencil = &depth_state;
   }
   auto pipeline = device.CreateRenderPipeline(&descriptor);
@@ -564,6 +589,7 @@ bool Renderer::State::UtilityPass(const std::string& name, wgpu::TextureView tar
   auto pipeline = UtilityPipeline(name, target_is_depth ? wgpu::TextureFormat::Undefined : format,
                                   target_is_depth ? format : wgpu::TextureFormat::Undefined, error);
   if (!pipeline) return false;
+  const bool scene_coverage = FindUtility(name)->scene_coverage;
   std::array<uint8_t, 64> params{};
   std::memcpy(params.data(), parameters.data(), std::min(params.size(), parameters.size_bytes()));
   const uint64_t offset = PushUniforms(params, error);
@@ -582,6 +608,10 @@ bool Renderer::State::UtilityPass(const std::string& name, wgpu::TextureView tar
     if (stencil) {
       depth.stencilLoadOp = load_existing ? wgpu::LoadOp::Load : wgpu::LoadOp::Clear;
       depth.stencilStoreOp = wgpu::StoreOp::Store;
+      if (scene_coverage) {
+        depth.stencilLoadOp = wgpu::LoadOp::Clear;
+        depth.stencilClearValue = kForwardEmptySceneStencil;
+      }
     }
     descriptor.depthStencilAttachment = &depth;
   } else {
@@ -611,6 +641,7 @@ bool Renderer::State::UtilityPass(const std::string& name, wgpu::TextureView tar
     group.entries = entries.data();
     encoder_pass.SetBindGroup(1, device.CreateBindGroup(&group));
   }
+  if (scene_coverage) encoder_pass.SetStencilReference(kForwardCoveredSceneStencil);
   encoder_pass.SetViewport(0, 0, float(width), float(height), 0, 1);
   const int32_t left = std::clamp(scissor[0], 0, int32_t(width));
   const int32_t top = std::clamp(scissor[1], 0, int32_t(height));

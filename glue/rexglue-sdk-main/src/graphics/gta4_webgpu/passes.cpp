@@ -228,25 +228,62 @@ bool Renderer::State::Resolve(const Work& work, std::string& error) {
 
 bool Renderer::State::Handoff(const Work& work, std::string& error) {
   const auto c = work.As<DepthSurfaceHandoffCommand>();
-  auto source = ResolveSource(c.source, true, error);
-  auto destination = Surface(c.destination, true, error);
-  if (!source || !destination) return false;
-  if (!source->initialized || source == destination) return true;
-  if (source->width != destination->width || source->height != destination->height) {
-    error = "Depth handoff between different extents";
+  if (!IsValidForwardStencilHandoffPolicy(c.stencil_policy)) {
+    error = "Invalid depth handoff stencil policy";
     return false;
   }
-  // Depth only; the destination keeps its stencil (WebGPU cannot export
-  // stencil from a shader, so the rebuild policy is not reproduced).
-  const std::array<float, 12> parameters{0, 0, 0, 0,
-                                         float(source->width), float(source->height),
-                                         float(source->width), float(source->height),
-                                         0, 0, 0, 0};
-  if (!UtilityPass("copy_depth", destination->view, wgpu::kDepthSliceUndefined, true,
-                   destination->format, destination->width, destination->height,
-                   {0, 0, int32_t(destination->width), int32_t(destination->height)},
-                   DepthView(*source), parameters, destination->initialized, error))
-    return false;
+  const bool rebuild = c.stencil_policy == ForwardStencilHandoffPolicy::kRebuildSceneCoverage;
+  auto destination = Surface(c.destination, true, error);
+  if (!destination) return false;
+  // As in the Metal renderer, depth comes from the title's resolved snapshot.
+  std::shared_ptr<TextureResource> snapshot;
+  if (auto found = textures.find(c.source_texture); found != textures.end() &&
+                                                     found->second->gpu_produced &&
+                                                     found->second->depth_values &&
+                                                     found->second->content_serial)
+    snapshot = found->second;
+  if (trace)
+    REXLOG_INFO("webgpu-trace: handoff source={:08X} texture={:08X} snapshot={} destination={:08X} "
+                "rebuild={}",
+                c.source.handle, c.source_texture, bool(snapshot), c.destination.handle, rebuild);
+  const std::array<int32_t, 4> whole{0, 0, int32_t(destination->width),
+                                     int32_t(destination->height)};
+  if (snapshot) {
+    if (snapshot->width != destination->width || snapshot->height != destination->height) {
+      error = "Depth handoff between different extents";
+      return false;
+    }
+    wgpu::TextureViewDescriptor level{};
+    level.dimension = wgpu::TextureViewDimension::e2D;
+    level.mipLevelCount = 1;
+    level.arrayLayerCount = 1;
+    const bool float_depth = GetBaseFormat(snapshot->info.format) == xenos::TextureFormat::k_24_8_FLOAT;
+    const std::array<float, 12> parameters{0, 0, 0, 0, 0, 0, 0, 0, float_depth ? 1.0f : 0.0f, 0, 0, 0};
+    // A rebuild clears depth to zero and stencil to the empty-scene value;
+    // otherwise every depth sample is overwritten and the stencil is kept.
+    if (!UtilityPass(rebuild ? "scene_depth_handoff" : "copy_depth_values", destination->view,
+                     wgpu::kDepthSliceUndefined, true, destination->format, destination->width,
+                     destination->height, whole, snapshot->texture.CreateView(&level), parameters,
+                     !rebuild && destination->initialized, error))
+      return false;
+  } else {
+    // No snapshot: copy the source surface's depth and keep the stencil.
+    auto source = ResolveSource(c.source, true, error);
+    if (!source) return false;
+    if (!source->initialized || source == destination) return true;
+    if (source->width != destination->width || source->height != destination->height) {
+      error = "Depth handoff between different extents";
+      return false;
+    }
+    const std::array<float, 12> parameters{0, 0, 0, 0,
+                                           float(source->width), float(source->height),
+                                           float(source->width), float(source->height),
+                                           0, 0, 0, 0};
+    if (!UtilityPass("copy_depth", destination->view, wgpu::kDepthSliceUndefined, true,
+                     destination->format, destination->width, destination->height, whole,
+                     DepthView(*source), parameters, destination->initialized, error))
+      return false;
+  }
   destination->initialized = true;
   destination->content_serial = ++content_serial;
   return true;

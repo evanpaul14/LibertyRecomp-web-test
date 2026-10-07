@@ -756,8 +756,8 @@ bool Renderer::State::Draw(const Work& work, std::string& error) {
                           work.up_vertices.data() + inputs[0].elements[0]->offset, position);
     REXLOG_INFO("webgpu-trace: draw vs={:016X} ps={:016X} type={} count={} indexed={} up={} "
                 "color0={:08X}/{}x{} depth={:08X} viewport={},{},{},{},{},{} scissor={},{},{},{} "
-                "writes={:X} blend0={:08X} depth-test={}/{} attr0={},{},{},{} c208={},{},{},{} "
-                "textures={:X}",
+                "writes={:X} blend0={:08X} depth-test={}/{} stencil={}/{}/{:02X}/{:02X}/{:02X} "
+                "ops={}{}{} attr0={},{},{},{} c208={},{},{},{} textures={:X}",
                 vertex.hash, pixel ? pixel->hash : 0, type, vertex_count, indexed, up,
                 targets.colors[0] ? targets.colors[0]->descriptor.handle : 0,
                 targets.colors[0] ? targets.colors[0]->width : 0,
@@ -765,7 +765,10 @@ bool Renderer::State::Draw(const Work& work, std::string& error) {
                 targets.depth ? targets.depth->descriptor.handle : 0, viewport[0], viewport[1],
                 viewport[2], viewport[3], viewport[4], viewport[5], left, top, right, bottom,
                 fixed.color_write_mask, fixed.blend_controls[0], fixed.depth_enable,
-                fixed.depth_function, position[0], position[1], position[2], position[3], c0[0],
+                fixed.depth_function, fixed.stencil_enable, fixed.stencil_function,
+                fixed.stencil_reference, fixed.stencil_mask, fixed.stencil_write_mask,
+                fixed.stencil_fail, fixed.stencil_depth_fail, fixed.stencil_pass, position[0],
+                position[1], position[2], position[3], c0[0],
                 c0[1], c0[2], c0[3], pipeline->texture_mask);
     // The first vertex's decoded inputs, and the nonzero pixel constants.
     std::string detail;
