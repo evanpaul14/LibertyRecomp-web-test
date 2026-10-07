@@ -276,9 +276,11 @@ node out/web-node/LibertyRecomp/LibertyRecomp.js --diagnostics=true \
 - Performance: identical uniform blocks share a slot within a batch, redundant
   pass state is skipped, texture bind groups and samplers are cached across
   frames, and the hot byte compares and swaps use SIMD128 (Emscripten's libc
-  does them per byte). Measured in Chrome gameplay: ~13 µs of render-thread
-  time per draw (uniforms ~2, encoding ~3, the rest per-draw setup), and the
-  game thread spends ~35% of its time capturing. Still open: device-block
+  does them per byte). Measured in Chrome: ~13 µs of render-thread time per
+  draw in an earlier gameplay run (uniforms ~2, encoding ~3, the rest per-draw
+  setup), but ~20–32 µs in the 2026-10-07 intro run, rising with draw count
+  (6,600 draws: inputs 36, bindings 25, uniforms 29, encode 39 ms a frame).
+  The game thread spends ~30–35% of its time capturing. Still open: device-block
   dirty deltas instead of 22 KB copies, fewer per-draw allocations, and
   asynchronous pipeline compiles (native Dawn compiles synchronously, about
   140 ms per pipeline on Metal).
@@ -297,16 +299,19 @@ node out/web-node/LibertyRecomp/LibertyRecomp.js --diagnostics=true \
 
 ## Next steps (pick with the user)
 
-1. **In-browser game files.** A file or folder picker (File System Access API /
+1. **WebGPU renderer performance.** The renderer is done as a title-command
+   renderer (the same interface the desktop gta4-native and gta4-metal
+   renderers use, not Xenos emulation), and Chrome renders the intro correctly
+   (see above). In Chrome, pipeline compiles and texture decoding are already
+   near zero per frame; the cost is per-draw setup (inputs, bindings,
+   uniforms, encoding) and the game thread's captures. Next: cut per-draw work
+   and allocations, send device-block dirty deltas, then confirm Chrome
+   through gameplay proper (11–15k draws). Later: compile pipelines off the
+   render thread and close the fidelity gaps above.
+2. **In-browser game files.** A file or folder picker (File System Access API /
    OPFS), mounted so the existing `gta4::install::Install()` can read it;
    reuse the non-interactive install path in `GTA4App::OnFinalizePaths`. Files
    are 7–8 GB, so stream them rather than preloading into MEMFS. (Local runs
    already stream an installed game from `serve.py`; the lazy mount in
    `res/web/index.html` is a model for this.)
-2. **WebGPU renderer.** Done as a title-command renderer (the same interface
-   the desktop gta4-native and gta4-metal renderers use, not Xenos emulation).
-   Follow-ups: profile a gameplay frame first (split SwiftShader time vs
-   pipeline compiles vs texture decode), then compile pipelines and decode
-   textures off the render thread, send device-block dirty deltas, close the
-   fidelity gaps above. Chrome renders the intro correctly (see above).
 3. **Audio, input and page lifecycle** (SDL audio context unlock, pointer lock, fullscreen).

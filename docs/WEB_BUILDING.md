@@ -1,9 +1,10 @@
 # Web / WebAssembly Build (Experimental)
 
 > [!WARNING]
-> The web port is at an early stage. It builds, links and starts in a browser and
-> renders with **WebGPU**, but the browser cannot load your game files yet, so the
-> game itself has only been run under Node.js so far.
+> The web port is at an early stage. It builds, links and runs in a browser and
+> renders with **WebGPU**, but the page cannot load your game files yet: it runs
+> the game only from a local install served by `tools/web/serve.py`, or under
+> Node.js.
 > See [Status](#status) and [Roadmap](#roadmap).
 
 The web build compiles the RexGlue runtime and the recompiled GTA IV code to
@@ -280,8 +281,10 @@ Not working yet:
   targets at a different physical resolution, separate color/alpha blend
   constants, sampler border colors and mirror-clamp addressing (approximated),
   wireframe fill, and reads of 3D or block-compressed GPU textures.
-- **Performance.** Every draw still copies the 22 KB device block (the Vulkan
-  renderer sends dirty deltas), and pipelines compile synchronously.
+- **Performance.** Heavy scenes are limited by the render thread's per-draw
+  setup (about 20–32 µs a draw in Chrome), and the game thread spends about a
+  third of its time capturing. Every draw still copies the 22 KB device block
+  (the Vulkan renderer sends dirty deltas), and pipelines compile synchronously.
 - **Write watches.** The runtime's memory-coherence tracking relies on page
   protection faults, which wasm does not have. The renderer instead relies on the
   title's own unlock notifications.
