@@ -122,8 +122,10 @@ NODE_PATH=<npm>/node_modules LIBERTY_DAWN_NODE=<npm>/node_modules/webgpu \
 VK_ICD_FILENAMES=/opt/pw-browsers/chromium-1194/chrome-linux/vk_swiftshader_icd.json \
 XDG_DATA_HOME=<data> node out/web/LibertyRecomp/LibertyRecomp.js --diagnostics=true \
   --webgpu_frame_dump_path=<dir>/f --webgpu_frame_dump_interval=120
-# frames are PAM images (header + raw RGBA; convert with a few lines of Python
-# to view them); --webgpu_trace_frame=N logs every command of frame N.
+# frames are PAM images (tools/web/pam_to_png.py converts them);
+# --webgpu_trace_frame=N logs every command of frame N.
+# Or all in one: EMSDK_ENV=<emsdk>/emsdk_env.sh DAWN_MODULES=<npm>/node_modules \
+#   XDG_DATA_HOME=<data> DUMP_INTERVAL=120 tools/web/run_node_webgpu.sh <name> <seconds>
 # Gameplay starts after roughly 2500-4200 presented frames on SwiftShader.
 ```
 

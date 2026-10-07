@@ -132,7 +132,10 @@ XDG_DATA_HOME=/path/to/data node out/web/LibertyRecomp/LibertyRecomp.js --diagno
     --webgpu_frame_dump_path=/tmp/frames/f --webgpu_frame_dump_interval=60
 ```
 
-`--webgpu_frame_dump_path` writes every Nth presented frame as a PAM image (RGBA).
+`--webgpu_frame_dump_path` writes every Nth presented frame as a PAM image (RGBA);
+`tools/web/pam_to_png.py` converts them. `tools/web/run_node_webgpu.sh` does the
+whole loop (build, run with a time limit, convert frames, summarize the log); its
+header lists the environment variables it needs.
 `--webgpu_trace_frame=N` logs every title command of frame N. Every 60 frames the
 renderer logs its draw, clear and resolve counts. `--gpu_plugin=none` restores the
 old headless mode.
