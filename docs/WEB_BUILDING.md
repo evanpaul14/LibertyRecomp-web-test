@@ -232,7 +232,8 @@ runs into gameplay:
   starts a new game and renders Liberty City: the skyline at night, water
   reflections and the HUD radar, at about 8000 draws a frame with no rejected
   draws or WebGPU errors. On a CPU-emulated GPU this takes over 15 minutes to
-  reach and runs at well under one frame per second.
+  reach: the loading screen runs at about 24 fps, gameplay frames take 4–7
+  seconds each.
 
 `--gta4_log_guest_debug_print=true` logs the title's own debug messages (the
 retail build discards them), which is the quickest way to see why it stops.

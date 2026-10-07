@@ -8,7 +8,8 @@ mapped); this file is for whoever continues the work.
 
 - The RexGlue runtime, FFmpeg and all 89 generated GTA IV translation units
   build to **wasm64** (Memory64, pthreads, wasm EH, SIMD128) and link into
-  `out/web/LibertyRecomp/LibertyRecomp.{js,wasm}` (about 64 MB).
+  `out/web/LibertyRecomp/LibertyRecomp.{js,wasm}` (about 116 MB, 12 MB of it the
+  embedded WGSL shader archive).
 - In headless Chromium 141 the page is cross-origin isolated and the app
   starts and reaches the install check (there is no way to give it game files
   in a browser yet).
@@ -18,7 +19,15 @@ mapped); this file is for whoever continues the work.
   + title update 8), the game draws its loading screen, starts a new game and
   renders Liberty City (night skyline, water reflections, HUD radar) at about
   8000 draws a frame with **no rejected draws and no WebGPU errors**. It takes
-  over 15 minutes on SwiftShader to get there.
+  over 15 minutes on SwiftShader to get there; the furthest frame reached is
+  2760 (a 25-minute run cap, not a crash).
+- **Measured speed (SwiftShader, 4 cores, from dump file times):** the loading
+  screen runs at about 24 fps; gameplay frames take 4–7 s each. The slowest
+  stretch (frames 2520→2640, ~6.7 s/frame) had only ~500 draws a frame while
+  pipelines grew 47→159 and textures 85→~2400, which points at one-time costs
+  (synchronous pipeline compiles, which SwiftShader turns into CPU code, and
+  texture decoding on the render thread) more than per-draw cost. Not profiled
+  yet; SwiftShader and the game also share the same 4 CPU cores.
 - All 2062 title shader variants translate to WGSL (`tools/webgpu`) and pass
   Tint validation; the archive is checked in and embedded.
 - In headless Chromium the browser build still starts and stops at the install
@@ -95,9 +104,12 @@ ninja -C out/web LibertyRecomp rex-web-memory-test
 ## Testing with game files
 
 The user supplied their own disc ISO and TU#8 package for local testing only.
-They lived in the session scratchpad, which does not survive the session, and
-were **never** committed or uploaded. Do not put game files in the repo. Ask
-the user again if needed.
+They live in a session scratchpad and were **never** committed or uploaded. Do
+not put game files in the repo. So far the container has kept them (with emsdk)
+between sessions under
+`/tmp/claude-0/-home-user-LibertyRecomp-web-test/3bed923f-3d76-5082-9c2b-35e41823c0fc/scratchpad/`
+(`gamefiles/data` is an installed `XDG_DATA_HOME`, `emsdk/` the SDK); check
+before relying on it, and ask the user again if they are gone.
 
 ```bash
 XDG_DATA_HOME=<data> node out/web/LibertyRecomp/LibertyRecomp.js --diagnostics=true \
@@ -110,7 +122,8 @@ NODE_PATH=<npm>/node_modules LIBERTY_DAWN_NODE=<npm>/node_modules/webgpu \
 VK_ICD_FILENAMES=/opt/pw-browsers/chromium-1194/chrome-linux/vk_swiftshader_icd.json \
 XDG_DATA_HOME=<data> node out/web/LibertyRecomp/LibertyRecomp.js --diagnostics=true \
   --webgpu_frame_dump_path=<dir>/f --webgpu_frame_dump_interval=120
-# frames are PAM images; --webgpu_trace_frame=N logs every command of frame N.
+# frames are PAM images (header + raw RGBA; convert with a few lines of Python
+# to view them); --webgpu_trace_frame=N logs every command of frame N.
 # Gameplay starts after roughly 2500-4200 presented frames on SwiftShader.
 ```
 
@@ -145,6 +158,8 @@ XDG_DATA_HOME=<data> node out/web/LibertyRecomp/LibertyRecomp.js --diagnostics=t
    are 7–8 GB, so stream them rather than preloading into MEMFS.
 2. **WebGPU renderer.** Done as a title-command renderer (the same interface
    the desktop gta4-native and gta4-metal renderers use, not Xenos emulation).
-   Follow-ups: the gaps above, device-block dirty deltas, and checking the
-   picture in a real browser once files load.
+   Follow-ups: profile a gameplay frame first (split SwiftShader time vs
+   pipeline compiles vs texture decode), then compile pipelines and decode
+   textures off the render thread, send device-block dirty deltas, close the
+   fidelity gaps above, and check the picture in a real browser once files load.
 3. **Audio, input and page lifecycle** (SDL audio context unlock, pointer lock, fullscreen).
