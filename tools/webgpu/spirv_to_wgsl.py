@@ -23,7 +23,7 @@ Both are rewritten here, on the GLSL that SPIRV-Cross produces:
 
 The result is compiled back to SPIR-V with glslangValidator and translated to
 WGSL with naga. Tools needed on PATH: spirv-cross, glslangValidator, spirv-opt,
-naga; Python package zstandard.
+naga.
 """
 from __future__ import annotations
 
@@ -36,6 +36,7 @@ import struct
 import subprocess
 import sys
 import tempfile
+import zlib
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
@@ -192,7 +193,20 @@ def remove_switch_fallthrough(src: str) -> str:
 
 
 def rewrite_glsl(src: str) -> tuple[str, dict]:
-    info = {"textures": {}, "samplers": []}
+    info = {"textures": {}, "samplers": [], "attributes": [], "outputs": 0}
+
+    # Vertex inputs use semantic locations up to 39; WebGPU allows 16. Pack
+    # them densely and record the semantic location of each attribute.
+    if "gl_Position" in src:
+        def remap(mm):
+            if mm.group(2) != "vec4":
+                raise ConversionError(f"unsupported vertex input type {mm.group(2)}")
+            info["attributes"].append(int(mm.group(1)))
+            return f"layout(location = {len(info['attributes']) - 1}) in vec4 "
+        src = re.sub(r"layout\(location = (\d+)\) in (\w+) ", remap, src)
+    else:
+        for om in re.finditer(r"layout\(location = (\d+)\) out ", src):
+            info["outputs"] |= 1 << int(om.group(1))
 
     # Push-constant block -> byte offsets of the merged uniform buffer.
     m = re.search(
@@ -504,10 +518,13 @@ def main() -> int:
     return 0 if not failures else 1
 
 
-# Archive (zstd-compressed): "LRWGSL01", u32 count, then per record:
+# Archive (zlib-compressed): "LRWGSL02", u32 count, then per record (little-endian):
 #   u64 hash, u32 stage (0 pixel, 1 vertex), u32 variant (0 early, 1 late),
-#   u32 texture mask, u32 cube mask, u32 sampler mask, u32 spec mask, u32 length, bytes
-MAGIC = b"LRWGSL01"
+#   u32 texture mask, u32 cube mask, u32 sampler mask, u32 spec mask,
+#   u32 color output mask, u32 attribute count, u8 semantic location per
+#   attribute (WGSL @location(i) reads semantic attributes[i]), padding to
+#   four bytes, u32 WGSL length, WGSL bytes, padding to four bytes.
+MAGIC = b"LRWGSL02"
 
 
 def write_archive(path: Path, results: dict) -> None:
@@ -521,15 +538,17 @@ def write_archive(path: Path, results: dict) -> None:
         smp_mask = 0
         for slot in info["samplers"]:
             smp_mask |= 1 << slot
+        attributes = bytes(info["attributes"])
+        attributes += b"\0" * (-len(attributes) % 4)
         body = wgsl.encode()
-        records.append(struct.pack("<QIIIIIII", int(h, 16), 0 if stage == "ps" else 1,
+        body += b"\0" * (-len(body) % 4)
+        records.append(struct.pack("<QIIIIIIII", int(h, 16), 0 if stage == "ps" else 1,
                                    0 if variant == "e" else 1, tex_mask, cube_mask, smp_mask,
-                                   entry["spec"], len(body)) + body)
-    import zstandard
-
+                                   entry["spec"], info["outputs"], len(info["attributes"])) +
+                       attributes + struct.pack("<I", len(wgsl.encode())) + body)
     path.parent.mkdir(parents=True, exist_ok=True)
     raw = MAGIC + struct.pack("<I", len(records)) + b"".join(records)
-    path.write_bytes(zstandard.ZstdCompressor(level=19, threads=-1).compress(raw))
+    path.write_bytes(zlib.compress(raw, 9))
 
 
 if __name__ == "__main__":

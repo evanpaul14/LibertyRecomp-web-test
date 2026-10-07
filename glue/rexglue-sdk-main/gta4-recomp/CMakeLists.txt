@@ -314,8 +314,8 @@ if(APPLE AND LIBERTY_RECOMP_TARGET_PLATFORM STREQUAL "desktop")
         COMMENT "Verifying macOS runtime closure, architecture, minimum OS, and signature..."
         VERBATIM)
 elseif(EMSCRIPTEN)
-    # Web (wasm64) build. Phase 1 is headless: the recompiled game code and
-    # the RexGlue runtime, without a GPU backend. See docs/WEB_BUILDING.md.
+    # Web (wasm64) build: the recompiled game code, the RexGlue runtime and
+    # the WebGPU title renderer. See docs/WEB_BUILDING.md.
     option(LIBERTY_WEB_NODERAWFS
         "Give the web build direct host filesystem access when run under Node.js (testing only)"
         OFF)
@@ -341,6 +341,7 @@ elseif(EMSCRIPTEN)
     target_link_libraries(LibertyRecomp PRIVATE
         gta4_recomp_generated
         rex::runtime
+        rex-gta4-webgpu
         xxHash::xxhash
         SDL3::SDL3
         utf8cpp

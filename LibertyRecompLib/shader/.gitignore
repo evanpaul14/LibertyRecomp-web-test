@@ -11,3 +11,7 @@
 # Track postprocess shader cache (postfx shader registry — required to build)
 !postprocess_cache.h
 !postprocess_cache.cpp
+
+# WGSL translation of the shader cache for the web build's WebGPU renderer
+# (tools/webgpu/spirv_to_wgsl.py)
+!webgpu_shader_archive.bin

@@ -9,3 +9,13 @@ if (ENVIRONMENT_IS_NODE) {
     }
   });
 }
+
+// Headless WebGPU for Node test runs: LIBERTY_DAWN_NODE names the Dawn
+// package (npm "webgpu"). Pre-js code runs in every worker, and WebGPU
+// objects live in the worker that creates them, so each gets its own GPU.
+if (ENVIRONMENT_IS_NODE && process.env.LIBERTY_DAWN_NODE && !globalThis.navigator?.gpu) {
+  const dawn = require(process.env.LIBERTY_DAWN_NODE);
+  Object.assign(globalThis, dawn.globals);
+  if (!globalThis.navigator) globalThis.navigator = {};
+  Object.defineProperty(globalThis.navigator, 'gpu', { value: dawn.create([]), configurable: true });
+}

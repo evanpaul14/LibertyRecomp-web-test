@@ -15,6 +15,10 @@
 #include <rex/graphics/gta4_native/hdr_policy.h>
 #include <rex/graphics/gta4_native/supersampling_policy.h>
 #include <rex/graphics/video_mode_util.h>
+#include <rex/platform.h>
+#if REX_PLATFORM_WEB
+#include <rex/graphics/gta4_webgpu.h>
+#endif
 #include <rex/cvar.h>
 #include <rex/logging.h>
 #include <rex/runtime.h>
@@ -672,11 +676,13 @@ void GTA4App::OnPreSetup(rex::RuntimeConfig& config) {
   rex::input::mnk::SetNativeControllerCompatibilityBindings(
       gta4::input::KeyboardControllerBindings());
 #if REX_PLATFORM_WEB
-  // No GPU backend exists for the browser yet (WebGPU is future work), so
-  // the web build runs headless on purpose rather than requesting a plugin
-  // it cannot load.
+  // The web build has no plugin loader; its WebGPU title renderer is linked
+  // in. gpu_plugin=none keeps the previous headless behavior.
   if (!config.graphics && config.gpu_plugin.empty()) {
-    REXLOG_WARN("Web build: no GPU backend available, running headless");
+    config.graphics = rex::graphics::gta4_webgpu::CreateGraphicsSystem();
+  } else if (config.gpu_plugin == "none") {
+    config.gpu_plugin.clear();
+    REXLOG_WARN("Web build: gpu_plugin=none, running headless");
   }
 #else
   if (!config.graphics && config.gpu_plugin.empty()) {
