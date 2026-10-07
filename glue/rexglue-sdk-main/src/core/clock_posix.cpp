@@ -20,6 +20,16 @@ static_assert(REX_PLATFORM_LINUX || REX_PLATFORM_MAC, "This file is POSIX-only")
 
 namespace rex::chrono {
 
+#ifndef __APPLE__
+// Emscripten has no CLOCK_MONOTONIC_RAW: clock_getres and clock_gettime fail
+// on it, and with asserts compiled out the clock read uninitialized values.
+#ifdef __EMSCRIPTEN__
+constexpr clockid_t kHostClock = CLOCK_MONOTONIC;
+#else
+constexpr clockid_t kHostClock = CLOCK_MONOTONIC_RAW;
+#endif
+#endif
+
 uint64_t Clock::host_tick_frequency_platform() {
 #ifdef __APPLE__
   mach_timebase_info_data_t info;
@@ -27,7 +37,7 @@ uint64_t Clock::host_tick_frequency_platform() {
   return (uint64_t)((1000000000ull * (uint64_t)info.denom) / (uint64_t)info.numer);
 #else
   timespec res;
-  int error = clock_getres(CLOCK_MONOTONIC_RAW, &res);
+  int error = clock_getres(kHostClock, &res);
   assert_zero(error);
   assert_zero(res.tv_sec);  // Sub second resolution is required.
 
@@ -45,7 +55,7 @@ uint64_t Clock::host_tick_count_platform() {
   return mach_absolute_time();
 #else
   timespec tp;
-  int error = clock_gettime(CLOCK_MONOTONIC_RAW, &tp);
+  int error = clock_gettime(kHostClock, &tp);
   assert_zero(error);
 
   return tp.tv_nsec + tp.tv_sec * 1000000000ull;
