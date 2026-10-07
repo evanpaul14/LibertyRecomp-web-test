@@ -51,9 +51,9 @@ mapped); this file is for whoever continues the work.
   --diagnostics_categories=logging --log_level=warn`: other diagnostics print
   a line per draw, and every line blocks the game thread until the page's
   main thread handles it. In the browser that alone held gameplay below 1 fps.
-- Next step candidates, in suggested order: the black deferred lighting, then
-  re-checking Chrome with the clock fix (the hang fix below applies there too).
-  Ask the user.
+- Next step candidates, in suggested order: re-checking Chrome with the clock,
+  hang and stencil-rebuild fixes below (the black gameplay seen there is likely
+  the same stencil bug), then coronas outdoors. Ask the user.
 - **Node graphics session (Dawn on Metal, M1 Mac, 2026-10-07).**
   - *Fixed: black loading screens.* Emscripten has no `CLOCK_MONOTONIC_RAW`;
     `clock_getres`/`clock_gettime` failed and, with asserts compiled out, the
@@ -85,9 +85,18 @@ mapped); this file is for whoever continues the work.
     with `--inspect` (or `kill -USR1` it), then use the inspector's
     `NodeWorker` domain to send `Debugger.pause` to each worker and read
     `callFrames`.
-  - *Open: lighting.* In the intro, water/ground below the horizon is often black
-    and lamp coronas are hard white shapes. Forward-drawn things (sky, text,
-    lamps) look right, so the deferred lighting composite is the suspect.
+  - *Fixed: black deferred lighting.* After the G-buffer, the title hands the
+    scene depth to the forward depth surface with `kRebuildSceneCoverage`: stencil
+    must become 0x80 where the scene is empty and 0xFF where it is covered. The
+    WebGPU handoff only copied depth, so the full-screen lighting pass (stencil
+    `Equal 0x01`, mask 0x01) was rejected everywhere and lit surfaces stayed
+    black. `Handoff` (`passes.cpp`) now follows the Metal renderer: depth comes
+    from the resolved snapshot (`source_texture`), and a rebuild clears stencil
+    to 0x80 and writes 0xFF with a fixed-function stencil Replace where packed
+    depth is nonzero (no shader stencil export needed). The intro cutscenes now
+    render lit. The draw trace also logs stencil state, and handoffs are traced.
+  - *Unchecked: coronas.* Lamp coronas looked like hard white shapes before the
+    fix; not rechecked outdoors since.
   - *Packed depth aliases (unverified):* `RegisterVirtualResource` with
     `packed_depth_source` is honored; resolved depth is stored as `rg32float`
     (depth, stencil) and an alias texture is rebuilt as A8R8G8B8 like
@@ -201,8 +210,7 @@ XDG_DATA_HOME=<data> node out/web/LibertyRecomp/LibertyRecomp.js --diagnostics=t
 - Renderer gaps (all handled by the Metal renderer, which is the reference):
   MSAA, temporal AA/upscaling, SMAA/FXAA, modern post-processing (DoF, sun
   shafts, FusionFix tone LUT), vector fonts, virtual/reflection targets at a
-  different physical size, the forward-depth handoff's stencil rebuild (WebGPU
-  cannot export stencil), separate color/alpha blend constants, border colors,
+  different physical size, separate color/alpha blend constants, border colors,
   wireframe, readback of 3D/compressed GPU textures.
 - Write watches (page-protection faults) never fire; the renderer trusts the
   title's `ResourceUnlock` notifications plus a byte compare when a capture is

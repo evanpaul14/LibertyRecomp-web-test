@@ -258,12 +258,11 @@ Not working yet:
 - **Renderer gaps** (all present in the Metal renderer): MSAA, temporal AA and
   upscaling, SMAA/FXAA, the modern post-processing effects (depth of field, sun
   shafts, FusionFix tone mapping), vector font replacement, virtual and reflection
-  targets at a different physical resolution, the stencil rebuild of the
-  forward-pass depth handoff, separate color/alpha blend constants, sampler border
-  colors and mirror-clamp addressing (approximated), wireframe fill, and reads of
-  3D or block-compressed GPU textures.
-- **Lighting.** In the intro, deferred-lit surfaces (water, ground, the ship)
-  are often black below the horizon, and lamp coronas are hard white shapes.
+  targets at a different physical resolution, separate color/alpha blend
+  constants, sampler border colors and mirror-clamp addressing (approximated),
+  wireframe fill, and reads of 3D or block-compressed GPU textures.
+- **Coronas.** Lamp coronas looked like hard white shapes in earlier intro runs;
+  not rechecked since the deferred lighting was fixed.
 - **Performance.** Every draw still copies the 22 KB device block (the Vulkan
   renderer sends dirty deltas), and pipelines compile synchronously.
 - **Write watches.** The runtime's memory-coherence tracking relies on page
