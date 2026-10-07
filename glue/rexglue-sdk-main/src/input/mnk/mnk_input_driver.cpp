@@ -566,7 +566,7 @@ void MnkInputDriver::UpdateMouseCapture() {
   bool currently_captured = false;
   {
     std::lock_guard lock(state_mutex_);
-    should_capture = IsEnabled() && has_focus_ && is_active();
+    should_capture = IsEnabled() && has_focus_ && is_active() && !mouse_capture_failed_;
     currently_captured = mouse_captured_;
   }
 
@@ -604,6 +604,7 @@ void MnkInputDriver::UpdateMouseCapture() {
 
           std::lock_guard lock(state_mutex_);
           mouse_captured_ = should_capture && applied;
+          mouse_capture_failed_ = should_capture && !applied;
           ResetPointerMotionLocked();
           if (rex::input::IsInputTraceEnabled()) {
             REXLOG_INFO(
@@ -964,6 +965,7 @@ void MnkInputDriver::OnLostFocus(rex::ui::UISetupEvent&) {
 void MnkInputDriver::OnGotFocus(rex::ui::UISetupEvent&) {
   std::lock_guard lock(state_mutex_);
   has_focus_ = true;
+  mouse_capture_failed_ = false;
   if (rex::input::IsInputTraceEnabled()) {
     const uint64_t trace_sequence = last_key_event_sequence_ != 0
                                         ? last_key_event_sequence_

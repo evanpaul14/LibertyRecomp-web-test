@@ -114,6 +114,9 @@ class MnkInputDriver final : public InputDriver,
   int32_t prev_mouse_x_ = 0;
   int32_t prev_mouse_y_ = 0;
   bool mouse_captured_ = false;
+  // Set when the window refuses relative mouse mode (the web build has none);
+  // capture is not retried until focus returns.
+  bool mouse_capture_failed_ = false;
   // Cursor visibility to restore on capture release - the window owner may run
   // an auto-hide policy that capture must not permanently override.
   rex::ui::Window::CursorVisibility precapture_cursor_visibility_ =
