@@ -46,8 +46,8 @@ mapped); this file is for whoever continues the work.
     or GPU errors. Light scenes (400–700 draws) run at 40–59 fps; the heaviest
     stretch (~6,000–6,600 draws) dropped to 3–6 fps, at ~20–32 µs of
     render-thread time per draw, spread over inputs, bindings, uniforms and
-    encoding (pipeline compiles were near zero). Gameplay proper (11–15k
-    draws) has not been reached in Chrome since.
+    encoding (pipeline compiles were near zero). Gameplay is confirmed: the
+    user played and drove around at about 3–10 fps.
   - *Fixed: frozen canvas.* The picture stopped updating once a heavy scene
     put the renderer behind the game, while rendering went on. A worker's
     canvas shows a frame only when its current task ends, and the drain's
@@ -70,9 +70,8 @@ mapped); this file is for whoever continues the work.
   a line per draw, and every line blocks the game thread until the page's
   main thread handles it. In the browser that alone held gameplay below 1 fps.
 - Next step candidates, in suggested order: per-draw render-thread cost
-  (the heavy cutscene stretch runs at 3–6 fps; see the Chrome numbers above),
-  confirming Chrome through gameplay proper, then a game-file picker. Ask the
-  user.
+  (gameplay runs at 3–10 fps and the heavy cutscene stretch at 3–6 fps; see
+  the Chrome numbers above), then a game-file picker. Ask the user.
 - **Node graphics session (Dawn on Metal, M1 Mac, 2026-10-07).**
   - *Fixed: black loading screens.* Emscripten has no `CLOCK_MONOTONIC_RAW`;
     `clock_getres`/`clock_gettime` failed and, with asserts compiled out, the
@@ -305,8 +304,8 @@ node out/web-node/LibertyRecomp/LibertyRecomp.js --diagnostics=true \
    (see above). In Chrome, pipeline compiles and texture decoding are already
    near zero per frame; the cost is per-draw setup (inputs, bindings,
    uniforms, encoding) and the game thread's captures. Next: cut per-draw work
-   and allocations, send device-block dirty deltas, then confirm Chrome
-   through gameplay proper (11–15k draws). Later: compile pipelines off the
+   and allocations, and send device-block dirty deltas; gameplay in Chrome
+   is playable but runs at only 3–10 fps. Later: compile pipelines off the
    render thread and close the fidelity gaps above.
 2. **In-browser game files.** A file or folder picker (File System Access API /
    OPFS), mounted so the existing `gta4::install::Install()` can read it;

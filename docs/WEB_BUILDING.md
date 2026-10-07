@@ -235,8 +235,8 @@ Working:
 - With game files served by `tools/web/serve.py`, Chrome on an M1 Mac renders
   the loading screens and the intro cutscenes lit and correct, with no stalls
   or GPU errors. Light scenes run at 40–59 fps; the heaviest cutscene stretch
-  (about 6,000 draws a frame) drops to 3–6 fps. Gameplay proper has not been
-  rechecked in Chrome since the rendering fixes.
+  (about 6,000 draws a frame) drops to 3–6 fps. Gameplay is playable: walking
+  and driving around Liberty City runs at about 3–10 fps.
 
 `rex-web-memory-test` checks the memory layout and MMIO routing under Node 24:
 
