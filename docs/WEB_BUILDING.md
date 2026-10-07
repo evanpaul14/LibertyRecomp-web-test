@@ -123,6 +123,23 @@ ninja -C out/web rex-web-memory-test
 node glue/rexglue-sdk-main/out/web-wasm64/rex-web-memory-test.js
 ```
 
+Under Node.js with a real USA retail 1.00 disc plus title update 8 (installed
+headless with `--install_source`/`--install_update_source`), the game itself
+runs as far as a headless build can go:
+
+- the installer copies the files and applies the v8 patch (`0.0.0.5` →
+  `0.0.8.5`);
+- the kernel, file I/O, XMA decoder and audio threads start and the module
+  launches;
+- the title preloads its shaders from `common:/shaders`, allocates its
+  render-target pools, initializes the audio engine and registers its script
+  natives;
+- it then busy-waits for the GPU to consume its command ring buffer, which a
+  headless build never does. Going further needs the WebGPU backend.
+
+`--gta4_log_guest_debug_print=true` logs the title's own debug messages (the
+retail build discards them), which is the quickest way to see why it stops.
+
 Log lines need `?arg=--diagnostics=true`, the same as on desktop. On the web
 they go to the browser console and the page's log panel.
 
