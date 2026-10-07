@@ -419,11 +419,12 @@ struct ScriptNativeCall {
 };
 
 uint8_t LoadU8(uint8_t* base, uint32_t address) {
-  return *reinterpret_cast<volatile uint8_t*>(base + address);
+  return *reinterpret_cast<volatile uint8_t*>(base + address + REX_PHYS_HOST_OFFSET(address));
 }
 
 uint32_t LoadU32(uint8_t* base, uint32_t address) {
-  return __builtin_bswap32(*reinterpret_cast<volatile uint32_t*>(base + address));
+  return __builtin_bswap32(
+      *reinterpret_cast<volatile uint32_t*>(base + address + REX_PHYS_HOST_OFFSET(address)));
 }
 
 float LoadFloat(uint8_t* base, uint32_t address) {
@@ -431,11 +432,12 @@ float LoadFloat(uint8_t* base, uint32_t address) {
 }
 
 void StoreU8(uint8_t* base, uint32_t address, uint8_t value) {
-  *reinterpret_cast<volatile uint8_t*>(base + address) = value;
+  *reinterpret_cast<volatile uint8_t*>(base + address + REX_PHYS_HOST_OFFSET(address)) = value;
 }
 
 void StoreU32(uint8_t* base, uint32_t address, uint32_t value) {
-  *reinterpret_cast<volatile uint32_t*>(base + address) = __builtin_bswap32(value);
+  *reinterpret_cast<volatile uint32_t*>(base + address + REX_PHYS_HOST_OFFSET(address)) =
+      __builtin_bswap32(value);
 }
 
 ScriptNativeCall ReadScriptNativeCall(uint8_t* base, uint32_t call_context) {

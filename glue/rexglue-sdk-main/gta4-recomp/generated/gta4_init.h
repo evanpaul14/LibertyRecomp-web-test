@@ -104,6 +104,44 @@ extern PPCFuncMapping PPCFuncMappings[];
 // Memory Access
 //=============================================================================
 
+#if REX_PLATFORM_WEB
+// WebAssembly cannot alias pages or fault on MMIO, so every access goes
+// through helpers that fold aliased guest ranges onto one copy and route the
+// 0x7F000000 block to the MMIO handler (rex/system/web_guest_access.h).
+#include <rex/system/web_guest_access.h>
+
+#define REX_PHYS_HOST_OFFSET(addr) ::rex::memory::web::HostOffset((u32)(addr))
+
+#define REX_RAW_ADDR(x) (base + (u32)(x) + REX_PHYS_HOST_OFFSET(x))
+
+#define REX_LOAD_U8(x) ::rex::web_guest::Load<u8>(base, (u32)(x))
+#define REX_LOAD_U16(x) ::rex::web_guest::Load<u16>(base, (u32)(x))
+#define REX_LOAD_U32(x) ::rex::web_guest::Load<u32>(base, (u32)(x))
+#define REX_LOAD_U64(x) ::rex::web_guest::Load<u64>(base, (u32)(x))
+#define REX_LOAD_STRING(x, len) \
+  std::string_view(reinterpret_cast<const char*>(REX_RAW_ADDR(x)), (len))
+
+#define REX_STORE_U8(x, y) ::rex::web_guest::Store<u8>(base, (u32)(x), static_cast<u8>(y))
+#define REX_STORE_U16(x, y) ::rex::web_guest::Store<u16>(base, (u32)(x), static_cast<u16>(y))
+#define REX_STORE_U32(x, y) ::rex::web_guest::Store<u32>(base, (u32)(x), static_cast<u32>(y))
+#define REX_STORE_U64(x, y) ::rex::web_guest::Store<u64>(base, (u32)(x), static_cast<u64>(y))
+
+#define REX_MEMORY_SIZE 0x100000000ull
+
+#define REX_IS_MMIO_ADDR(addr) ((addr) >= 0x7F000000u && (addr) < 0x80000000u)
+
+// Every access is already MMIO-checked on the web.
+#define REX_MM_STORE_U8(addr, val) REX_STORE_U8(addr, val)
+#define REX_MM_STORE_U16(addr, val) REX_STORE_U16(addr, val)
+#define REX_MM_STORE_U32(addr, val) REX_STORE_U32(addr, val)
+#define REX_MM_STORE_U64(addr, val) REX_STORE_U64(addr, val)
+#define REX_MM_LOAD_U8(addr) REX_LOAD_U8(addr)
+#define REX_MM_LOAD_U16(addr) REX_LOAD_U16(addr)
+#define REX_MM_LOAD_U32(addr) REX_LOAD_U32(addr)
+#define REX_MM_LOAD_U64(addr) REX_LOAD_U64(addr)
+
+#else  // !REX_PLATFORM_WEB
+
 #if REX_PLATFORM_WIN32 || REX_PLATFORM_MAC
 #define REX_PHYS_HOST_OFFSET(addr) (((u32)(addr) >= 0xE0000000u) ? 0x1000u : 0u)
 #else
@@ -217,6 +255,8 @@ extern PPCFuncMapping PPCFuncMappings[];
            (static_cast<u64>(_hi) << 32) | _lo;                                      \
          })                                                                          \
        : __builtin_bswap64(*(volatile u64*)(base + (addr) + REX_PHYS_HOST_OFFSET(addr))))
+
+#endif  // REX_PLATFORM_WEB
 
 //=============================================================================
 // Function Dispatch

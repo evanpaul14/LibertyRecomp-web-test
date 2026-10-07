@@ -149,11 +149,12 @@ std::atomic<bool> g_title_input_owned{false};
 std::atomic<uint64_t> g_poll_epoch{0};
 
 uint8_t LoadU8(uint8_t* base, uint32_t address) noexcept {
-  return *reinterpret_cast<volatile uint8_t*>(base + address);
+  return *reinterpret_cast<volatile uint8_t*>(base + address + REX_PHYS_HOST_OFFSET(address));
 }
 
 uint32_t LoadU32(uint8_t* base, uint32_t address) noexcept {
-  return __builtin_bswap32(*reinterpret_cast<volatile uint32_t*>(base + address));
+  return __builtin_bswap32(
+      *reinterpret_cast<volatile uint32_t*>(base + address + REX_PHYS_HOST_OFFSET(address)));
 }
 
 float LoadFloat(uint8_t* base, uint32_t address) noexcept {
@@ -161,11 +162,12 @@ float LoadFloat(uint8_t* base, uint32_t address) noexcept {
 }
 
 void StoreU8(uint8_t* base, uint32_t address, uint8_t value) noexcept {
-  *reinterpret_cast<volatile uint8_t*>(base + address) = value;
+  *reinterpret_cast<volatile uint8_t*>(base + address + REX_PHYS_HOST_OFFSET(address)) = value;
 }
 
 void StoreU32(uint8_t* base, uint32_t address, uint32_t value) noexcept {
-  *reinterpret_cast<volatile uint32_t*>(base + address) = __builtin_bswap32(value);
+  *reinterpret_cast<volatile uint32_t*>(base + address + REX_PHYS_HOST_OFFSET(address)) =
+      __builtin_bswap32(value);
 }
 
 uint32_t ActionAddress(uint32_t control, Action action) noexcept {

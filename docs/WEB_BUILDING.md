@@ -76,7 +76,9 @@ Any other static host works if it sends the same headers.
 | FPSCR rounding / flush | Host MXCSR / FPCR | Per-thread virtual control word. wasm always rounds to nearest and never flushes denormals, so guest rounding modes are recorded but not applied |
 | Runtime library | `librexruntime` shared library | Static library |
 | GPU | `dlopen()`ed plugins (Vulkan, D3D12, Metal) | None yet; the app runs headless |
-| MMIO | Page faults decoded by `MMIOHandler` | No faults in wasm; needs explicit `REX_MM_*` checks (see Roadmap) |
+| Guest memory | 4.5 GB of file-mapping views; `0x7F`/`0xA0`/`0xC0`/`0xE0` ranges alias physical memory | One zero-filled region from `sbrk` (`memory_web.cpp`); aliased ranges are folded onto the physical copy by a 256-entry offset table (`rex/memory/web_guest_layout.h`) |
+| MMIO | Page faults decoded by `MMIOHandler` | Every generated load and store checks the `0x7F000000` block and calls `MMIOHandler::CheckLoad`/`CheckStore` (`rex/system/web_guest_access.h`), falling back to memory for unregistered addresses |
+| Page protection / write watches | `mprotect` + fault handler | Not available: protection calls succeed without effect, so access watches never fire |
 | Fibers | ucontext / Win32 fibers | Thread fibers only (`fiber_web.cpp`); GTA IV imports no guest fiber APIs |
 | FFmpeg (XMA) | Platform `config.h` | `thirdparty/ffmpeg-web/config.h`: portable C only |
 | Thread suspend / APC wake | Real-time signals | `pthread_kill`; delivered when the target worker services its mailbox |
@@ -98,28 +100,31 @@ Working:
   stops there with `GTA IV installation is not launch-ready: default.xex is
   missing or unreadable.`
 
+`rex-web-memory-test` checks the memory layout and MMIO routing under Node 24:
+
+```bash
+ninja -C out/web rex-web-memory-test
+node glue/rexglue-sdk-main/out/web-wasm64/rex-web-memory-test.js
+```
+
 Log lines need `?arg=--diagnostics=true`, the same as on desktop. On the web
 they go to the browser console and the page's log panel.
 
 Not working yet:
 
 - **Rendering.** There is no GPU backend.
-- **MMIO.** The current generated code reaches GPU registers by faulting on
-  `0x7F000000`–`0x7FFFFFFF`. wasm cannot fault, so these accesses silently hit
-  plain memory.
-- **Guest memory layout.** `rex::memory::Memory` builds the 4 GB guest space
-  (plus the 512 MB physical mirror) out of aliased file-mapping views. wasm
-  linear memory cannot alias pages.
+- **Write watches.** The runtime's memory-coherence tracking relies on page
+  protection faults, which wasm does not have. A GPU backend will need to track
+  dirty ranges another way.
+- **`0x90000000` mirror.** Natively this view mirrors `0x80000000`. On the web
+  it has its own backing; nothing is known to rely on the mirror.
 - **Game files.** There is no way yet to give the browser build your game files.
 
 ## Roadmap
 
-1. **Memory and MMIO.** Regenerate the code with explicit MMIO checks (the codegen
-   already emits `REX_MM_LOAD_*`/`REX_MM_STORE_*` macros that route MMIO addresses
-   through `MMIOHandler::CheckLoad`/`CheckStore`). Give `rex::memory::Memory` a web
-   backend that reserves one linear 4.5 GB region and folds the
-   `0xA0000000`/`0xC0000000`/`0xE0000000` physical aliases onto the physical
-   heap in the address macros.
+1. **Memory and MMIO.** Done. The web memory macros live in the generated
+   header (`gta4_init.h`) and its codegen template (`init_h.inja`), so the
+   per-function generated code did not need regenerating.
 2. **Game files.** Load the user's files through the File System Access API or
    OPFS, and adapt the installer to the browser.
 3. **WebGPU renderer.** Add a WebGPU backend for the Xenos command processor

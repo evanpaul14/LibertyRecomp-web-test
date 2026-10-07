@@ -274,6 +274,16 @@ add_subdirectory(src/kernel)
 add_subdirectory(src/codegen)
 add_subdirectory(src/rexglue)
 
+# Web guest memory layout / MMIO routing check, run under Node.js 24+.
+if(EMSCRIPTEN)
+    add_executable(rex-web-memory-test EXCLUDE_FROM_ALL tests/web/web_memory_test.cpp)
+    target_link_libraries(rex-web-memory-test PRIVATE rexruntime)
+    target_link_options(rex-web-memory-test PRIVATE
+        -sPROXY_TO_PTHREAD=1 -sINITIAL_MEMORY=64MB -sALLOW_MEMORY_GROWTH=1
+        -sMAXIMUM_MEMORY=16GB -sEXIT_RUNTIME=1 -sENVIRONMENT=node)
+    set_target_properties(rex-web-memory-test PROPERTIES SUFFIX ".js")
+endif()
+
 # The GTA IV title is kept as an optional SDK consumer so normal RexGlue builds
 # stay lightweight while the live application can still be configured entirely
 # from this source tree.  gta4-recomp uses rexglue_configure_target(), which is

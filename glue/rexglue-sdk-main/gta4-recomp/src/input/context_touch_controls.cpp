@@ -22,6 +22,7 @@
 #include <rex/input/mnk/encoded_action.h>
 #include <rex/input/mnk/pointer_motion.h>
 #include <rex/logging.h>
+#include <rex/system/xmemory.h>
 
 #include "gta4_touch_coordinator.h"
 #include "input/context_touch_context.h"
@@ -228,19 +229,21 @@ void BeginEditorFadeOutLocked() {
 }
 
 uint8_t LoadU8(uint8_t* base, uint32_t address) {
-  return *reinterpret_cast<volatile uint8_t*>(base + address);
+  return *reinterpret_cast<volatile uint8_t*>(rex::memory::GuestPtr(base, address));
 }
 
 uint32_t LoadU32(uint8_t* base, uint32_t address) {
-  return __builtin_bswap32(*reinterpret_cast<volatile uint32_t*>(base + address));
+  return __builtin_bswap32(
+      *reinterpret_cast<volatile uint32_t*>(rex::memory::GuestPtr(base, address)));
 }
 
 void StoreU8(uint8_t* base, uint32_t address, uint8_t value) {
-  *reinterpret_cast<volatile uint8_t*>(base + address) = value;
+  *reinterpret_cast<volatile uint8_t*>(rex::memory::GuestPtr(base, address)) = value;
 }
 
 void StoreU32(uint8_t* base, uint32_t address, uint32_t value) {
-  *reinterpret_cast<volatile uint32_t*>(base + address) = __builtin_bswap32(value);
+  *reinterpret_cast<volatile uint32_t*>(rex::memory::GuestPtr(base, address)) =
+      __builtin_bswap32(value);
 }
 
 bool EpochWithin(uint64_t current, uint64_t observed, uint64_t lifetime) {
