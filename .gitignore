@@ -658,6 +658,7 @@ docs/*.md
 !docs/GTA4_COLLISION_VPKUWUS_ALIASING_FIX.md
 !docs/GTA_IV_ASSET_STREAMING_SYSTEM.md
 !docs/WEB_BUILDING.md
+!docs/WEB_PORT_HANDOFF.md
 -e 
 # Claude and GitHub metadata - do not commit
 .claude/
