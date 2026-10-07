@@ -681,6 +681,7 @@ build-codegen/
 !tools/analyze_native_memory.py
 !tools/test_analyze_native_memory.py
 !tools/web/serve.py
+!tools/webgpu/*.py
 !tools/validate_shader_preservation.py
 !tools/test_validate_shader_preservation.py
 !tools/recover_shader_sources.py
