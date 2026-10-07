@@ -36,7 +36,8 @@ uint32_t TexelBytes(wgpu::TextureFormat format) {
     case wgpu::TextureFormat::RGBA8Unorm:
     case wgpu::TextureFormat::RG16Float:
     case wgpu::TextureFormat::R32Float: return 4;
-    case wgpu::TextureFormat::RGBA16Float: return 8;
+    case wgpu::TextureFormat::RGBA16Float:
+    case wgpu::TextureFormat::RG32Float: return 8;
     default: return 0;
   }
 }
@@ -61,6 +62,12 @@ wgpu::TextureView Subresource(const TextureResource& texture, uint32_t level, ui
 wgpu::TextureView DepthView(const SurfaceResource& surface) {
   wgpu::TextureViewDescriptor view{};
   view.aspect = wgpu::TextureAspect::DepthOnly;
+  return surface.texture.CreateView(&view);
+}
+
+wgpu::TextureView StencilView(const SurfaceResource& surface) {
+  wgpu::TextureViewDescriptor view{};
+  view.aspect = wgpu::TextureAspect::StencilOnly;
   return surface.texture.CreateView(&view);
 }
 }  // namespace
@@ -187,7 +194,8 @@ bool Renderer::State::Resolve(const Work& work, std::string& error) {
       if (!UtilityPass(depth ? "copy_depth_to_color" : "copy_color", target, depth_slice, false,
                        destination->format, target_w, target_h,
                        {dx, dy, dx + int32_t(copy_w), dy + int32_t(copy_h)},
-                       depth ? DepthView(*source) : source->view, parameters, true, error))
+                       depth ? DepthView(*source) : source->view, parameters, true, error,
+                       depth ? StencilView(*source) : nullptr))
         return false;
     }
     destination->content_serial = ++content_serial;
@@ -466,13 +474,14 @@ Renderer::Status Renderer::State::Readback(const Work& work, std::string& error)
               const uint8_t* texel = bytes + size_t(y) * row + size_t(x) * host_bytes;
               uint32_t packed = 0;
               if (depth_values) {
-                float value;
+                float value, stencil;
                 std::memcpy(&value, texel, sizeof(value));
+                std::memcpy(&stencil, texel + sizeof(value), sizeof(stencil));
                 const uint32_t quantized =
                     float_depth ? xenos::Float32To20e4(value, false)
                                 : uint32_t(std::nearbyint(std::clamp(double(value), 0.0, 1.0) *
                                                           16777215.0));
-                packed = quantized << 8;
+                packed = quantized << 8 | (uint32_t(stencil) & 0xFFu);
                 texel = reinterpret_cast<const uint8_t*>(&packed);
               }
               texture_conversion::CopySwapBlock(

@@ -52,10 +52,45 @@ constexpr char kCopyColor[] = R"(
   return textureLoad(source, source_coord(p), 0) * params.c.x;
 }
 )";
+// Resolved depth keeps its stencil in green (see SampledFormat).
 constexpr char kCopyDepthToColor[] = R"(
 @group(1) @binding(0) var source: texture_depth_2d;
+@group(1) @binding(1) var stencil: texture_2d<u32>;
 @fragment fn fs(@builtin(position) p: vec4<f32>) -> @location(0) vec4<f32> {
-  return vec4<f32>(textureLoad(source, source_coord(p), 0), 0.0, 0.0, 1.0);
+  let coord = source_coord(p);
+  return vec4<f32>(textureLoad(source, coord, 0), f32(textureLoad(stencil, coord, 0).r), 0.0, 1.0);
+}
+)";
+// A resolved depth/stencil snapshot read back as A8R8G8B8 (sub_828D9768), as
+// gta4_native/packed_depth_alias_ps.glsl. c.x: 20e4 float depth, c.y: the
+// fetch constant's swizzle.
+constexpr char kPackedDepthAlias[] = R"(
+@group(1) @binding(0) var source: texture_2d<f32>;
+fn depth20e4(depth: f32) -> u32 {
+  if (!(depth > 0.0)) { return 0u; }
+  var bits = bitcast<u32>(depth);
+  if (bits >= 0x3FFFFFF8u) { return 0xFFFFFFu; }
+  if (bits < 0x38800000u) {
+    let shift = min(113u - (bits >> 23u), 24u);
+    bits = (0x800000u | (bits & 0x7FFFFFu)) >> shift;
+  } else {
+    bits += 0xC8000000u;
+  }
+  return (bits >> 3u) & 0xFFFFFFu;
+}
+@fragment fn fs(@builtin(position) p: vec4<f32>) -> @location(0) vec4<f32> {
+  let value = textureLoad(source, vec2<i32>(p.xy), 0);
+  let packed_depth = select(u32(round(clamp(value.r, 0.0, 1.0) * 16777215.0)),
+                            depth20e4(value.r), params.c.x != 0.0);
+  let packed = (packed_depth << 8u) | (u32(value.g) & 255u);
+  let raw = vec4<f32>(vec4<u32>(packed, packed >> 8u, packed >> 16u, packed >> 24u) & vec4<u32>(255u)) / 255.0;
+  let swizzle = u32(params.c.y);
+  var color: vec4<f32>;
+  for (var channel = 0u; channel < 4u; channel++) {
+    let component = (swizzle >> (3u * channel)) & 7u;
+    color[channel] = select(f32(component & 1u), raw[min(component, 3u)], component < 4u);
+  }
+  return color;
 }
 )";
 constexpr char kCopyDepth[] = R"(
@@ -81,13 +116,15 @@ constexpr char kPresent[] = R"(
 struct UtilityKind {
   const char* name;
   const char* code;
-  // Group 1 source: 0 none, 1 float texture, 2 depth texture, 3 float texture + sampler.
+  // Group 1 source: 0 none, 1 float texture, 2 depth texture, 3 float texture + sampler,
+  // 4 depth texture + stencil texture.
   int source;
 };
 constexpr UtilityKind kUtilities[] = {
-    {"copy_color", kCopyColor, 1},     {"copy_depth_to_color", kCopyDepthToColor, 2},
+    {"copy_color", kCopyColor, 1},     {"copy_depth_to_color", kCopyDepthToColor, 4},
     {"copy_depth", kCopyDepth, 2},     {"clear_color", kClearColor, 0},
     {"clear_depth", kClearDepth, 0},   {"present", kPresent, 3},
+    {"packed_depth_alias", kPackedDepthAlias, 1},
 };
 const UtilityKind* FindUtility(std::string_view name) {
   for (const auto& kind : kUtilities)
@@ -470,14 +507,20 @@ wgpu::RenderPipeline Renderer::State::UtilityPipeline(const std::string& name,
     entries[0].binding = 0;
     entries[0].visibility = wgpu::ShaderStage::Fragment;
     entries[0].texture.viewDimension = wgpu::TextureViewDimension::e2D;
-    entries[0].texture.sampleType = kind->source == 2 ? wgpu::TextureSampleType::Depth
-                                    : kind->source == 3 ? wgpu::TextureSampleType::Float
-                                                        : wgpu::TextureSampleType::UnfilterableFloat;
+    entries[0].texture.sampleType =
+        kind->source == 2 || kind->source == 4 ? wgpu::TextureSampleType::Depth
+        : kind->source == 3                    ? wgpu::TextureSampleType::Float
+                                               : wgpu::TextureSampleType::UnfilterableFloat;
     entries[1].binding = 1;
     entries[1].visibility = wgpu::ShaderStage::Fragment;
-    entries[1].sampler.type = wgpu::SamplerBindingType::Filtering;
+    if (kind->source == 4) {
+      entries[1].texture.viewDimension = wgpu::TextureViewDimension::e2D;
+      entries[1].texture.sampleType = wgpu::TextureSampleType::Uint;
+    } else {
+      entries[1].sampler.type = wgpu::SamplerBindingType::Filtering;
+    }
     wgpu::BindGroupLayoutDescriptor descriptor{};
-    descriptor.entryCount = kind->source == 3 ? 2 : 1;
+    descriptor.entryCount = kind->source >= 3 ? 2 : 1;
     descriptor.entries = entries.data();
     groups.push_back(device.CreateBindGroupLayout(&descriptor));
   }
@@ -517,7 +560,7 @@ bool Renderer::State::UtilityPass(const std::string& name, wgpu::TextureView tar
                                   wgpu::TextureFormat format, uint32_t width, uint32_t height,
                                   const std::array<int32_t, 4>& scissor, wgpu::TextureView source,
                                   std::span<const float> parameters, bool load_existing,
-                                  std::string& error) {
+                                  std::string& error, wgpu::TextureView stencil) {
   auto pipeline = UtilityPipeline(name, target_is_depth ? wgpu::TextureFormat::Undefined : format,
                                   target_is_depth ? format : wgpu::TextureFormat::Undefined, error);
   if (!pipeline) return false;
@@ -558,10 +601,13 @@ bool Renderer::State::UtilityPass(const std::string& name, wgpu::TextureView tar
     entries[0].binding = 0;
     entries[0].textureView = source;
     entries[1].binding = 1;
-    entries[1].sampler = linear_sampler;
+    if (stencil)
+      entries[1].textureView = stencil;
+    else
+      entries[1].sampler = linear_sampler;
     wgpu::BindGroupDescriptor group{};
     group.layout = pipeline.GetBindGroupLayout(1);
-    group.entryCount = name == "present" ? 2 : 1;
+    group.entryCount = name == "present" || stencil ? 2 : 1;
     group.entries = entries.data();
     encoder_pass.SetBindGroup(1, device.CreateBindGroup(&group));
   }
@@ -673,6 +719,14 @@ Renderer::Status Renderer::Execute(Work& work, std::string& error) {
       return Status::kDone;
     case CommandType::kPresent:
       return s.Present(work, error);
+    case CommandType::kRegisterVirtualResource: {
+      const auto c = work.As<RegisterVirtualResourceCommand>();
+      if (c.kind == VirtualResourceKind::kTexture && c.packed_depth_source)
+        s.packed_depth_aliases[c.resource] = c.packed_depth_source;
+      else
+        s.packed_depth_aliases.erase(c.resource);
+      return Status::kDone;
+    }
     case CommandType::kRenderPhaseMarker:
       if (s.trace) {
         const auto c = work.As<RenderPhaseMarkerCommand>();

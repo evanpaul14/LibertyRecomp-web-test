@@ -50,9 +50,10 @@ wgpu::TextureFormat SampledFormat(xenos::TextureFormat format) {
     case xenos::TextureFormat::k_16_16_FLOAT: return wgpu::TextureFormat::RG16Float;
     case xenos::TextureFormat::k_32_FLOAT: return wgpu::TextureFormat::R32Float;
     // Resolved depth is stored as float values so every title shader can
-    // sample it with a filtering sampler.
+    // sample it with a filtering sampler; green keeps the stencil for packed
+    // depth aliases and readback.
     case xenos::TextureFormat::k_24_8:
-    case xenos::TextureFormat::k_24_8_FLOAT: return wgpu::TextureFormat::R32Float;
+    case xenos::TextureFormat::k_24_8_FLOAT: return wgpu::TextureFormat::RG32Float;
     default: return wgpu::TextureFormat::Undefined;
   }
 }
@@ -425,8 +426,55 @@ wgpu::Buffer Renderer::State::VertexBuffer(const BufferCapture& capture, uint32_
   return buffer;
 }
 
+std::shared_ptr<TextureResource> Renderer::State::PackedDepthAlias(
+    uint32_t handle, uint32_t source_handle, const xenos::xe_gpu_texture_fetch_t& fetch,
+    std::string& error) {
+  const auto source = textures.find(source_handle);
+  if (source == textures.end() || !source->second->gpu_produced || !source->second->depth_values ||
+      !source->second->content_serial) {
+    error = "Packed depth alias has no resolved depth snapshot";
+    return {};
+  }
+  std::shared_ptr<TextureResource> alias;
+  if (auto found = textures.find(handle); found != textures.end() && found->second->gpu_produced &&
+      found->second->width == source->second->width &&
+      found->second->height == source->second->height) {
+    alias = found->second;
+  } else {
+    alias = CreateTexture(fetch, true, error);
+    if (!alias) return {};
+    if (alias->format != wgpu::TextureFormat::RGBA8Unorm ||
+        alias->width != source->second->width || alias->height != source->second->height) {
+      error = "Packed depth alias does not match its depth snapshot";
+      return {};
+    }
+    textures[handle] = alias;
+  }
+  if (alias->packed_source_serial == source->second->content_serial &&
+      alias->packed_swizzle == fetch.swizzle)
+    return alias;
+  wgpu::TextureViewDescriptor level{};
+  level.dimension = wgpu::TextureViewDimension::e2D;
+  level.mipLevelCount = 1;
+  level.arrayLayerCount = 1;
+  const bool float_depth =
+      GetBaseFormat(source->second->info.format) == xenos::TextureFormat::k_24_8_FLOAT;
+  const std::array<float, 12> parameters{0, 0, 0, 0, 0, 0, 0, 0,
+                                         float_depth ? 1.0f : 0.0f, float(fetch.swizzle), 0, 0};
+  if (!UtilityPass("packed_depth_alias", alias->texture.CreateView(&level),
+                   wgpu::kDepthSliceUndefined, false, alias->format, alias->width, alias->height,
+                   {0, 0, int32_t(alias->width), int32_t(alias->height)},
+                   source->second->texture.CreateView(&level), parameters, false, error))
+    return {};
+  alias->packed_source_serial = source->second->content_serial;
+  alias->packed_swizzle = fetch.swizzle;
+  alias->content_serial = ++content_serial;
+  return alias;
+}
+
 void Renderer::State::ReleaseResource(uint32_t handle) {
   textures.erase(handle);
+  packed_depth_aliases.erase(handle);
   if (auto found = surfaces.find(handle); found != surfaces.end()) {
     GuestSurfaceView view{};
     if (DecodeGuestSurfaceView(found->second->descriptor, false, view)) {
@@ -441,6 +489,7 @@ void Renderer::State::ClearResources() {
   surfaces.clear();
   color_views.clear();
   textures.clear();
+  packed_depth_aliases.clear();
   vertex_buffers.clear();
   index_buffers.clear();
   texture_groups.clear();

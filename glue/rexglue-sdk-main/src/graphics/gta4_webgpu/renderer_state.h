@@ -58,7 +58,10 @@ struct TextureResource {
   xenos::xe_gpu_texture_fetch_t fetch{};
   uint64_t capture_generation = 0;
   bool gpu_produced = false;
-  bool depth_values = false;  // r32float storage of a resolved depth surface.
+  bool depth_values = false;  // rg32float (depth, stencil) of a resolved depth surface.
+  // A packed depth alias: the source snapshot it was last built from.
+  uint64_t packed_source_serial = 0;
+  uint32_t packed_swizzle = 0;
   uint32_t width = 0, height = 0, layers = 1, mip_levels = 1;
   uint64_t content_serial = 0;
 };
@@ -117,7 +120,8 @@ struct Renderer::State {
                    bool target_is_depth, wgpu::TextureFormat format, uint32_t target_width,
                    uint32_t target_height, const std::array<int32_t, 4>& scissor,
                    wgpu::TextureView source, std::span<const float> parameters,
-                   bool load_existing, std::string& error);
+                   bool load_existing, std::string& error,
+                   wgpu::TextureView stencil = nullptr);
 
   // --- resources.cpp ---
   std::shared_ptr<SurfaceResource> Surface(const gta4_native::SurfaceDescriptor& descriptor,
@@ -131,6 +135,9 @@ struct Renderer::State {
                                                   const std::shared_ptr<const TextureCapture>& capture,
                                                   std::string& error);
   bool Upload(TextureResource& texture, const TextureCapture& capture, std::string& error);
+  std::shared_ptr<TextureResource> PackedDepthAlias(uint32_t handle, uint32_t source,
+                                                    const xenos::xe_gpu_texture_fetch_t& fetch,
+                                                    std::string& error);
   wgpu::Sampler Sampler(const xenos::xe_gpu_texture_fetch_t& fetch,
                         const TextureResource* texture);
   wgpu::Buffer IndexBuffer(const BufferCapture& capture, bool& index32, std::string& error);
@@ -250,6 +257,9 @@ struct Renderer::State {
                      gta4_native::GuestPlacementKeyHash>
       color_views;
   std::unordered_map<uint32_t, std::shared_ptr<TextureResource>> textures;
+  // Textures the title samples as A8R8G8B8 views of a resolved depth texture,
+  // by alias handle: the resolved texture's handle.
+  std::unordered_map<uint32_t, uint32_t> packed_depth_aliases;
   struct ConvertedBuffer {
     wgpu::Buffer buffer;
     uint64_t size = 0;

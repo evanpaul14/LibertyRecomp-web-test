@@ -628,7 +628,10 @@ bool Renderer::State::Draw(const Work& work, std::string& error) {
       std::shared_ptr<TextureResource> resource;
       if (handle) {
         std::string texture_error;
-        resource = SampledTexture(handle, fetch, work.textures[slot], texture_error);
+        if (const auto alias = packed_depth_aliases.find(handle); alias != packed_depth_aliases.end())
+          resource = PackedDepthAlias(handle, alias->second, fetch, texture_error);
+        else
+          resource = SampledTexture(handle, fetch, work.textures[slot], texture_error);
         if (trace || (!resource && !texture_error.empty() && ++texture_failures <= 32)) {
           size_t bytes = 0, nonzero = 0;
           if (const auto& capture = work.textures[slot]; capture && !capture->mips.empty()) {
