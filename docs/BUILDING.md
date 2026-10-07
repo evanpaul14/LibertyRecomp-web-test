@@ -242,6 +242,7 @@ keep those local. Embedded builds (iOS, PS4, Switch) additionally require a loca
 payload at packaging time. Android supports runtime asset selection. See
 [platform setup](PLATFORM_SETUP.md) and `tools/local_game_payload/README.md` for SDK and
 payload requirements. Fetching all tool sources does not install those platform SDKs.
+An experimental WebAssembly build is described in [WEB_BUILDING.md](WEB_BUILDING.md).
 
 ## 5. Shader Tools
 

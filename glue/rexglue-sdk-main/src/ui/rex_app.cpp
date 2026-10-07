@@ -199,6 +199,11 @@ bool ReXApp::SetupEnvironment() {
 #endif
   }
 
+#if REX_PLATFORM_WEB
+  // Log files land in Emscripten's in-memory filesystem, where nobody can
+  // read them; mirror logs to stdout (the browser console and page log).
+  log_config.log_to_console = true;
+#endif
   rex::InitLogging(log_config);
   rex::RegisterLogLevelCallback();
 

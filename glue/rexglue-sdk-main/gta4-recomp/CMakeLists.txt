@@ -387,6 +387,13 @@ elseif(EMSCRIPTEN)
         RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/LibertyRecomp"
     )
     rexglue_configure_target(LibertyRecomp)
+    # The page that hosts the module; serve the output directory with
+    # tools/web/serve.py (threads need COOP/COEP headers).
+    add_custom_command(TARGET LibertyRecomp POST_BUILD
+        COMMAND ${CMAKE_COMMAND} -E copy_if_different
+            "${CMAKE_CURRENT_SOURCE_DIR}/res/web/index.html"
+            "$<TARGET_FILE_DIR:LibertyRecomp>/index.html"
+        VERBATIM)
 else()
     add_library(gta4_recomp INTERFACE)
     target_include_directories(gta4_recomp INTERFACE

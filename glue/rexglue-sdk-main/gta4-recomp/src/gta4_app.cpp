@@ -646,9 +646,18 @@ std::optional<rex::PathConfig> GTA4App::OnFinalizePaths(
 void GTA4App::OnPreSetup(rex::RuntimeConfig& config) {
   rex::input::mnk::SetNativeControllerCompatibilityBindings(
       gta4::input::KeyboardControllerBindings());
+#if REX_PLATFORM_WEB
+  // No GPU backend exists for the browser yet (WebGPU is future work), so
+  // the web build runs headless on purpose rather than requesting a plugin
+  // it cannot load.
+  if (!config.graphics && config.gpu_plugin.empty()) {
+    REXLOG_WARN("Web build: no GPU backend available, running headless");
+  }
+#else
   if (!config.graphics && config.gpu_plugin.empty()) {
     config.gpu_plugin = "gta4-native";
   }
+#endif
 
   // Resolve the backend-dependent combination before the AA controller latches
   // its active scene configuration. A pending frontend choice cannot change
