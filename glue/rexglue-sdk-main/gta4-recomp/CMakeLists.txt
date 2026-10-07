@@ -20,6 +20,7 @@ set(GTA4_APP_SOURCES
     src/gta4_app.cpp
     src/gta4_frontend_hooks.cpp
     src/gta4_font_selection_trace.cpp
+    src/gta4_guest_debug_print.cpp
     src/gta4_presentation_options.cpp
     src/gta4_presentation_hooks.cpp
     src/gta4_aspect_hooks.cpp
@@ -378,6 +379,12 @@ elseif(EMSCRIPTEN)
         -sENVIRONMENT=web,worker,node
         -sEXIT_RUNTIME=1
     )
+    option(LIBERTY_WEB_FUNCTION_NAMES
+        "Keep function names in the web build so traps and profiles are readable"
+        OFF)
+    if(LIBERTY_WEB_FUNCTION_NAMES)
+        target_link_options(LibertyRecomp PRIVATE --profiling-funcs)
+    endif()
     if(LIBERTY_WEB_NODERAWFS)
         target_link_options(LibertyRecomp PRIVATE -sNODERAWFS=1
             "--pre-js=${CMAKE_CURRENT_SOURCE_DIR}/res/web/node_env.js")
