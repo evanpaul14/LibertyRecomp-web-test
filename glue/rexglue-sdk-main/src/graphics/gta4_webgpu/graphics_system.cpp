@@ -21,6 +21,7 @@
 
 #include "../gta4_native/native_buffer_metadata.h"
 #include "../gta4_native/native_texture_image_identity.h"
+#include "canvas.h"
 #include "renderer.h"
 #include "shader_archive.h"
 
@@ -161,6 +162,7 @@ X_STATUS Gta4WebGpuGraphicsSystem::SetupGuestGpu(runtime::FunctionDispatcher* di
 
 void* Gta4WebGpuGraphicsSystem::RenderThreadMain(void* argument) {
   auto* self = static_cast<Gta4WebGpuGraphicsSystem*>(argument);
+  RequestCanvas();
   self->renderer_->SetResume([self] {
     {
       std::lock_guard lock(self->queue_mutex_);
@@ -602,7 +604,12 @@ void Gta4WebGpuGraphicsSystem::Drain() {
 
 bool Gta4WebGpuGraphicsSystem::SubmitTitleCommand(uint32_t title_id, uint32_t abi,
                                                   const void* command, size_t size) {
-  if (title_id != kTitleId || !Unwrap(abi, command, size)) return false;
+  if (title_id != kTitleId) return false;
+  if (!Unwrap(abi, command, size)) {
+    static std::atomic<uint32_t> logged{0};
+    if (++logged <= 16) REXLOG_WARN("gta4-webgpu: cannot unwrap title command abi={:08X}", abi);
+    return false;
+  }
   const auto header = Read<CommandHeader>(command);
   if (header.type == CommandType::kTemporalUpdate) return true;  // No temporal AA here.
   auto work = std::make_unique<Work>();

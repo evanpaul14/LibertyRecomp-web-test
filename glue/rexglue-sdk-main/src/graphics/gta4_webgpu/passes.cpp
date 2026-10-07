@@ -16,6 +16,7 @@
 
 #include "../gta4_native/native_color_output.h"
 #include "../gta4_native/native_texture_image_identity.h"
+#include "canvas.h"
 
 REXCVAR_DEFINE_STRING(webgpu_frame_dump_path, "", "GPU/Diagnostics",
                       "Web build: write presented frames as PAM images with this path prefix");
@@ -63,6 +64,48 @@ wgpu::TextureView DepthView(const SurfaceResource& surface) {
   return surface.texture.CreateView(&view);
 }
 }  // namespace
+
+void Renderer::State::PresentToCanvas(const TextureResource& source, std::string& error) {
+  uint32_t width = 0, height = 0;
+  if (!PollCanvas(width, height)) return;
+  if (!surface) {
+    wgpu::EmscriptenSurfaceSourceCanvasHTMLSelector canvas{};
+    canvas.selector = kCanvasSelector;
+    wgpu::SurfaceDescriptor descriptor{};
+    descriptor.nextInChain = &canvas;
+    surface = instance.CreateSurface(&descriptor);
+    wgpu::SurfaceCapabilities capabilities{};
+    surface.GetCapabilities(adapter, &capabilities);
+    surface_format = capabilities.formatCount ? capabilities.formats[0]
+                                              : wgpu::TextureFormat::BGRA8Unorm;
+    REXLOG_INFO("gta4-webgpu: presenting to the page canvas ({})", uint32_t(surface_format));
+  }
+  if (width != surface_width || height != surface_height) {
+    wgpu::SurfaceConfiguration configuration{};
+    configuration.device = device;
+    configuration.format = surface_format;
+    configuration.usage = wgpu::TextureUsage::RenderAttachment;
+    configuration.width = width;
+    configuration.height = height;
+    configuration.alphaMode = wgpu::CompositeAlphaMode::Opaque;
+    configuration.presentMode = wgpu::PresentMode::Fifo;
+    surface.Configure(&configuration);
+    surface_width = width;
+    surface_height = height;
+  }
+  wgpu::SurfaceTexture current{};
+  surface.GetCurrentTexture(&current);
+  if (!current.texture) return;
+  wgpu::TextureViewDescriptor view{};
+  view.dimension = wgpu::TextureViewDimension::e2D;
+  view.arrayLayerCount = 1;
+  view.mipLevelCount = 1;
+  const std::array<float, 12> parameters{0, 0, 0, 0, 0, 0, float(width), float(height), 0, 0, 0, 0};
+  // The browser shows the canvas when the render worker next yields.
+  UtilityPass("present", current.texture.CreateView(), wgpu::kDepthSliceUndefined, false,
+              surface_format, width, height, {0, 0, int32_t(width), int32_t(height)},
+              source.texture.CreateView(&view), parameters, false, error);
+}
 
 bool Renderer::State::Resolve(const Work& work, std::string& error) {
   const auto c = work.As<ResolveCommand>();
@@ -227,9 +270,16 @@ Renderer::Status Renderer::State::Present(const Work& work, std::string& error) 
                 c.frontbuffer_texture, !source ? "none" : source->gpu_produced ? "gpu" : "cpu",
                 source ? source->width : 0, source ? source->height : 0, pipelines.size(),
                 textures.size(), surfaces.size());
+  if (c.submitted_frame <= 3 || c.submitted_frame % 60 == 0) {
+    std::string counts;
+    for (size_t i = 0; i < stats.commands.size(); ++i)
+      if (stats.commands[i]) counts += fmt::format(" {}:{}", i, stats.commands[i]);
+    REXLOG_INFO("gta4-webgpu: frame={} commands{}", c.submitted_frame, counts);
+  }
   stats = {};
   frame_draws = 0;
 
+  if (source) PresentToCanvas(*source, error);
   const std::string dump_path = REXCVAR_GET(webgpu_frame_dump_path);
   const uint32_t interval = std::max(1u, REXCVAR_GET(webgpu_frame_dump_interval));
   const bool dump = !dump_path.empty() && source && c.width && c.height &&

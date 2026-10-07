@@ -429,9 +429,10 @@ bool ReXApp::SetupPresentation() {
       }
     }
     window_->SetPresenter(presenter);
-  } else if (!graphics_system) {
-    // Detached mode: the app brings its own renderer and drives its own paint
-    // loop. ReXApp owns the returned drawer via immediate_drawer_.
+  } else {
+    // Detached mode: the app brings its own renderer (or the graphics system
+    // presents without a ui::Presenter, as on the web) and drives its own
+    // paint loop. ReXApp owns the returned drawer via immediate_drawer_.
     immediate_drawer_ = OnCreateImmediateDrawer();
     if (immediate_drawer_) {
       SetupOverlays(/*presenter=*/nullptr, immediate_drawer_.get());

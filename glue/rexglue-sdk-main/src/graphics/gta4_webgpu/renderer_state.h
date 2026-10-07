@@ -153,6 +153,7 @@ struct Renderer::State {
   bool Resolve(const Work& work, std::string& error);
   bool Handoff(const Work& work, std::string& error);
   Status Present(const Work& work, std::string& error);
+  void PresentToCanvas(const TextureResource& source, std::string& error);
   Status Readback(const Work& work, std::string& error);
 
   memory::Memory* memory;
@@ -167,6 +168,10 @@ struct Renderer::State {
   wgpu::TextureFormat depth_format = wgpu::TextureFormat::Depth24PlusStencil8;
   bool float32_blendable = false;
   bool bc_textures = false;
+
+  wgpu::Surface surface;  // The page canvas; absent under Node.
+  wgpu::TextureFormat surface_format = wgpu::TextureFormat::Undefined;
+  uint32_t surface_width = 0, surface_height = 0;
 
   wgpu::CommandEncoder encoder;
   wgpu::RenderPassEncoder pass;
@@ -219,6 +224,7 @@ struct Renderer::State {
   struct FrameStats {
     uint32_t draws = 0, no_targets = 0, empty_viewport = 0, empty_scissor = 0, failed = 0;
     uint32_t clears = 0, resolves = 0;
+    std::array<uint32_t, 32> commands{};
   } stats;
   uint64_t gpu_errors = 0;
   bool ready = false;

@@ -379,7 +379,10 @@ elseif(EMSCRIPTEN)
         -sDEFAULT_PTHREAD_STACK_SIZE=4MB
         -sENVIRONMENT=web,worker,node
         -sEXIT_RUNTIME=1
+        "--pre-js=${CMAKE_CURRENT_SOURCE_DIR}/res/web/webgpu_canvas.js"
     )
+    set_property(TARGET LibertyRecomp APPEND PROPERTY LINK_DEPENDS
+        "${CMAKE_CURRENT_SOURCE_DIR}/res/web/webgpu_canvas.js")
     option(LIBERTY_WEB_FUNCTION_NAMES
         "Keep function names in the web build so traps and profiles are readable"
         OFF)

@@ -279,6 +279,7 @@ bool Renderer::State::Draw(const Work& work, std::string& error) {
     }
   }
   if (!count) return true;
+  const uint32_t vertex_count = count;  // Before fan/quad index conversion.
   if (count > 16u * 1024u * 1024u || !work.device) {
     error = "Draw range exceeds its bound or has no device state";
     return false;
@@ -488,13 +489,13 @@ bool Renderer::State::Draw(const Work& work, std::string& error) {
   for (const auto& input : inputs) {
     VertexBinding binding;
     if (up) {
-      if (!up_stride || uint64_t(up_stride) * count > work.up_vertices.size()) {
+      if (!up_stride || uint64_t(up_stride) * vertex_count > work.up_vertices.size()) {
         error = "Invalid UP vertex payload extent";
         return false;
       }
       const size_t components = input.elements.size() * 4;
-      std::vector<float> decoded(size_t(count) * components);
-      for (uint32_t v = 0; v < count; ++v) {
+      std::vector<float> decoded(size_t(vertex_count) * components);
+      for (uint32_t v = 0; v < vertex_count; ++v) {
         for (size_t i = 0; i < input.elements.size(); ++i) {
           const auto* element = input.elements[i];
           float* out = decoded.data() + v * components + i * 4;
@@ -508,7 +509,7 @@ bool Renderer::State::Draw(const Work& work, std::string& error) {
       if (type == 8) {
         // Rectangle list: three corners per rectangle; reconstruct the fourth
         // opposite the longest edge and emit two triangles.
-        if (count % 3) {
+        if (vertex_count % 3) {
           error = "Incomplete rectangle list";
           return false;
         }
@@ -520,7 +521,7 @@ bool Renderer::State::Draw(const Work& work, std::string& error) {
           if (at != input.locations.end()) position_index = size_t(at - input.locations.begin());
         }
         std::vector<float> expanded(decoded.size() * 2);
-        for (uint32_t r = 0; r < count / 3; ++r) {
+        for (uint32_t r = 0; r < vertex_count / 3; ++r) {
           const float* corner[3] = {decoded.data() + (r * 3) * components,
                                     decoded.data() + (r * 3 + 1) * components,
                                     decoded.data() + (r * 3 + 2) * components};

@@ -150,6 +150,7 @@ if(EMSCRIPTEN)
             " (generate it with tools/webgpu/spirv_to_wgsl.py, see docs/WEB_BUILDING.md)")
     endif()
     add_library(rex-gta4-webgpu STATIC
+        gta4_webgpu/canvas.cpp
         gta4_webgpu/draw.cpp
         gta4_webgpu/graphics_system.cpp
         gta4_webgpu/passes.cpp
