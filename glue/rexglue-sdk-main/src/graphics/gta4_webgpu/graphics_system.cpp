@@ -7,6 +7,7 @@
 #include <thread>
 
 #include <emscripten/emscripten.h>
+#include <emscripten/eventloop.h>
 #include <emscripten/proxying.h>
 #include <emscripten/threading.h>
 
@@ -21,6 +22,7 @@
 #include <rex/logging.h>
 #include <rex/system/function_dispatcher.h>
 #include <rex/system/xmemory.h>
+#include <rex/thread/wait_trace.h>
 
 #include "../gta4_native/native_buffer_metadata.h"
 #include "../gta4_native/native_texture_image_identity.h"
@@ -191,6 +193,8 @@ void* Gta4WebGpuGraphicsSystem::RenderThreadMain(void* argument) {
     }
     self->ready_wake_.notify_all();
   });
+  // Reports when queued work stops moving (a lost wake or GPU callback).
+  emscripten_set_interval(WatchdogThunk, 5000.0, self);
   // WebGPU callbacks and drain requests arrive through the event loop.
   emscripten_exit_with_live_runtime();
   return nullptr;
@@ -577,6 +581,8 @@ void Gta4WebGpuGraphicsSystem::Enqueue(std::unique_ptr<Work> work, bool present)
     };
     if (!has_space()) {
       const double start = emscripten_get_now();
+      thread::wait_trace::Scope wait_scope("render queue full (%zu commands, %u presents)",
+                                           queue_.size(), queued_presents_);
       queue_space_.wait(lock, has_space);
       blocked_ms_ += emscripten_get_now() - start;
     }
@@ -594,6 +600,42 @@ void Gta4WebGpuGraphicsSystem::ScheduleDrain() {
     drain_scheduled_.store(false, std::memory_order_release);
     REXLOG_ERROR("gta4-webgpu: render thread wake failed");
   }
+}
+
+void Gta4WebGpuGraphicsSystem::WatchdogThunk(void* self) {
+  auto* system = static_cast<Gta4WebGpuGraphicsSystem*>(self);
+  size_t queued;
+  uint32_t presents;
+  bool waiting;
+  uint64_t executed;
+  uint64_t presents_executed;
+  uint32_t next_type;
+  {
+    std::lock_guard lock(system->queue_mutex_);
+    queued = system->queue_.size();
+    presents = system->queued_presents_;
+    waiting = system->waiting_on_gpu_;
+    executed = system->executed_;
+    presents_executed = system->presents_executed_;
+    next_type = queued ? uint32_t(system->queue_.front()->type()) : 0u;
+  }
+  const bool stalled = executed == system->watchdog_executed_ && (queued || waiting);
+  system->watchdog_executed_ = executed;
+  // No present for a while: report what every thread is blocked on (once per stall).
+  if (presents_executed != system->watchdog_presents_) {
+    system->watchdog_presents_ = presents_executed;
+    system->watchdog_idle_ticks_ = 0;
+  } else if (++system->watchdog_idle_ticks_ == 3 || system->watchdog_idle_ticks_ == 12) {
+    thread::wait_trace::Dump(system->watchdog_idle_ticks_ == 3 ? "no present for 15 s"
+                                                                : "no present for 60 s");
+  }
+  if (!stalled) return;
+  REXLOG_WARN("gta4-webgpu: render queue stalled: {} commands ({} presents) queued, "
+              "waiting on GPU={}, drain scheduled={}, next command type={}, last type={}",
+              queued, presents, waiting, system->drain_scheduled_.load(),
+              next_type, system->last_type_);
+  // A lost wake leaves the queue idle; drain it from here.
+  if (!waiting) system->Drain();
 }
 
 void Gta4WebGpuGraphicsSystem::DrainThunk(void* self) {
@@ -622,7 +664,12 @@ void Gta4WebGpuGraphicsSystem::Drain() {
     }
     {
       std::lock_guard lock(queue_mutex_);
-      if (present) --queued_presents_;
+      ++executed_;
+      last_type_ = uint32_t(work->type());
+      if (present) {
+        --queued_presents_;
+        ++presents_executed_;
+      }
       if (status == Renderer::Status::kPending) waiting_on_gpu_ = true;
     }
     queue_space_.notify_all();
@@ -725,6 +772,7 @@ bool Gta4WebGpuGraphicsSystem::ExecuteTitleCommand(uint32_t title_id, uint32_t a
   work->execute = slot;
   Enqueue(std::move(work), false);
   std::unique_lock lock(slot->mutex);
+  thread::wait_trace::Scope wait_scope("synchronous title command %u", uint32_t(header.type));
   slot->wake.wait(lock, [&] { return slot->done || !render_running_; });
   if (!slot->done || !slot->success || slot->result.size() != result_size) {
     if (!slot->error.empty())

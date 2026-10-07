@@ -9,6 +9,7 @@
  * @modified    Tom Clay, 2026 - Adapted for ReXGlue runtime
  */
 
+#include <cstdio>
 #include <vector>
 
 #include <rex/chrono/clock.h>
@@ -26,8 +27,15 @@
 #include <rex/system/xsemaphore.h>
 #include <rex/system/xsymboliclink.h>
 #include <rex/system/xthread.h>
+#include <rex/thread/wait_trace.h>
 
 namespace rex::system {
+
+namespace {
+long long TraceTimeout(std::chrono::milliseconds timeout) {
+  return timeout == std::chrono::milliseconds::max() ? -1 : (long long)timeout.count();
+}
+}  // namespace
 
 XObject::XObject(Type type) : kernel_state_(nullptr), pointer_ref_count_(1), type_(type) {
   handles_.reserve(10);
@@ -213,6 +221,9 @@ X_STATUS XObject::Wait(uint32_t wait_reason, uint32_t processor_mode, uint32_t a
                                 : std::chrono::milliseconds::max();
 
   XThread::CheckTitleTermination();
+  rex::thread::wait_trace::Scope wait_scope(
+      "wait type=%u obj=%08X '%s' reason=%u alertable=%u timeout=%lld ms", uint32_t(type_),
+      guest_object_ptr_, name_.c_str(), wait_reason, alertable, TraceTimeout(timeout_ms));
   auto result = rex::thread::Wait(wait_handle, alertable ? true : false, timeout_ms);
   XThread::CheckTitleTermination();
   switch (result) {
@@ -239,6 +250,10 @@ X_STATUS XObject::SignalAndWait(XObject* signal_object, XObject* wait_object, ui
                                       TimeoutTicksToMs(*opt_timeout)))
                                 : std::chrono::milliseconds::max();
 
+  rex::thread::wait_trace::Scope wait_scope(
+      "signal obj=%08X and wait type=%u obj=%08X '%s' alertable=%u timeout=%lld ms",
+      signal_object->guest_object(), uint32_t(wait_object->type()), wait_object->guest_object(),
+      wait_object->name().c_str(), alertable, TraceTimeout(timeout_ms));
   auto result =
       rex::thread::SignalAndWait(signal_object->GetWaitHandle(), wait_object->GetWaitHandle(),
                                  alertable ? true : false, timeout_ms);
@@ -273,6 +288,14 @@ X_STATUS XObject::WaitMultiple(uint32_t count, XObject** objects, uint32_t wait_
                                 : std::chrono::milliseconds::max();
 
   XThread::CheckTitleTermination();
+  char objects_text[96] = {};
+  for (uint32_t i = 0, used = 0; i < count && used + 16 < sizeof(objects_text); ++i) {
+    used += std::snprintf(objects_text + used, sizeof(objects_text) - used, "%s%u:%08X",
+                          i ? "," : "", uint32_t(objects[i]->type()), objects[i]->guest_object());
+  }
+  rex::thread::wait_trace::Scope wait_scope("wait %s of %u [%s] alertable=%u timeout=%lld ms",
+                                            wait_type ? "any" : "all", count, objects_text,
+                                            alertable, TraceTimeout(timeout_ms));
   if (wait_type) {
     auto result =
         rex::thread::WaitAny(std::move(wait_handles), alertable ? true : false, timeout_ms);

@@ -78,6 +78,7 @@ class Gta4WebGpuGraphicsSystem final : public system::IGraphicsSystem {
   // Render thread.
   static void* RenderThreadMain(void* self);
   static void DrainThunk(void* self);
+  static void WatchdogThunk(void* self);
   void Drain();
   void ScheduleDrain();
 
@@ -112,6 +113,12 @@ class Gta4WebGpuGraphicsSystem final : public system::IGraphicsSystem {
   std::atomic<bool> drain_scheduled_{false};
   bool render_running_ = false;
   bool waiting_on_gpu_ = false;
+  uint64_t executed_ = 0;  // Commands the render thread has run (under queue_mutex_).
+  uint32_t last_type_ = 0;
+  uint64_t presents_executed_ = 0;  // Under queue_mutex_.
+  uint64_t watchdog_executed_ = 0;  // Render thread only.
+  uint64_t watchdog_presents_ = 0;  // Render thread only.
+  uint32_t watchdog_idle_ticks_ = 0;  // Render thread only.
 
   pthread_t render_thread_{};
   bool render_thread_started_ = false;

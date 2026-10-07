@@ -16,6 +16,7 @@
 
 #include <fmt/format.h>
 
+#include <rex/thread/wait_trace.h>
 #include <rex/chrono/clock.h>
 #include <rex/cvar.h>
 #include <rex/dbg.h>
@@ -1024,6 +1025,7 @@ uint32_t XThread::SelfSuspend() {
   std::unique_lock<std::mutex> lock(suspend_mutex_);
   uint32_t previous = guest_thread->suspend_count;
   guest_thread->suspend_count++;
+  rex::thread::wait_trace::Scope wait_scope("self-suspended (guest)");
   suspend_cv_.wait(lock, [guest_thread]() { return guest_thread->suspend_count == 0; });
   return previous;
 }
@@ -1045,6 +1047,7 @@ X_STATUS XThread::Delay(uint32_t processor_mode, uint32_t alertable, uint64_t in
   }
   timeout_ms = chrono::Clock::ScaleGuestDurationMillis(timeout_ms);
   CheckTitleTermination();
+  rex::thread::wait_trace::Scope wait_scope("delay %u ms alertable=%u", timeout_ms, alertable);
   if (alertable) {
     auto result = rex::thread::AlertableSleep(std::chrono::milliseconds(timeout_ms));
     CheckTitleTermination();
