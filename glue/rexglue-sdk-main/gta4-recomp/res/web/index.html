@@ -9,6 +9,7 @@
     html, body { margin: 0; height: 100%; background: #000; color: #ccc;
                  font: 13px/1.4 ui-monospace, SFMono-Regular, Menlo, monospace; }
     body { display: flex; flex-direction: column; }
+    #screen:fullscreen { width: 100vw; height: 100vh; }
     #screen { flex: 1; min-height: 0; position: relative; background: #000; }
     /* WebGPU draws into #liberty-gpu from a worker; SDL keeps #canvas (on
        top, transparent) for input. */
@@ -106,6 +107,16 @@
       }
       append('Mounted ' + files.length + ' game files from the server');
     }
+    // SDL asks the input canvas (#canvas) to go fullscreen, which would leave
+    // the WebGPU canvas underneath it hidden. Fullscreen the container that
+    // holds both instead.
+    (function () {
+      const screenEl = document.getElementById('screen');
+      const input = document.getElementById('canvas');
+      for (const name of ['requestFullscreen', 'webkitRequestFullscreen']) {
+        input[name] = (options) => (screenEl.requestFullscreen || screenEl.webkitRequestFullscreen).call(screenEl, options);
+      }
+    })();
     var Module = {
       canvas: document.getElementById('canvas'),
       arguments: new URLSearchParams(location.search).getAll('arg'),
