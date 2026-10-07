@@ -2493,6 +2493,11 @@ bool LiveCompatibilityRuntime::LoadOrCreateIdentity(const std::filesystem::path&
 }
 
 uint32_t LiveCompatibilityRuntime::DiscoverLocalIpv4() {
+#if REX_PLATFORM_WEB
+  // A page has no host network interface to report (and Emscripten's
+  // getaddrinfo shim only fabricates proxy addresses).
+  return htonl(INADDR_LOOPBACK);
+#endif
   char hostname[256]{};
   if (gethostname(hostname, sizeof(hostname)) != 0) {
     return htonl(INADDR_LOOPBACK);

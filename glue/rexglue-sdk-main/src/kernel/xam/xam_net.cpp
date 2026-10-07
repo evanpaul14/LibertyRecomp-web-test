@@ -799,7 +799,15 @@ u32 NetDll_XNetDnsLookup_entry(u32 caller, mapped_string host, u32 event_handle,
   hints.ai_family = AF_INET;
   hints.ai_socktype = SOCK_DGRAM;
   addrinfo* addresses = nullptr;
+#if REX_PLATFORM_WEB
+  // Browsers cannot resolve DNS; Emscripten's getaddrinfo only fabricates
+  // addresses for its WebSocket proxy. Report the host as not found, as an
+  // offline console would.
+  (void)hints;
+  const int lookup_result = EAI_NONAME;
+#else
   const int lookup_result = getaddrinfo(host.value().data(), nullptr, &hints, &addresses);
+#endif
   if (lookup_result != 0) {
     dns->status = 0x2AF9;  // WSAHOST_NOT_FOUND
   } else {
