@@ -231,10 +231,11 @@ Working:
   `main()` runs on its worker. Without game files it stops at the installation
   check (`GTA IV installation is not launch-ready: default.xex is missing or
   unreadable.`).
-- With game files served by `tools/web/serve.py`, Chrome on an M1 Mac reaches
-  gameplay; the loading screen draws correctly and gameplay runs at about 5 fps.
-  Gameplay looked black there, most likely the stencil bug since fixed (see
-  Depth handoff above); Chrome has not been rechecked since.
+- With game files served by `tools/web/serve.py`, Chrome on an M1 Mac renders
+  the loading screens and the intro cutscenes lit and correct, with no stalls
+  or GPU errors. Light scenes run at 40–59 fps; the heaviest cutscene stretch
+  (about 6,000 draws a frame) drops to 3–6 fps. Gameplay proper has not been
+  rechecked in Chrome since the rendering fixes.
 
 `rex-web-memory-test` checks the memory layout and MMIO routing under Node 24:
 

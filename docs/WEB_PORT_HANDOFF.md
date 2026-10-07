@@ -39,20 +39,40 @@ mapped); this file is for whoever continues the work.
 - **Real browser (Chrome on an M1 Mac, 2026-10-07).** With game files served by
   `tools/web/serve.py` (installed from a disc image extracted to a folder; the
   installer cannot map a 7.8 GB `.iso` under Node), the build reaches gameplay
-  in Chrome. The loading screen draws correctly. Gameplay frames (11–15k draws)
-  run at about 5 fps, and in Chrome they looked black. That run predates the
-  clock, hang, stencil-rebuild and downsample-resolve fixes below, all of which
-  apply to the browser too; the black gameplay is most likely the stencil bug.
-  Not rechecked in Chrome since.
+  in Chrome. An earlier run showed black gameplay at about 5 fps; it predated
+  the clock, hang, stencil-rebuild and downsample-resolve fixes below.
+  - *Rechecked with those fixes:* the intro cutscenes render lit and correct
+    (ship's cabin, the docks meeting with the in-world credits) with no stalls
+    or GPU errors. Light scenes (400–700 draws) run at 40–59 fps; the heaviest
+    stretch (~6,000–6,600 draws) dropped to 3–6 fps, at ~20–32 µs of
+    render-thread time per draw, spread over inputs, bindings, uniforms and
+    encoding (pipeline compiles were near zero). Gameplay proper (11–15k
+    draws) has not been reached in Chrome since.
+  - *Fixed: frozen canvas.* The picture stopped updating once a heavy scene
+    put the renderer behind the game, while rendering went on. A worker's
+    canvas shows a frame only when its current task ends, and the drain's
+    "yield" after a present re-proxied itself to the render thread, which
+    Emscripten runs in the same task while it executes that thread's mailbox
+    (`em_task_queue_execute`). With work always queued, the task never ended.
+    The drain now resumes from a `MessageChannel` message (a new task), with
+    game-thread wakes suppressed until then (`YieldToEventLoop` in
+    `graphics_system.cpp`). Found with the new `presents` perf line (below):
+    every present was shown with new content, yet the picture was frozen.
+  - The Claude-in-Chrome extension could not see the WebGPU canvas in its own
+    tab group (it stayed dark there while a normal tab rendered); use a tab
+    opened normally (`open -a "Google Chrome" <url>`) and a screen capture.
 - **Profiling.** `--webgpu_perf_report=true` logs render-thread and capture
-  timing every 5 s as warnings. Use it with `--diagnostics=true
+  timing every 5 s as warnings, plus a `presents` line: presents shown on the
+  canvas, those with new frontbuffer contents, those skipped (no source, no
+  canvas, no surface texture with its status), canvas size, frontbuffer and GPU
+  error count. Use it with `--diagnostics=true
   --diagnostics_categories=logging --log_level=warn`: other diagnostics print
   a line per draw, and every line blocks the game thread until the page's
   main thread handles it. In the browser that alone held gameplay below 1 fps.
-- Next step candidates, in suggested order: re-check Chrome with the fixes
-  below (picture, frame rate, no stall), then a game-file picker, then
-  performance (pipeline compiles off the render thread, device-block deltas).
-  Ask the user.
+- Next step candidates, in suggested order: per-draw render-thread cost
+  (the heavy cutscene stretch runs at 3–6 fps; see the Chrome numbers above),
+  confirming Chrome through gameplay proper, then a game-file picker. Ask the
+  user.
 - **Node graphics session (Dawn on Metal, M1 Mac, 2026-10-07).**
   - *Fixed: black loading screens.* Emscripten has no `CLOCK_MONOTONIC_RAW`;
     `clock_getres`/`clock_gettime` failed and, with asserts compiled out, the
@@ -129,7 +149,7 @@ mapped); this file is for whoever continues the work.
 | FPSCR | Per-thread virtual control word; wasm always rounds to nearest | `include/rex/platform/fpscr.h` |
 | Fibers | Thread fibers only; `Create`/`SwitchTo` fail loudly (GTA IV uses none) | `src/core/fiber_web.cpp` |
 | GPU | Statically linked WebGPU title-command renderer (no `dlopen` on web); created in `GTA4App::OnPreSetup`. `--gpu_plugin=none` = headless | `src/graphics/gta4_webgpu/`, `include/rex/graphics/gta4_webgpu.h`, `gta4-recomp/src/gta4_app.cpp` |
-| GPU threading | One render pthread owns the device and runs from the JS event loop (needed for `mapAsync` and canvas presentation), woken via `emscripten_proxy_async`. Game threads capture device block/buffers/textures at submit (`Capture` in `graphics_system.cpp`) | `gta4_webgpu/graphics_system.cpp`, `work.h` |
+| GPU threading | One render pthread owns the device and runs from the JS event loop (needed for `mapAsync` and canvas presentation), woken via `emscripten_proxy_async`; after each present it yields with a `MessageChannel` message, since a proxied wake can run in the same task and the canvas only updates when the task ends. Game threads capture device block/buffers/textures at submit (`Capture` in `graphics_system.cpp`) | `gta4_webgpu/graphics_system.cpp`, `work.h` |
 | Shaders | Stock SPIR-V → GLSL (SPIRV-Cross) → rewrite BDA constants to one UBO (VS 0, PS 4096, shared 8192, spec word 8192+0x500) and bindless to fixed slots → glslang → spirv-opt → naga → WGSL. naga undoes the Vulkan y-flip itself | `tools/webgpu/spirv_to_wgsl.py`, `LibertyRecompLib/shader/webgpu_shader_archive.bin` |
 | Vertex data | Every attribute decoded to `float32x4` on the CPU per buffer generation (shaders read vec4 floats; WebGPU cannot feed integer formats to them) | `gta4_webgpu/vertex_decode.h`, `resources.cpp` |
 | Render targets | Single-sampled; resolved depth stored as `rg32float` (depth, stencil), with packed A8R8G8B8 aliases rebuilt on demand; resolves pick the latest surface at the same EDRAM placement, and map samples when its MSAA layout differs from the resolved view (`resolve_color`) | `gta4_webgpu/resources.cpp`, `passes.cpp`, `renderer.cpp` |
@@ -288,5 +308,5 @@ node out/web-node/LibertyRecomp/LibertyRecomp.js --diagnostics=true \
    Follow-ups: profile a gameplay frame first (split SwiftShader time vs
    pipeline compiles vs texture decode), then compile pipelines and decode
    textures off the render thread, send device-block dirty deltas, close the
-   fidelity gaps above, and check the picture in a real browser once files load.
+   fidelity gaps above. Chrome renders the intro correctly (see above).
 3. **Audio, input and page lifecycle** (SDL audio context unlock, pointer lock, fullscreen).
