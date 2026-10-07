@@ -75,6 +75,13 @@ REXCVAR_DEFINE_BOOL(install_dlc, false, "GTA IV/Installation",
 REXCVAR_DEFINE_BOOL(install_check, false, "GTA IV/Installation",
                     "Verify the installed game and episode layouts before launch")
     .lifecycle(rex::cvar::Lifecycle::kInitOnly);
+REXCVAR_DEFINE_STRING(install_source, "", "GTA IV/Installation",
+                      "Install non-interactively from this disc image, folder or XContent "
+                      "package before launch")
+    .lifecycle(rex::cvar::Lifecycle::kInitOnly);
+REXCVAR_DEFINE_STRING(install_update_source, "", "GTA IV/Installation",
+                      "Title update (default.xexp or its XContent package) for install_source")
+    .lifecycle(rex::cvar::Lifecycle::kInitOnly);
 REXCVAR_DEFINE_BOOL(gta4_diagnostics_skip_user_music, false, "GTA IV/Diagnostics",
                     "Skip the host user-music player during isolated diagnostics")
     .lifecycle(rex::cvar::Lifecycle::kRequiresRestart);
@@ -599,6 +606,24 @@ std::optional<rex::PathConfig> GTA4App::OnFinalizePaths(
   REXCVAR_SET(install, false);
   REXCVAR_SET(install_dlc, false);
   REXCVAR_SET(install_check, false);
+
+  // Non-interactive install (scripted setups and headless web testing): the
+  // same installer the wizard runs, driven by --install_source.
+  const std::string install_source = REXCVAR_GET(install_source);
+  if (!install_source.empty()) {
+    gta4::install::Selection selection;
+    selection.game_source = install_source;
+    selection.update_source = std::string(REXCVAR_GET(install_update_source));
+    gta4::install::Progress progress;
+    REXLOG_INFO("Installing GTA IV from {} (update: {})", install_source,
+                selection.update_source.empty() ? "none" : selection.update_source.string());
+    const auto result = gta4::install::Install(selection, liberty_root_, progress);
+    if (result.success) {
+      REXLOG_INFO("GTA IV installation completed ({} bytes)", progress.copied_bytes.load());
+    } else {
+      REXLOG_ERROR("GTA IV installation failed: {}", result.error);
+    }
+  }
 
   std::string readiness_error;
   bool ready = gta4::install::IsInstallReady(paths.game_data_root, &readiness_error);
