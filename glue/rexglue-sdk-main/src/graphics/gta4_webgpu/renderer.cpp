@@ -69,6 +69,38 @@ constexpr char kCopyColor[] = R"(
   return textureLoad(source, source_coord(p), 0) * params.c.x;
 }
 )";
+// A color resolve through a surface whose MSAA layout differs from the one
+// that holds the EDRAM contents, as gta4_native/resolve_convert_ps.glsl: the
+// selected samples of each requested pixel are fetched from the owner (one
+// value per guest pixel) and averaged. a: source origin (requested pixels),
+// destination origin; b: requested and owner sample scales; c.x: exponent
+// scale, c.y: CopySampleSelect.
+constexpr char kResolveColor[] = R"(
+@group(1) @binding(0) var source: texture_2d<f32>;
+fn requested_sample(pixel: vec2<i32>, index: u32) -> vec4<f32> {
+  let scale = vec2<i32>(params.b.xy);
+  let offset = vec2<i32>(select(0, i32((index >> 1u) & 1u), scale.x == 2),
+                         select(0, i32(index & 1u), scale.y == 2));
+  let owner = (pixel * scale + offset) / vec2<i32>(params.b.zw);
+  return textureLoad(source, clamp(owner, vec2<i32>(0), vec2<i32>(textureDimensions(source)) - 1), 0);
+}
+@fragment fn fs(@builtin(position) p: vec4<f32>) -> @location(0) vec4<f32> {
+  let pixel = vec2<i32>(params.a.xy) + vec2<i32>(floor(p.xy)) - vec2<i32>(params.a.zw);
+  let select_samples = u32(params.c.y);
+  var color: vec4<f32>;
+  if (select_samples <= 3u) {
+    color = requested_sample(pixel, select_samples);
+  } else if (select_samples == 4u) {
+    color = (requested_sample(pixel, 0u) + requested_sample(pixel, 1u)) * 0.5;
+  } else if (select_samples == 5u) {
+    color = (requested_sample(pixel, 2u) + requested_sample(pixel, 3u)) * 0.5;
+  } else {
+    color = (requested_sample(pixel, 0u) + requested_sample(pixel, 1u) +
+             requested_sample(pixel, 2u) + requested_sample(pixel, 3u)) * 0.25;
+  }
+  return color * params.c.x;
+}
+)";
 // Resolved depth keeps its stencil in green (see SampledFormat).
 constexpr char kCopyDepthToColor[] = R"(
 @group(1) @binding(0) var source: texture_depth_2d;
@@ -145,7 +177,8 @@ struct UtilityKind {
   bool scene_coverage = false;
 };
 constexpr UtilityKind kUtilities[] = {
-    {"copy_color", kCopyColor, 1},     {"copy_depth_to_color", kCopyDepthToColor, 4},
+    {"copy_color", kCopyColor, 1},     {"resolve_color", kResolveColor, 1},
+    {"copy_depth_to_color", kCopyDepthToColor, 4},
     {"copy_depth", kCopyDepth, 2},     {"copy_depth_values", kCopyDepthValues, 1},
     {"clear_color", kClearColor, 0},   {"clear_depth", kClearDepth, 0},
     {"present", kPresent, 3},          {"packed_depth_alias", kPackedDepthAlias, 1},

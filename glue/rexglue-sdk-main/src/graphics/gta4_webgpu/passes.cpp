@@ -154,26 +154,48 @@ bool Renderer::State::Resolve(const Work& work, std::string& error) {
     error = "Resolve destination origin is outside the image";
     return false;
   }
-  auto rect = c.source_rectangle_valid
-                  ? c.source_rectangle
-                  : ResolveRectangle{0, 0, int32_t(source->width), int32_t(source->height)};
-  rect.left = std::clamp(rect.left, 0, int32_t(source->width));
-  rect.top = std::clamp(rect.top, 0, int32_t(source->height));
-  rect.right = std::clamp(rect.right, rect.left, int32_t(source->width));
-  rect.bottom = std::clamp(rect.bottom, rect.top, int32_t(source->height));
+  // The surface holding the contents may view the same EDRAM with another MSAA
+  // layout (the title downsamples by resolving a 4x view of a 1x surface).
+  // The rectangle is then in the requested view's pixels.
+  const bool reinterpret = !depth && c.source.sample_type != source->descriptor.sample_type;
+  const int32_t logical_w = int32_t(reinterpret ? c.source.width : source->width);
+  const int32_t logical_h = int32_t(reinterpret ? c.source.height : source->height);
+  auto rect = c.source_rectangle_valid ? c.source_rectangle
+                                       : ResolveRectangle{0, 0, logical_w, logical_h};
+  rect.left = std::clamp(rect.left, 0, logical_w);
+  rect.top = std::clamp(rect.top, 0, logical_h);
+  rect.right = std::clamp(rect.right, rect.left, logical_w);
+  rect.bottom = std::clamp(rect.bottom, rect.top, logical_h);
   const uint32_t copy_w = std::min(uint32_t(rect.right - rect.left), target_w - uint32_t(dx));
   const uint32_t copy_h = std::min(uint32_t(rect.bottom - rect.top), target_h - uint32_t(dy));
   if (trace)
     REXLOG_INFO("webgpu-trace: resolve flags={:08X} source={:08X} chosen={:08X} serial={} "
-                "destination={:08X} {}x{} rect={},{},{},{} copy={}x{} at {},{}",
+                "destination={:08X} {}x{} rect={},{},{},{} copy={}x{} at {},{} samples={}/{}",
                 flags, c.source.handle, source->descriptor.handle, source->content_serial,
                 c.destination_texture, destination->width, destination->height, rect.left,
-                rect.top, rect.right, rect.bottom, copy_w, copy_h, dx, dy);
+                rect.top, rect.right, rect.bottom, copy_w, copy_h, dx, dy, c.source.sample_type,
+                source->descriptor.sample_type);
   EndPass();
   if (!Begin(error)) return false;
   if (copy_w && copy_h) {
     const int32_t exponent = depth ? 0 : NativeResolveExponent(flags);
-    if (!depth && !exponent && source->format == destination->format) {
+    if (reinterpret) {
+      uint32_t depth_slice = 0;
+      auto target = Subresource(*destination, level, slice, depth_slice);
+      const auto requested = xenos::MsaaSamples(c.source.sample_type);
+      const auto owner = xenos::MsaaSamples(source->descriptor.sample_type);
+      const auto sample_select =
+          SanitizeGuestCopySampleSelect(DecodeResolveSampleSelect(flags), requested, false);
+      const std::array<float, 12> parameters{
+          float(rect.left), float(rect.top), float(dx), float(dy),
+          float(GuestSampleScaleX(requested)), float(GuestSampleScaleY(requested)),
+          float(GuestSampleScaleX(owner)), float(GuestSampleScaleY(owner)),
+          std::ldexp(1.0f, exponent), float(uint32_t(sample_select)), 0, 0};
+      if (!UtilityPass("resolve_color", target, depth_slice, false, destination->format, target_w,
+                       target_h, {dx, dy, dx + int32_t(copy_w), dy + int32_t(copy_h)},
+                       source->view, parameters, true, error))
+        return false;
+    } else if (!depth && !exponent && source->format == destination->format) {
       wgpu::TexelCopyTextureInfo from{};
       from.texture = source->texture;
       from.origin = {uint32_t(rect.left), uint32_t(rect.top), 0};
@@ -345,6 +367,7 @@ Renderer::Status Renderer::State::Present(const Work& work, std::string& error) 
   frame_draws = 0;
   submitted_frame = c.submitted_frame;
 
+  if (trace && !probes.empty()) ReportPixelProbes(error);
   if (source) PresentToCanvas(*source, error);
   const std::string dump_path = REXCVAR_GET(webgpu_frame_dump_path);
   const uint32_t interval = std::max(1u, REXCVAR_GET(webgpu_frame_dump_interval));
@@ -415,6 +438,34 @@ Renderer::Status Renderer::State::Present(const Work& work, std::string& error) 
         if (resume) resume();
       });
   return Status::kPending;
+}
+
+void Renderer::State::ReportPixelProbes(std::string& error) {
+  Flush(error);
+  auto buffer = std::move(probe_buffer);
+  auto list = std::move(probes);
+  probe_buffer = nullptr;
+  probes.clear();
+  const uint64_t bytes = list.size() * 256;
+  buffer.MapAsync(
+      wgpu::MapMode::Read, 0, bytes, wgpu::CallbackMode::AllowSpontaneous,
+      [buffer, list](wgpu::MapAsyncStatus status, wgpu::StringView) {
+        if (status != wgpu::MapAsyncStatus::Success) return;
+        const auto* data = static_cast<const uint8_t*>(buffer.GetConstMappedRange(0, list.size() * 256));
+        std::unordered_map<uint32_t, std::string> last;
+        for (size_t i = 0; i < list.size(); ++i) {
+          const uint32_t size = std::max(1u, TexelBytes(list[i].format));
+          std::string value;
+          for (uint32_t b = 0; b < size; ++b) value += fmt::format("{:02X}", data[i * 256 + b]);
+          auto& previous = last[list[i].target];
+          if (value != previous)
+            REXLOG_INFO("webgpu-pixel: draw#{} ps={:016X} target={:08X} {} -> {}", i,
+                        list[i].pixel_shader, list[i].target, previous.empty() ? "?" : previous,
+                        value);
+          previous = value;
+        }
+        buffer.Unmap();
+      });
 }
 
 Renderer::Status Renderer::State::Readback(const Work& work, std::string& error) {

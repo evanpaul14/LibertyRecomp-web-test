@@ -3,11 +3,13 @@
 #include <algorithm>
 #include <bit>
 #include <cmath>
+#include <cstdlib>
 #include <cstring>
 #include <optional>
 
 #include <fmt/format.h>
 
+#include <rex/cvar.h>
 #include <rex/logging.h>
 
 #include "../gta4_native/alpha_to_coverage_util.h"
@@ -18,6 +20,12 @@
 #include "../gta4_native/native_triangle_fan.h"
 #include "simd_bytes.h"
 #include "vertex_decode.h"
+
+REXCVAR_DEFINE_STRING(webgpu_trace_pixel, "", "GPU/Diagnostics",
+                      "Web build: with --webgpu_trace_frame, log which draws change the "
+                      "texel x,y of their first color target");
+REXCVAR_DEFINE_STRING(webgpu_skip_pixel_shader, "", "GPU/Diagnostics",
+                      "Web build: skip draws that use these pixel shader hashes (hex, comma-separated)");
 
 namespace rex::graphics::gta4_webgpu {
 namespace {
@@ -310,6 +318,17 @@ bool Renderer::State::Draw(const Work& work, std::string& error) {
       return false;
     }
     pixel = found->second;
+    static const std::vector<uint64_t> skipped = [] {
+      std::vector<uint64_t> hashes;
+      const std::string list = REXCVAR_GET(webgpu_skip_pixel_shader);
+      for (const char* p = list.c_str(); *p;) {
+        char* end = nullptr;
+        if (const uint64_t hash = std::strtoull(p, &end, 16); end != p) hashes.push_back(hash);
+        p = *end ? end + 1 : end;
+      }
+      return hashes;
+    }();
+    if (std::find(skipped.begin(), skipped.end(), pixel->hash) != skipped.end()) return true;
   }
   const auto declaration_found = declarations.find(declaration);
   if (declaration_found == declarations.end()) {
@@ -876,7 +895,38 @@ bool Renderer::State::Draw(const Work& work, std::string& error) {
   ++draws;
   ++frame_draws;
   ++stats.draws;
+  if (trace) ProbePixel(targets, pixel ? pixel->hash : 0);
   return true;
+}
+
+void Renderer::State::ProbePixel(const Targets& targets, uint64_t pixel_shader) {
+  constexpr size_t kMaximumProbes = 4096, kProbeStride = 256;
+  static const auto position = [] {
+    std::array<uint32_t, 2> xy{UINT32_MAX, UINT32_MAX};
+    std::sscanf(REXCVAR_GET(webgpu_trace_pixel).c_str(), "%u,%u", &xy[0], &xy[1]);
+    return xy;
+  }();
+  const auto& color = targets.colors[0];
+  if (!color || position[0] >= color->width || position[1] >= color->height ||
+      probes.size() >= kMaximumProbes)
+    return;
+  if (!probe_buffer) {
+    wgpu::BufferDescriptor descriptor{};
+    descriptor.size = kMaximumProbes * kProbeStride;
+    descriptor.usage = wgpu::BufferUsage::CopyDst | wgpu::BufferUsage::MapRead;
+    probe_buffer = device.CreateBuffer(&descriptor);
+  }
+  EndPass();
+  wgpu::TexelCopyTextureInfo from{};
+  from.texture = color->texture;
+  from.origin = {position[0], position[1], 0};
+  wgpu::TexelCopyBufferInfo to{};
+  to.buffer = probe_buffer;
+  to.layout.offset = probes.size() * kProbeStride;
+  to.layout.bytesPerRow = kProbeStride;
+  wgpu::Extent3D size{1, 1, 1};
+  encoder.CopyTextureToBuffer(&from, &to, &size);
+  probes.push_back({pixel_shader, color->descriptor.handle, color->format});
 }
 
 bool Renderer::State::ClearSurface(const std::shared_ptr<SurfaceResource>& surface,

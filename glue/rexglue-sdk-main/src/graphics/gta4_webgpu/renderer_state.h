@@ -291,6 +291,17 @@ struct Renderer::State {
   uint64_t gpu_errors = 0;
   bool ready = false;
   bool trace = false;
+  // --webgpu_trace_pixel: one texel of each traced draw's first color target,
+  // copied after the draw and logged at present where it changed.
+  struct PixelProbe {
+    uint64_t pixel_shader = 0;
+    uint32_t target = 0;
+    wgpu::TextureFormat format = wgpu::TextureFormat::Undefined;
+  };
+  wgpu::Buffer probe_buffer;
+  std::vector<PixelProbe> probes;
+  void ProbePixel(const Targets& targets, uint64_t pixel_shader);
+  void ReportPixelProbes(std::string& error);
   uint64_t texture_failures = 0;
 };
 
