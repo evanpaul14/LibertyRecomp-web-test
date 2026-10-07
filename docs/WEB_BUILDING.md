@@ -140,7 +140,8 @@ constants and bound textures) and always dumps it; trace lines are info-level, s
 add `--log_level=info`. Every 60 frames the renderer logs its draw, clear and
 resolve counts. `--webgpu_perf_report=true` logs timing every 5 s as warnings.
 `--webgpu_frame_limit` caps presents per second (default 60, 0 = unlimited).
-`--gpu_plugin=none` restores the old headless mode.
+`--gpu_plugin=none` restores the old headless mode. If no frame is presented
+for 15 seconds, the renderer logs every thread and what it is waiting on.
 
 ## How the port works
 
@@ -190,7 +191,7 @@ renderer, and UP rectangle lists get their fourth corner reconstructed.
 
 **Targets and resolves.** Every render target is single-sampled (WebGPU only has 1×
 and 4× MSAA). Color resolves copy directly or through a small conversion pass
-(exponent bias, format change); resolved depth is stored as `r32float` so title
+(exponent bias, format change); resolved depth is stored as `rg32float` (depth and stencil) so title
 shaders can sample it with a filtering sampler. Surfaces that share an EDRAM
 placement resolve from the one written last.
 
@@ -261,9 +262,6 @@ Not working yet:
   forward-pass depth handoff, separate color/alpha blend constants, sampler border
   colors and mirror-clamp addressing (approximated), wireframe fill, and reads of
   3D or block-compressed GPU textures.
-- **Intermittent hang under Node.** Most runs now stop presenting at some point
-  (loading, intro or "Starting a new game…") with every game thread waiting and
-  the render queue empty; the cause is not known yet.
 - **Lighting.** In the intro, deferred-lit surfaces (water, ground, the ship)
   are often black below the horizon, and lamp coronas are hard white shapes.
 - **Performance.** Every draw still copies the 22 KB device block (the Vulkan

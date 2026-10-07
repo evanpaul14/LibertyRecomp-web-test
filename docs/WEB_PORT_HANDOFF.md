@@ -51,9 +51,9 @@ mapped); this file is for whoever continues the work.
   --diagnostics_categories=logging --log_level=warn`: other diagnostics print
   a line per draw, and every line blocks the game thread until the page's
   main thread handles it. In the browser that alone held gameplay below 1 fps.
-- Next step candidates, in suggested order: the Node hang (it makes every
-  gameplay test unreliable), the black deferred lighting, then re-checking Chrome
-  with the clock fix. Ask the user.
+- Next step candidates, in suggested order: the black deferred lighting, then
+  re-checking Chrome with the clock fix (the hang fix below applies there too).
+  Ask the user.
 - **Node graphics session (Dawn on Metal, M1 Mac, 2026-10-07).**
   - *Fixed: black loading screens.* Emscripten has no `CLOCK_MONOTONIC_RAW`;
     `clock_getres`/`clock_gettime` failed and, with asserts compiled out, the
@@ -64,26 +64,39 @@ mapped); this file is for whoever continues the work.
     which likely explains the missing loading artwork seen in Chrome.
   - *Added:* present pacing (`--webgpu_frame_limit`, default 60) and a richer
     frame trace (see Testing below).
-  - *Open: hang.* Since the clock fix, most Node runs stop presenting at a random
-    point (loading, intro, "Starting a new game…"). It reproduces with
-    `--webgpu_frame_limit=0` and without frame dumps. A `sample` of the stalled
-    process shows the Node main thread idle in libuv and every `em-pthread` parked
-    in `__psynch_cvwait` (no busy spin). The uncommitted render-queue watchdog
-    stayed silent, i.e. the render queue was empty and not waiting on the GPU, so
-    the game threads deadlocked among themselves. Prime suspect: suspend/APC
-    delivery via `pthread_kill` (`src/core/threading_posix.cpp`), which only lands
-    when the target worker services its mailbox; real timeouts may now expose a
-    wait the garbage clock used to break. Not confirmed.
+  - *Fixed: hang.* Node runs used to stop presenting after about 3.5 minutes.
+    The main game thread was stuck in `XamInputGetState` →
+    `MnkInputDriver::UpdateMouseCapture` → `CallInUIThreadSynchronous`, waiting
+    for a UI-thread wakeup that never ran. SDL3 was built without threads on
+    Emscripten (`SDL_THREADS_DISABLED`, its default there), so its mutexes did
+    nothing and game threads pushing wakeup events raced the UI thread on the
+    event queue. Relative mouse mode always fails on the web, so capture was
+    retried (one synchronous round trip plus an error line) on every input
+    poll, which made the race frequent. Fixes: `SDL_PTHREADS=ON` for Emscripten
+    (`thirdparty/CMakeLists.txt`), and a failed capture is not retried until
+    focus returns (`mnk_input_driver.cpp`). A 19-minute run reached gameplay
+    with no stall. The suspend/APC theory was wrong: no thread suspends happen.
+  - *Hang diagnostics.* `rex/thread/wait_trace.h` (web only) records what each
+    thread is blocked on (kernel waits, critical sections, delays, suspends,
+    render-queue and synchronous-command waits). The render-thread watchdog logs
+    the list as warnings after 15 s and 60 s without a present. For a thread
+    shown as "running (or blocked outside a traced wait)", get its wasm stack
+    from the live process: build with `LIBERTY_WEB_FUNCTION_NAMES=ON`, run Node
+    with `--inspect` (or `kill -USR1` it), then use the inspector's
+    `NodeWorker` domain to send `Debugger.pause` to each worker and read
+    `callFrames`.
   - *Open: lighting.* In the intro, water/ground below the horizon is often black
     and lamp coronas are hard white shapes. Forward-drawn things (sky, text,
     lamps) look right, so the deferred lighting composite is the suspect.
-  - *Uncommitted in the working tree (builds, unverified):* (1) packed depth
-    aliases: `RegisterVirtualResource` with `packed_depth_source` is now honored;
-    resolved depth is stored as `rg32float` (depth, stencil) and an alias texture
-    is rebuilt as A8R8G8B8 like `gta4_native/packed_depth_alias_ps.glsl`. It caused
-    no GPU errors but did not change the black ground in the one frame checked,
-    and it is not yet confirmed that the title takes this path. (2) A render-thread
-    watchdog that logs `render queue stalled` when queued work stops moving.
+  - *Packed depth aliases (unverified):* `RegisterVirtualResource` with
+    `packed_depth_source` is honored; resolved depth is stored as `rg32float`
+    (depth, stencil) and an alias texture is rebuilt as A8R8G8B8 like
+    `gta4_native/packed_depth_alias_ps.glsl`. It caused no GPU errors but did not
+    change the black ground in the one frame checked, and it is not yet confirmed
+    that the title takes this path.
+  - *Render-thread watchdog:* every 5 s it logs `render queue stalled` (and drains
+    the queue) when queued work stops moving, and dumps the wait trace after 15 s
+    and 60 s without a present.
 
 ## Key design decisions (and where they live)
 
@@ -100,7 +113,7 @@ mapped); this file is for whoever continues the work.
 | GPU threading | One render pthread owns the device and runs from the JS event loop (needed for `mapAsync` and canvas presentation), woken via `emscripten_proxy_async`. Game threads capture device block/buffers/textures at submit (`Capture` in `graphics_system.cpp`) | `gta4_webgpu/graphics_system.cpp`, `work.h` |
 | Shaders | Stock SPIR-V → GLSL (SPIRV-Cross) → rewrite BDA constants to one UBO (VS 0, PS 4096, shared 8192, spec word 8192+0x500) and bindless to fixed slots → glslang → spirv-opt → naga → WGSL. naga undoes the Vulkan y-flip itself | `tools/webgpu/spirv_to_wgsl.py`, `LibertyRecompLib/shader/webgpu_shader_archive.bin` |
 | Vertex data | Every attribute decoded to `float32x4` on the CPU per buffer generation (shaders read vec4 floats; WebGPU cannot feed integer formats to them) | `gta4_webgpu/vertex_decode.h`, `resources.cpp` |
-| Render targets | Single-sampled; resolved depth stored as `r32float`; resolves pick the latest surface at the same EDRAM placement | `gta4_webgpu/resources.cpp`, `passes.cpp` |
+| Render targets | Single-sampled; resolved depth stored as `rg32float` (depth, stencil), with packed A8R8G8B8 aliases rebuilt on demand; resolves pick the latest surface at the same EDRAM placement | `gta4_webgpu/resources.cpp`, `passes.cpp` |
 | Canvas | `<canvas id="liberty-gpu">` is transferred to the render worker as an OffscreenCanvas (pre-js `res/web/webgpu_canvas.js`); SDL's `#canvas` stays on top for input | `gta4_webgpu/canvas.cpp`, `res/web/index.html` |
 | Main loop | `-sPROXY_TO_PTHREAD`; COOP/COEP needed (`tools/web/serve.py`) | `gta4-recomp/CMakeLists.txt` |
 | Apple-only bridges, community MP | Report unavailable / not built on web | `gta4-recomp/src/web/web_platform_bridges.cpp` |
@@ -210,8 +223,10 @@ XDG_DATA_HOME=<data> node out/web/LibertyRecomp/LibertyRecomp.js --diagnostics=t
 - Guest FP rounding and flush modes are recorded but not applied.
 - Guest DNS is reported as host-not-found and the local IP as loopback; there is
   no online play.
-- Thread suspend and APC wakes rely on `pthread_kill`, which is delivered when
-  the target worker services its mailbox.
+- Thread suspend and APC wakes rely on `pthread_kill`, which Emscripten runs
+  only when the target calls `nanosleep` or returns to its event loop. GTA IV
+  does not suspend threads, and alertable waits poll their APC queue, so
+  nothing depends on it today.
 - The `Too few processor cores` warning appears with 4 Node workers; it is harmless.
 
 ## Next steps (pick with the user)
