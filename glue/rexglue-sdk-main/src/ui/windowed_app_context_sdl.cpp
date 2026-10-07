@@ -18,6 +18,9 @@
 
 #include <rex/logging.h>
 #include <rex/platform.h>
+#if REX_PLATFORM_WEB
+#include <emscripten/em_asm.h>
+#endif
 #include <rex/ui/window_sdl.h>
 
 namespace rex::ui {
@@ -66,6 +69,13 @@ bool SDLWindowedAppContext::Initialize() {
   // The Linux surface type the presenters consume is XcbWindow, so force X11
   // and keep SDL off Wayland where no surface shim exists yet.
   SDL_SetHint(SDL_HINT_VIDEO_DRIVER, "x11");
+#endif
+#if REX_PLATFORM_WEB
+  // Under Node.js (headless testing) there is no DOM for SDL's Emscripten
+  // video driver; use its offscreen driver instead.
+  if (EM_ASM_INT({ return ENVIRONMENT_IS_NODE ? 1 : 0; })) {
+    SDL_SetHint(SDL_HINT_VIDEO_DRIVER, "offscreen");
+  }
 #endif
   if (!SDL_InitSubSystem(SDL_INIT_VIDEO)) {
     REXLOG_ERROR("SDL_InitSubSystem(SDL_INIT_VIDEO) failed: {}", SDL_GetError());

@@ -379,7 +379,10 @@ elseif(EMSCRIPTEN)
         -sEXIT_RUNTIME=1
     )
     if(LIBERTY_WEB_NODERAWFS)
-        target_link_options(LibertyRecomp PRIVATE -sNODERAWFS=1)
+        target_link_options(LibertyRecomp PRIVATE -sNODERAWFS=1
+            "--pre-js=${CMAKE_CURRENT_SOURCE_DIR}/res/web/node_env.js")
+        set_property(TARGET LibertyRecomp APPEND PROPERTY LINK_DEPENDS
+            "${CMAKE_CURRENT_SOURCE_DIR}/res/web/node_env.js")
     endif()
     set_target_properties(LibertyRecomp PROPERTIES
         OUTPUT_NAME "LibertyRecomp"

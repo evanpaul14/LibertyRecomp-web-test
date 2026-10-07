@@ -65,6 +65,22 @@ repeated `arg` query parameters, for example `?arg=--diagnostics=true`.
 
 Any other static host works if it sends the same headers.
 
+### Headless testing under Node.js
+
+For testing without a browser, configure with `-DLIBERTY_WEB_NODERAWFS=ON`.
+That build reads the host filesystem directly, picks up `XDG_DATA_HOME`/`HOME`
+from the environment, and uses SDL's offscreen video driver:
+
+```bash
+cmake out/web -DLIBERTY_WEB_NODERAWFS=ON && ninja -C out/web LibertyRecomp
+XDG_DATA_HOME=/path/to/data node out/web/LibertyRecomp/LibertyRecomp.js --diagnostics=true
+```
+
+The game is then read from `$XDG_DATA_HOME/LibertyRecomp/game`, which needs the
+same contents as a desktop install: the USA retail 1.00 disc files plus the v8
+title update's `default.xexp`. The build only runs under Node, so switch the
+option back off for the browser.
+
 ## How the port works
 
 | Area | Desktop | Web |
