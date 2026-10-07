@@ -14,6 +14,7 @@
 #include <cstdio>
 #include <cstring>
 
+#include <rex/ppc/function.h>
 #include <rex/system/web_guest_access.h>
 #include <rex/system/xmemory.h>
 
@@ -118,6 +119,25 @@ int main() {
     Check(*memory.TranslatePhysical<uint32_t*>(physical_address) == __builtin_bswap32(0x0BADCAFE),
           "allocation is visible through its physical address");
     memory.SystemHeapFree(phys);
+  }
+
+  // Pointers returned by native helpers keep the alias of their argument.
+  {
+    const uint32_t c0_args[8] = {0xD9000100, 0x2F, 0, 0, 0, 0, 0, 0};
+    Check(rex::ppc::detail::HostPointerToGuest(base, rex::memory::GuestPtr(base, 0xD9000105),
+                                               c0_args) == 0xD9000105,
+          "returned pointer keeps the 0xC0000000 alias of its argument");
+    const uint32_t e0_args[8] = {0xF9000100, 0, 0, 0, 0, 0, 0, 0};
+    Check(rex::ppc::detail::HostPointerToGuest(base, rex::memory::GuestPtr(base, 0xF9000180),
+                                               e0_args) == 0xF9000180,
+          "returned pointer keeps the 0xE0000000 alias of its argument");
+    const uint32_t virtual_args[8] = {0x40002000, 0, 0, 0, 0, 0, 0, 0};
+    Check(rex::ppc::detail::HostPointerToGuest(base, rex::memory::GuestPtr(base, 0x40002004),
+                                               virtual_args) == 0x40002004,
+          "returned pointer in virtual memory is unchanged");
+    Check(rex::ppc::detail::HostPointerToGuest(base, rex::memory::GuestPtr(base, 0xC0000040),
+                                               virtual_args) == 0xA0000040,
+          "unrelated physical pointer falls back to the canonical view");
   }
 
   std::printf("%s (%d failure%s)\n", g_failures ? "FAILED" : "ALL PASSED", g_failures,

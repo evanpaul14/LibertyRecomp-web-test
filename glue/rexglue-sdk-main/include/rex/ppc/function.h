@@ -304,14 +304,56 @@ struct ArgTranslator {
     } else if constexpr (std::is_null_pointer_v<T>) {
       SetIntegerArgumentValue(ctx, base, idx, 0);
     } else if constexpr (std::is_pointer_v<T>) {
+#if REX_PLATFORM_WEB
+      SetIntegerArgumentValue(
+          ctx, base, idx,
+          rex::memory::web::GuestAddressForHostOffset(reinterpret_cast<uintptr_t>(value) -
+                                                      reinterpret_cast<uintptr_t>(base)));
+#else
       SetIntegerArgumentValue(ctx, base, idx,
                               static_cast<uint32_t>(reinterpret_cast<uintptr_t>(value) -
                                                     reinterpret_cast<uintptr_t>(base)));
+#endif
     } else {
       SetIntegerArgumentValue(ctx, base, idx, value);
     }
   }
 };
+
+#if REX_PLATFORM_WEB
+namespace detail {
+// On the web, aliased guest ranges share host memory (see
+// rex/memory/web_guest_layout.h), so a host pointer alone does not say which
+// guest view it belongs to. Native helpers only return pointers into buffers
+// they were given (strchr, strncpy, ...), so place the result in the alias of
+// the nearest argument at or below it; otherwise use the canonical view.
+inline uint32_t HostPointerToGuest(uint8_t* base, const void* host,
+                                   const uint32_t (&guest_args)[8]) noexcept {
+  const uint64_t offset = reinterpret_cast<uintptr_t>(host) - reinterpret_cast<uintptr_t>(base);
+  uint64_t best = UINT64_MAX;
+  uint64_t best_distance = UINT64_MAX;
+  for (uint32_t arg : guest_args) {
+    const uint64_t alias_offset = rex::memory::web::HostOffset(arg);
+    if (offset < alias_offset) {
+      continue;
+    }
+    const uint64_t guest = offset - alias_offset;
+    if (guest < arg || guest > UINT32_MAX ||
+        rex::memory::web::HostOffset(static_cast<uint32_t>(guest)) != alias_offset) {
+      continue;
+    }
+    if (guest - arg < best_distance) {
+      best_distance = guest - arg;
+      best = guest;
+    }
+  }
+  if (best != UINT64_MAX) {
+    return static_cast<uint32_t>(best);
+  }
+  return rex::memory::web::GuestAddressForHostOffset(offset);
+}
+}  // namespace detail
+#endif
 
 //=============================================================================
 // Argument Gathering
@@ -408,6 +450,11 @@ __attribute__((noinline)) void HostToGuestFunction(PPCContext& ctx, uint8_t* bas
 
   auto args = function_args(Func);
   _translate_args_to_host<Func>(ctx, base, args);
+#if REX_PLATFORM_WEB
+  // Kept to place a returned pointer back in the guest alias it came from.
+  const uint32_t guest_args[] = {ctx.r3.u32, ctx.r4.u32, ctx.r5.u32, ctx.r6.u32,
+                                 ctx.r7.u32, ctx.r8.u32, ctx.r9.u32, ctx.r10.u32};
+#endif
 
   if constexpr (std::is_same_v<ret_t, void>) {
     std::apply(Func, args);
@@ -419,8 +466,12 @@ __attribute__((noinline)) void HostToGuestFunction(PPCContext& ctx, uint8_t* bas
 
     if constexpr (std::is_pointer<ret_t>()) {
       if (v != nullptr) {
+#if REX_PLATFORM_WEB
+        ctx.r3.u64 = detail::HostPointerToGuest(base, v, guest_args);
+#else
         ctx.r3.u64 =
             static_cast<uint32_t>(reinterpret_cast<size_t>(v) - reinterpret_cast<size_t>(base));
+#endif
       } else {
         ctx.r3.u64 = 0;
       }
