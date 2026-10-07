@@ -2,7 +2,7 @@
 # Modern C++23 cross-platform SDK for recompiling Xbox 360 executables
 cmake_minimum_required(VERSION 3.25)
 
-if(APPLE)
+if(CMAKE_HOST_APPLE AND NOT CMAKE_TOOLCHAIN_FILE MATCHES "web-emscripten")
     set(REXGLUE_LANGUAGES C CXX OBJC OBJCXX)
 else()
     set(REXGLUE_LANGUAGES C CXX)
