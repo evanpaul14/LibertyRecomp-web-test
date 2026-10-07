@@ -305,6 +305,20 @@ if(APPLE AND LIBERTY_RECOMP_TARGET_PLATFORM STREQUAL "desktop")
             "$<TARGET_BUNDLE_DIR:LibertyRecomp>" --arch "${CMAKE_OSX_ARCHITECTURES}"
         COMMENT "Verifying macOS runtime closure, architecture, minimum OS, and signature..."
         VERBATIM)
+elseif(EMSCRIPTEN)
+    # Web (wasm64) build. Phase 1 is headless: the recompiled game code and
+    # the RexGlue runtime, without a GPU backend. See docs/WEB_BUILDING.md.
+    add_library(gta4_recomp_generated STATIC ${GENERATED_SOURCES})
+    target_include_directories(gta4_recomp_generated PUBLIC
+        ${CMAKE_CURRENT_SOURCE_DIR}/generated
+    )
+    target_link_libraries(gta4_recomp_generated PUBLIC rex::runtime)
+    # Generated code is not ours to warn about.
+    target_compile_options(gta4_recomp_generated PRIVATE -w)
+    # Same rationale as the macOS build: the registrar is one huge
+    # straight-line function.
+    set_property(SOURCE generated/gta4_register.cpp APPEND PROPERTY COMPILE_OPTIONS
+        "$<$<CONFIG:Release>:-O0>")
 else()
     add_library(gta4_recomp INTERFACE)
     target_include_directories(gta4_recomp INTERFACE
