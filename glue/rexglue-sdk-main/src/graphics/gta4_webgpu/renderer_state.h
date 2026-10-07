@@ -286,8 +286,16 @@ struct Renderer::State {
     uint32_t frames = 0, draws = 0, new_pipelines = 0, new_textures = 0, new_buffers = 0;
     uint32_t new_groups = 0, uniform_slots = 0, uniform_reused = 0;
     uint64_t texture_bytes = 0, buffer_bytes = 0;
+    // Presents: shown on the canvas, skipped (no source, no canvas, no
+    // surface texture), and how many showed a frontbuffer with new contents.
+    uint32_t shown = 0, no_source = 0, no_canvas = 0, no_surface_texture = 0, new_content = 0;
+    uint32_t surface_status = 0;  // wgpu::SurfaceGetCurrentTextureStatus of the last failure.
     double start_ms = 0;
   } timing;
+  // The frontbuffer last shown, to tell a frozen picture from a frozen source.
+  const TextureResource* presented_source = nullptr;
+  uint64_t presented_serial = 0;
+  uint32_t presented_frontbuffer = 0;
   uint64_t gpu_errors = 0;
   bool ready = false;
   bool trace = false;

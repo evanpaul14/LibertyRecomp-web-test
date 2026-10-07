@@ -74,7 +74,10 @@ wgpu::TextureView StencilView(const SurfaceResource& surface) {
 
 void Renderer::State::PresentToCanvas(const TextureResource& source, std::string& error) {
   uint32_t width = 0, height = 0;
-  if (!PollCanvas(width, height)) return;
+  if (!PollCanvas(width, height)) {
+    ++timing.no_canvas;
+    return;
+  }
   if (!surface) {
     wgpu::EmscriptenSurfaceSourceCanvasHTMLSelector canvas{};
     canvas.selector = kCanvasSelector;
@@ -102,7 +105,16 @@ void Renderer::State::PresentToCanvas(const TextureResource& source, std::string
   }
   wgpu::SurfaceTexture current{};
   surface.GetCurrentTexture(&current);
-  if (!current.texture) return;
+  if (!current.texture) {
+    ++timing.no_surface_texture;
+    timing.surface_status = uint32_t(current.status);
+    return;
+  }
+  ++timing.shown;
+  if (&source != presented_source || source.content_serial != presented_serial)
+    ++timing.new_content;
+  presented_source = &source;
+  presented_serial = source.content_serial;
   wgpu::TextureViewDescriptor view{};
   view.dimension = wgpu::TextureViewDimension::e2D;
   view.arrayLayerCount = 1;
@@ -360,6 +372,15 @@ Renderer::Status Renderer::State::Present(const Work& work, std::string& error) 
                 timing.encode_ms / frames, timing.submit_ms / frames, timing.new_pipelines, timing.new_textures,
                 timing.texture_bytes / 1024, timing.new_buffers, timing.buffer_bytes / 1024,
                 timing.new_groups, timing.uniform_slots, timing.uniform_reused);
+    WEBGPU_PERF_LOG("gta4-webgpu: presents shown={} new-content={} no-source={} no-canvas={} "
+                    "no-surface-texture={} (status {}); canvas {}x{}; frontbuffer {:08X} "
+                    "({}, {}x{}, serial {}); gpu errors {}",
+                    timing.shown, timing.new_content, timing.no_source, timing.no_canvas,
+                    timing.no_surface_texture, timing.surface_status, surface_width,
+                    surface_height, c.frontbuffer_texture,
+                    !source ? "none" : source->gpu_produced ? "gpu" : "cpu",
+                    source ? source->width : 0, source ? source->height : 0,
+                    source ? source->content_serial : 0, gpu_errors);
     timing = {};
     timing.start_ms = now;
   }
@@ -368,7 +389,10 @@ Renderer::Status Renderer::State::Present(const Work& work, std::string& error) 
   submitted_frame = c.submitted_frame;
 
   if (trace && !probes.empty()) ReportPixelProbes(error);
-  if (source) PresentToCanvas(*source, error);
+  if (source)
+    PresentToCanvas(*source, error);
+  else
+    ++timing.no_source;
   const std::string dump_path = REXCVAR_GET(webgpu_frame_dump_path);
   const uint32_t interval = std::max(1u, REXCVAR_GET(webgpu_frame_dump_interval));
   // The traced frame is always dumped, so its picture matches its trace.
