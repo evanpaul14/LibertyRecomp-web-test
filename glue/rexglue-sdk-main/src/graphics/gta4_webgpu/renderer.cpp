@@ -673,6 +673,12 @@ Renderer::Status Renderer::Execute(Work& work, std::string& error) {
       return Status::kDone;
     case CommandType::kPresent:
       return s.Present(work, error);
+    case CommandType::kRenderPhaseMarker:
+      if (s.trace) {
+        const auto c = work.As<RenderPhaseMarkerCommand>();
+        REXLOG_INFO("webgpu-trace: phase={} event={}", uint32_t(c.phase), uint32_t(c.event));
+      }
+      return Status::kDone;
     case CommandType::kTextureLock: {
       const auto status = s.Readback(work, error);
       if (status != Status::kPending) finish_sync(error.empty());
