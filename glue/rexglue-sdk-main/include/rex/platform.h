@@ -28,7 +28,14 @@
 #include <TargetConditionals.h>
 #endif
 
-#if defined(__SWITCH__)
+#if defined(__EMSCRIPTEN__)
+// Emscripten provides a musl/Linux-like userland (pthreads, POSIX files,
+// clocks), so the web build reuses the Linux paths. Code that relies on
+// things a browser cannot do (signal-based fault handling, aliased mmap
+// views, ucontext) checks REX_PLATFORM_WEB explicitly.
+#define REX_PLATFORM_WEB 1
+#define REX_PLATFORM_LINUX 1
+#elif defined(__SWITCH__)
 #define REX_PLATFORM_NX 1
 #define REX_PLATFORM_CONSOLE 1
 #elif defined(__ORBIS__)
@@ -82,6 +89,9 @@
 #ifndef REX_PLATFORM_LINUX
 #define REX_PLATFORM_LINUX 0
 #endif
+#ifndef REX_PLATFORM_WEB
+#define REX_PLATFORM_WEB 0
+#endif
 
 #if defined(__clang__)
 #define REX_COMPILER_CLANG 1
@@ -101,6 +111,10 @@
 #define REX_ARCH_AMD64 1
 #elif defined(_M_ARM64) || defined(__aarch64__)
 #define REX_ARCH_ARM64 1
+#elif defined(__wasm64__)
+#define REX_ARCH_WASM64 1
+#elif defined(__wasm32__)
+#error Rex requires wasm64 (-sMEMORY64); the guest address space does not fit in wasm32.
 #elif defined(_M_IX86) || defined(__i386__) || defined(_M_ARM) || defined(__arm__)
 #error Rex is not supported on 32-bit platforms.
 #elif defined(_M_PPC) || defined(__powerpc__)

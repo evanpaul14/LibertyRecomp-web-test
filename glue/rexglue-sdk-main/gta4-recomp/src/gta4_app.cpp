@@ -15,6 +15,10 @@
 #include <rex/graphics/gta4_native/hdr_policy.h>
 #include <rex/graphics/gta4_native/supersampling_policy.h>
 #include <rex/graphics/video_mode_util.h>
+#include <rex/platform.h>
+#if REX_PLATFORM_WEB
+#include <rex/graphics/gta4_webgpu.h>
+#endif
 #include <rex/cvar.h>
 #include <rex/logging.h>
 #include <rex/runtime.h>
@@ -74,6 +78,13 @@ REXCVAR_DEFINE_BOOL(install_dlc, false, "GTA IV/Installation",
     .lifecycle(rex::cvar::Lifecycle::kInitOnly);
 REXCVAR_DEFINE_BOOL(install_check, false, "GTA IV/Installation",
                     "Verify the installed game and episode layouts before launch")
+    .lifecycle(rex::cvar::Lifecycle::kInitOnly);
+REXCVAR_DEFINE_STRING(install_source, "", "GTA IV/Installation",
+                      "Install non-interactively from this disc image, folder or XContent "
+                      "package before launch")
+    .lifecycle(rex::cvar::Lifecycle::kInitOnly);
+REXCVAR_DEFINE_STRING(install_update_source, "", "GTA IV/Installation",
+                      "Title update (default.xexp or its XContent package) for install_source")
     .lifecycle(rex::cvar::Lifecycle::kInitOnly);
 REXCVAR_DEFINE_BOOL(gta4_diagnostics_skip_user_music, false, "GTA IV/Diagnostics",
                     "Skip the host user-music player during isolated diagnostics")
@@ -600,6 +611,24 @@ std::optional<rex::PathConfig> GTA4App::OnFinalizePaths(
   REXCVAR_SET(install_dlc, false);
   REXCVAR_SET(install_check, false);
 
+  // Non-interactive install (scripted setups and headless web testing): the
+  // same installer the wizard runs, driven by --install_source.
+  const std::string install_source = REXCVAR_GET(install_source);
+  if (!install_source.empty()) {
+    gta4::install::Selection selection;
+    selection.game_source = install_source;
+    selection.update_source = std::string(REXCVAR_GET(install_update_source));
+    gta4::install::Progress progress;
+    REXLOG_INFO("Installing GTA IV from {} (update: {})", install_source,
+                selection.update_source.empty() ? "none" : selection.update_source.string());
+    const auto result = gta4::install::Install(selection, liberty_root_, progress);
+    if (result.success) {
+      REXLOG_INFO("GTA IV installation completed ({} bytes)", progress.copied_bytes.load());
+    } else {
+      REXLOG_ERROR("GTA IV installation failed: {}", result.error);
+    }
+  }
+
   std::string readiness_error;
   bool ready = gta4::install::IsInstallReady(paths.game_data_root, &readiness_error);
   if (run_check) {
@@ -646,9 +675,20 @@ std::optional<rex::PathConfig> GTA4App::OnFinalizePaths(
 void GTA4App::OnPreSetup(rex::RuntimeConfig& config) {
   rex::input::mnk::SetNativeControllerCompatibilityBindings(
       gta4::input::KeyboardControllerBindings());
+#if REX_PLATFORM_WEB
+  // The web build has no plugin loader; its WebGPU title renderer is linked
+  // in. gpu_plugin=none keeps the previous headless behavior.
+  if (!config.graphics && config.gpu_plugin.empty()) {
+    config.graphics = rex::graphics::gta4_webgpu::CreateGraphicsSystem();
+  } else if (config.gpu_plugin == "none") {
+    config.gpu_plugin.clear();
+    REXLOG_WARN("Web build: gpu_plugin=none, running headless");
+  }
+#else
   if (!config.graphics && config.gpu_plugin.empty()) {
     config.gpu_plugin = "gta4-native";
   }
+#endif
 
   // Resolve the backend-dependent combination before the AA controller latches
   // its active scene configuration. A pending frontend choice cannot change
@@ -751,8 +791,13 @@ void GTA4App::OnPreSetup(rex::RuntimeConfig& config) {
   config.live.community_url = REXCVAR_GET(gta4_community_url);
   config.live.player_name = REXCVAR_GET(gta4_player_name);
   config.live.lan_discovery_port = static_cast<uint16_t>(REXCVAR_GET(gta4_lan_discovery_port));
+#if !REX_PLATFORM_WEB
+  // The community backend needs CURL and OpenSSL. The web build leaves the
+  // factory unset, so selecting community multiplayer reports an error
+  // instead of starting (browser networking is future work).
   config.live.community_backend_factory =
       &LibertyRecomp::Network::CreateCommunityMultiplayerBackend;
+#endif
   config.live.voice_audio_device = gta4::voice::CreateAudioDevice();
   config.live.voice_sample_codec = gta4::voice::CreateSampleCodec();
   const std::weak_ptr<rex::system::xam::IVoiceAudioDevice> voice_device =

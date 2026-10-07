@@ -148,7 +148,19 @@ bool Memory::Initialize() {
     return false;
   }
 
-#if REX_PLATFORM_MAC
+#if REX_PLATFORM_WEB
+  // wasm linear memory cannot place or alias views. The mapping is one
+  // zero-filled region laid out as [virtual 4 GB][physical 512 MB]; aliased
+  // guest ranges are folded onto the physical copy by address translation
+  // (rex/memory/web_guest_layout.h), and MapFileView returns pointers into it.
+  static_assert(web::kRegionSize <= 0x120000000ull + 0x10000);
+  mapping_base_ = reinterpret_cast<uint8_t*>(mapping_);
+  if (MapViews(mapping_base_)) {
+    REXSYS_ERROR("Unable to set up the guest memory views.");
+    assert_always();
+    return false;
+  }
+#elif REX_PLATFORM_MAC
   // On macOS, reserve a contiguous host range first, then carve guest views
   // into it with MAP_SHARED|MAP_FIXED so all views share the same backing fd.
   if (MapViewsMac()) {
@@ -437,6 +449,10 @@ VirtualHeap* Memory::GetPhysicalHeap() {
 uint32_t Memory::HostToGuestVirtual(const void* host_address) const {
   size_t virtual_address =
       reinterpret_cast<size_t>(host_address) - reinterpret_cast<size_t>(virtual_membase_);
+#if REX_PLATFORM_WEB
+  // Aliases share host memory here, so report the canonical guest view.
+  return web::GuestAddressForHostOffset(virtual_address);
+#endif
   uint32_t vE0000000_host_offset = heaps_.vE0000000.host_address_offset();
   size_t vE0000000_host_base = size_t(heaps_.vE0000000.heap_base()) + vE0000000_host_offset;
   if (virtual_address >= vE0000000_host_base &&
@@ -1694,11 +1710,21 @@ void PhysicalHeap::Initialize(memory::Memory* memory, uint8_t* membase, HeapType
                               uint32_t heap_base, uint32_t heap_size, uint32_t page_size,
                               VirtualHeap* parent_heap) {
   uint32_t host_address_offset;
+#if REX_PLATFORM_WEB
+  // Fold this alias of physical memory onto the single physical copy. The
+  // physical heap itself (based at physical_membase) needs no offset.
+  host_address_offset =
+      membase == memory->physical_membase() ? 0u : static_cast<uint32_t>(web::HostOffset(heap_base));
+  static_assert(web::HostOffset(0xA0000000u) <= UINT32_MAX &&
+                web::HostOffset(0xC0000000u) <= UINT32_MAX &&
+                web::HostOffset(0xE0000000u) <= UINT32_MAX);
+#else
   if (heap_base >= 0xE0000000 && rex::memory::allocation_granularity() > 0x1000) {
     host_address_offset = 0x1000;
   } else {
     host_address_offset = 0;
   }
+#endif
 
   BaseHeap::Initialize(memory, membase, heap_type, heap_base, heap_size, page_size,
                        host_address_offset);

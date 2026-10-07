@@ -21,10 +21,10 @@ static_assert(REX_PLATFORM_LINUX || REX_PLATFORM_MAC, "This file is POSIX-only")
 #include <deque>
 #include <limits>
 #include <memory>
+#include <thread>
 
 #include <pthread.h>
 #include <semaphore.h>
-#include <sys/eventfd.h>
 #include <sys/syscall.h>
 #include <sys/time.h>
 #include <sys/types.h>
@@ -37,6 +37,10 @@ static_assert(REX_PLATFORM_LINUX || REX_PLATFORM_MAC, "This file is POSIX-only")
 
 #include <sched.h>
 
+#if REX_PLATFORM_WEB
+#include <emscripten/threading.h>
+#endif
+
 #if REX_PLATFORM_ANDROID
 #include <dlfcn.h>
 
@@ -44,7 +48,7 @@ static_assert(REX_PLATFORM_LINUX || REX_PLATFORM_MAC, "This file is POSIX-only")
 #include <rex/string.h>
 #endif
 
-#if REX_PLATFORM_LINUX
+#if REX_PLATFORM_LINUX && !REX_PLATFORM_WEB
 // SIGEV_THREAD_ID in timer_create(...) is a Linux extension
 #define REX_HAS_SIGEV_THREAD_ID 1
 #ifdef __GLIBC__
@@ -142,10 +146,23 @@ void install_signal_handler(SignalType type) {
 // TODO(dougvj)
 void EnableAffinityConfiguration() {}
 
+static void SetPthreadName(pthread_t thread, const std::string& name) {
+#if REX_PLATFORM_WEB
+  // No pthread_setname_np; this names the Web Worker in browser devtools.
+  emscripten_set_thread_name(thread, name.c_str());
+#else
+  pthread_setname_np(thread, name.c_str());
+#endif
+}
+
 // uint64_t ticks() { return mach_absolute_time(); }
 
 uint32_t current_thread_system_id() {
+#if REX_PLATFORM_WEB
+  return static_cast<uint32_t>(gettid());
+#else
   return static_cast<uint32_t>(syscall(SYS_gettid));
+#endif
 }
 
 void MaybeYield() {
@@ -669,7 +686,7 @@ class PosixCondition<Thread> : public PosixConditionBase {
     WaitStarted();
     std::unique_lock<std::mutex> lock(state_mutex_);
     if (state_ != State::kUninitialized && state_ != State::kFinished) {
-      pthread_setname_np(thread_, std::string(name).c_str());
+      SetPthreadName(thread_, std::string(name));
 #if REX_PLATFORM_ANDROID
       SetAndroidPreApi26Name(name);
 #endif
@@ -691,6 +708,10 @@ class PosixCondition<Thread> : public PosixConditionBase {
 
   uint64_t affinity_mask() {
     WaitStarted();
+#if REX_PLATFORM_WEB
+    // Web Workers cannot be pinned; report every core as eligible.
+    return (uint64_t(1) << std::min(std::thread::hardware_concurrency(), 63u)) - 1;
+#else
     cpu_set_t cpu_set;
 #if REX_PLATFORM_ANDROID
     if (sched_getaffinity(pthread_gettid_np(thread_), sizeof(cpu_set_t), &cpu_set) != 0) {
@@ -708,10 +729,14 @@ class PosixCondition<Thread> : public PosixConditionBase {
       result |= set << i;
     }
     return result;
+#endif
   }
 
   void set_affinity_mask(uint64_t mask) {
     WaitStarted();
+#if REX_PLATFORM_WEB
+    (void)mask;
+#else
     cpu_set_t cpu_set;
     CPU_ZERO(&cpu_set);
     for (auto i = 0u; i < 64; i++) {
@@ -727,6 +752,7 @@ class PosixCondition<Thread> : public PosixConditionBase {
     if (pthread_setaffinity_np(thread_, sizeof(cpu_set_t), &cpu_set) != 0) {
       assert_always();
     }
+#endif
 #endif
   }
 
@@ -784,6 +810,12 @@ class PosixCondition<Thread> : public PosixConditionBase {
 #if REX_PLATFORM_ANDROID
     int result = sigqueue(pthread_gettid_np(thread_),
                           GetSystemSignal(SignalType::kThreadUserCallback), value);
+#elif REX_PLATFORM_WEB
+    // Emscripten has no pthread_sigqueue. The handler ignores the payload, and
+    // alertable waits drain the queue themselves, so the signal is only a
+    // wake-up hint (delivered when the target thread services its mailbox).
+    (void)value;
+    int result = pthread_kill(thread_, GetSystemSignal(SignalType::kThreadUserCallback));
 #else
     int result = pthread_sigqueue(thread_, GetSystemSignal(SignalType::kThreadUserCallback), value);
 #endif
@@ -1392,7 +1424,7 @@ void Thread::Exit(int exit_code) {
 }
 
 void set_current_thread_name(const std::string_view name) {
-  pthread_setname_np(pthread_self(), std::string(name).c_str());
+  SetPthreadName(pthread_self(), std::string(name));
 #if REX_PLATFORM_ANDROID
   if (!android_pthread_getname_np_ && current_thread_) {
     current_thread_->condition().SetAndroidPreApi26Name(name);

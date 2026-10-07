@@ -33,7 +33,7 @@ inline uint32_t stack_limit_from_pcr(PPCContext& ctx, uint8_t* base) {
   if (ctx.r13.u32 == 0)
     return 0;
   uint32_t raw;
-  std::memcpy(&raw, base + ctx.r13.u32 + 0x74, sizeof(raw));
+  std::memcpy(&raw, rex::memory::GuestPtr(base, ctx.r13.u32 + 0x74), sizeof(raw));
   return __builtin_bswap32(raw);
 }
 

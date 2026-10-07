@@ -74,8 +74,13 @@ elseif(APPLE)
         threading_mac.cpp
     )
 elseif(UNIX)
+    set(REXCORE_POSIX_MEMORY memory_posix.cpp)
     if(ANDROID)
         set(REXCORE_POSIX_FIBER fiber_android.cpp)
+    elseif(EMSCRIPTEN)
+        set(REXCORE_POSIX_FIBER fiber_web.cpp)
+        # No mmap aliasing or page protection in wasm linear memory.
+        set(REXCORE_POSIX_MEMORY memory_web.cpp)
     else()
         set(REXCORE_POSIX_FIBER fiber_posix.cpp)
     endif()
@@ -89,7 +94,7 @@ elseif(UNIX)
         ${REXCORE_POSIX_FIBER}
         mapped_memory_posix.cpp
         math_gcc.cpp
-        memory_posix.cpp
+        ${REXCORE_POSIX_MEMORY}
         platform/console_posix.cpp
         platform/env_posix.cpp
         seh_posix.cpp

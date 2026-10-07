@@ -1,0 +1,56 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Liberty Recompiled</title>
+  <style>
+    :root { color-scheme: dark; }
+    html, body { margin: 0; height: 100%; background: #000; color: #ccc;
+                 font: 13px/1.4 ui-monospace, SFMono-Regular, Menlo, monospace; }
+    body { display: flex; flex-direction: column; }
+    #screen { flex: 1; min-height: 0; position: relative; background: #000; }
+    /* WebGPU draws into #liberty-gpu from a worker; SDL keeps #canvas (on
+       top, transparent) for input. */
+    #screen canvas { position: absolute; inset: 0; width: 100%; height: 100%; display: block; }
+    #canvas { z-index: 1; }
+    #status { padding: 4px 8px; background: #111; border-top: 1px solid #222; }
+    #log { height: 30vh; overflow: auto; margin: 0; padding: 4px 8px;
+           background: #0a0a0a; border-top: 1px solid #222; white-space: pre-wrap; }
+  </style>
+</head>
+<body>
+  <div id="screen">
+    <canvas id="liberty-gpu"></canvas>
+    <canvas id="canvas" tabindex="-1" oncontextmenu="event.preventDefault()"></canvas>
+  </div>
+  <div id="status">Loading…</div>
+  <pre id="log"></pre>
+  <script>
+    // Threads need SharedArrayBuffer, which browsers only expose to
+    // cross-origin isolated pages (COOP + COEP headers). See
+    // tools/web/serve.py and docs/WEB_BUILDING.md.
+    const statusEl = document.getElementById('status');
+    const logEl = document.getElementById('log');
+    function append(line) {
+      logEl.textContent += line + '\n';
+      logEl.scrollTop = logEl.scrollHeight;
+    }
+    if (!self.crossOriginIsolated) {
+      statusEl.textContent =
+        'This page is not cross-origin isolated, so WebAssembly threads are unavailable. ' +
+        'Serve it with tools/web/serve.py.';
+    }
+    var Module = {
+      canvas: document.getElementById('canvas'),
+      arguments: new URLSearchParams(location.search).getAll('arg'),
+      print: (text) => { console.log(text); append(text); },
+      printErr: (text) => { console.error(text); append(text); },
+      setStatus: (text) => { if (text) statusEl.textContent = text; },
+      onRuntimeInitialized: () => { statusEl.textContent = 'Running'; },
+      onAbort: (what) => { statusEl.textContent = 'Aborted: ' + what; },
+    };
+  </script>
+  <script src="LibertyRecomp.js"></script>
+</body>
+</html>

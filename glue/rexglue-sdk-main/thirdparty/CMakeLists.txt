@@ -446,6 +446,12 @@ else()
     set(FFMPEG_ATOMICS_INCLUDE "${FFMPEG_DIR}/compat/atomics/gcc")
 endif()
 
+# FFmpeg has no WebAssembly config; ffmpeg-web/config.h supplies a portable
+# C-only one. It must come before FFMPEG_DIR, which has its own config.h.
+if(EMSCRIPTEN)
+    set(FFMPEG_WEB_CONFIG_DIR "${CMAKE_CURRENT_SOURCE_DIR}/ffmpeg-web")
+endif()
+
 #=============================================================================
 # ARM64 setup for FFmpeg (NEON optimizations)
 #=============================================================================
@@ -565,6 +571,9 @@ target_include_directories(libavutil
         $<INSTALL_INTERFACE:${CMAKE_INSTALL_INCLUDEDIR}>
     PRIVATE ${FFMPEG_ATOMICS_INCLUDE}
 )
+if(FFMPEG_WEB_CONFIG_DIR)
+    target_include_directories(libavutil BEFORE PRIVATE "${FFMPEG_WEB_CONFIG_DIR}")
+endif()
 target_compile_definitions(libavutil PRIVATE ${FFMPEG_COMMON_DEFINES})
 target_compile_options(libavutil PRIVATE -w)  # Suppress warnings in third-party code
 if(WIN32)
@@ -687,6 +696,9 @@ if(IS_ARM64)
 endif()
 
 target_include_directories(libavcodec BEFORE PRIVATE "${FFMPEG_OVERLAY_BUILD_DIR}")
+if(FFMPEG_WEB_CONFIG_DIR)
+    target_include_directories(libavcodec BEFORE PRIVATE "${FFMPEG_WEB_CONFIG_DIR}")
+endif()
 
 target_include_directories(libavcodec
     PUBLIC

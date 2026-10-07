@@ -199,6 +199,11 @@ bool ReXApp::SetupEnvironment() {
 #endif
   }
 
+#if REX_PLATFORM_WEB
+  // Log files land in Emscripten's in-memory filesystem, where nobody can
+  // read them; mirror logs to stdout (the browser console and page log).
+  log_config.log_to_console = true;
+#endif
   rex::InitLogging(log_config);
   rex::RegisterLogLevelCallback();
 
@@ -424,9 +429,10 @@ bool ReXApp::SetupPresentation() {
       }
     }
     window_->SetPresenter(presenter);
-  } else if (!graphics_system) {
-    // Detached mode: the app brings its own renderer and drives its own paint
-    // loop. ReXApp owns the returned drawer via immediate_drawer_.
+  } else {
+    // Detached mode: the app brings its own renderer (or the graphics system
+    // presents without a ui::Presenter, as on the web) and drives its own
+    // paint loop. ReXApp owns the returned drawer via immediate_drawer_.
     immediate_drawer_ = OnCreateImmediateDrawer();
     if (immediate_drawer_) {
       SetupOverlays(/*presenter=*/nullptr, immediate_drawer_.get());

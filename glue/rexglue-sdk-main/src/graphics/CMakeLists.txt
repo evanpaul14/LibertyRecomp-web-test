@@ -140,6 +140,38 @@ function(rexgpu_configure_plugin target export_name)
     endif()
 endfunction()
 
+# GPU plugins are dlopen()ed at runtime. The web build has no plugin loader,
+# so its WebGPU title renderer is a static library linked into the app.
+if(EMSCRIPTEN)
+    set(GTA4_WEBGPU_SHADER_ARCHIVE
+        "${LIBERTY_RECOMP_WORKSPACE_ROOT}/LibertyRecompLib/shader/webgpu_shader_archive.bin")
+    if(NOT EXISTS "${GTA4_WEBGPU_SHADER_ARCHIVE}")
+        message(FATAL_ERROR "WebGPU shader archive not found: ${GTA4_WEBGPU_SHADER_ARCHIVE}"
+            " (generate it with tools/webgpu/spirv_to_wgsl.py, see docs/WEB_BUILDING.md)")
+    endif()
+    add_library(rex-gta4-webgpu STATIC
+        gta4_webgpu/canvas.cpp
+        gta4_webgpu/draw.cpp
+        gta4_webgpu/graphics_system.cpp
+        gta4_webgpu/passes.cpp
+        gta4_webgpu/renderer.cpp
+        gta4_webgpu/resources.cpp
+        gta4_webgpu/shader_archive.cpp
+        gta4_webgpu/texture_decode.cpp
+    )
+    target_include_directories(rex-gta4-webgpu PRIVATE "${REXGLUE_ROOT}/src")
+    target_compile_definitions(rex-gta4-webgpu PRIVATE
+        GTA4_WEBGPU_SHADER_ARCHIVE="${GTA4_WEBGPU_SHADER_ARCHIVE}")
+    target_link_libraries(rex-gta4-webgpu PUBLIC rexruntime xxHash::xxhash)
+    # emdawnwebgpu: Dawn's webgpu.h on top of the browser's WebGPU API.
+    target_compile_options(rex-gta4-webgpu PRIVATE
+        --use-port=emdawnwebgpu -sUSE_ZLIB=1 -Wno-c23-extensions)
+    target_link_options(rex-gta4-webgpu INTERFACE --use-port=emdawnwebgpu -sUSE_ZLIB=1)
+    set_source_files_properties(gta4_webgpu/shader_archive.cpp PROPERTIES
+        OBJECT_DEPENDS "${GTA4_WEBGPU_SHADER_ARCHIVE}")
+    return()
+endif()
+
 add_library(rexgpu-xenos SHARED
     plugin_main.cpp
     ${REXGPU_XENOS_SOURCES}

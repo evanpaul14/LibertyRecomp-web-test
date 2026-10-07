@@ -12,6 +12,59 @@ endif()
 
 include(generated/sources.cmake)
 
+# Title sources shared by every platform build of the app. Platform-only
+# files (Objective-C++ bridges, the CURL/OpenSSL community backend) are added
+# by each branch below.
+set(GTA4_APP_SOURCES
+    src/main.cpp
+    src/gta4_app.cpp
+    src/gta4_frontend_hooks.cpp
+    src/gta4_font_selection_trace.cpp
+    src/gta4_guest_debug_print.cpp
+    src/gta4_presentation_options.cpp
+    src/gta4_presentation_hooks.cpp
+    src/gta4_aspect_hooks.cpp
+    src/gta4_quicksave_hooks.cpp
+    src/gta4_input_hooks.cpp
+    src/gta4_sony_feedback.cpp
+    src/gta4_sony_event_hooks.cpp
+    src/gta4_loading_parallax_fix.cpp
+    src/gta4_motion_bridge.cpp
+    src/gta4_motion_hooks.cpp
+    src/gta4_motion_vehicle_hooks.cpp
+    src/gta4_audio_lifetime_trace.cpp
+    src/gta4_audio_ramped_mix.cpp
+    src/gta4_lzx_hooks.cpp
+    src/gta4_multiplayer_64_hooks.cpp
+    src/gta4_online_hooks.cpp
+    src/gta4_native_hooks.cpp
+    src/gta4_population_hooks.cpp
+    src/gta4_streaming_diagnostics.cpp
+    src/gta4_streaming_hooks.cpp
+    src/gta4_touch_coordinator.cpp
+    src/gta4_transition_hooks.cpp
+    src/install/gta4_install_dialog.cpp
+    src/install/gta4_installer.cpp
+    src/install/gta4_rpf_extractor.cpp
+    src/install/gta4_source_inspector.cpp
+    src/legal_screen_trace.cpp
+    src/rpf_button_prompts.cpp
+    src/input/text_chat_dialog.cpp
+    src/input/context_touch_controls.cpp
+    src/input/context_touch_context.cpp
+    src/input/context_touch_camera_hooks.cpp
+    src/input/context_touch_settings.cpp
+    src/input/context_touch_draw.cpp
+    src/input/context_touch_layout.cpp
+    src/input/context_touch_activity.cpp
+    src/input/context_touch_activity_context.cpp
+    src/input/context_touch_activity_layout.cpp
+    src/input/context_touch_overlay.cpp
+    src/gta4_touch_guest_hooks.cpp
+    src/network/gta4_voice_audio.cpp
+    "${CMAKE_CURRENT_SOURCE_DIR}/../thirdparty/crypto/rijndael-alg-fst.c"
+)
+
 if(APPLE AND LIBERTY_RECOMP_TARGET_PLATFORM STREQUAL "desktop")
     find_package(Python3 3.10 REQUIRED COMPONENTS Interpreter)
     find_package(CURL REQUIRED)
@@ -92,56 +145,11 @@ if(APPLE AND LIBERTY_RECOMP_TARGET_PLATFORM STREQUAL "desktop")
 
     add_executable(LibertyRecomp MACOSX_BUNDLE
         "${LIBERTY_DESKTOP_ICON}"
-        src/main.cpp
-        src/gta4_app.cpp
-        src/gta4_frontend_hooks.cpp
-        src/gta4_font_selection_trace.cpp
-        src/gta4_presentation_options.cpp
-        src/gta4_presentation_hooks.cpp
-        src/gta4_aspect_hooks.cpp
-        src/gta4_quicksave_hooks.cpp
-        src/gta4_input_hooks.cpp
-        src/gta4_sony_feedback.cpp
-        src/gta4_sony_event_hooks.cpp
-        src/gta4_loading_parallax_fix.cpp
-        src/gta4_motion_bridge.cpp
-        src/gta4_motion_hooks.cpp
-        src/gta4_motion_vehicle_hooks.cpp
-        src/gta4_audio_lifetime_trace.cpp
-        src/gta4_audio_ramped_mix.cpp
-        src/gta4_lzx_hooks.cpp
-        src/gta4_multiplayer_64_hooks.cpp
-        src/gta4_online_hooks.cpp
-        src/gta4_native_hooks.cpp
-        src/gta4_population_hooks.cpp
-        src/gta4_streaming_diagnostics.cpp
-        src/gta4_streaming_hooks.cpp
-        src/gta4_touch_coordinator.cpp
-        src/gta4_transition_hooks.cpp
-        src/install/gta4_install_dialog.cpp
-        src/install/gta4_installer.cpp
-        src/install/gta4_rpf_extractor.cpp
-        src/install/gta4_source_inspector.cpp
-        src/legal_screen_trace.cpp
-        src/rpf_button_prompts.cpp
+        ${GTA4_APP_SOURCES}
         src/achievement_bridge_gc.mm
-        src/input/text_chat_dialog.cpp
-        src/input/context_touch_controls.cpp
-        src/input/context_touch_context.cpp
-        src/input/context_touch_camera_hooks.cpp
-        src/input/context_touch_settings.cpp
-        src/input/context_touch_draw.cpp
-        src/input/context_touch_layout.cpp
-        src/input/context_touch_activity.cpp
-        src/input/context_touch_activity_context.cpp
-        src/input/context_touch_activity_layout.cpp
-        src/input/context_touch_overlay.cpp
-        src/gta4_touch_guest_hooks.cpp
         src/input/user_music_player.mm
         src/network/community_multiplayer.cpp
         src/network/gta4_microphone_permission.mm
-        src/network/gta4_voice_audio.cpp
-        "${CMAKE_CURRENT_SOURCE_DIR}/../thirdparty/crypto/rijndael-alg-fst.c"
         "${LIBERTY_GC_MACOS_ENTITLEMENTS}"
         ${LIBERTY_BUTTON_PROMPT_RESOURCES}
         ${LIBERTY_VECTOR_FONT_RESOURCES}
@@ -304,6 +312,101 @@ if(APPLE AND LIBERTY_RECOMP_TARGET_PLATFORM STREQUAL "desktop")
         COMMAND "${Python3_EXECUTABLE}" "${LIBERTY_MACOS_BUNDLE_VERIFIER}"
             "$<TARGET_BUNDLE_DIR:LibertyRecomp>" --arch "${CMAKE_OSX_ARCHITECTURES}"
         COMMENT "Verifying macOS runtime closure, architecture, minimum OS, and signature..."
+        VERBATIM)
+elseif(EMSCRIPTEN)
+    # Web (wasm64) build: the recompiled game code, the RexGlue runtime and
+    # the WebGPU title renderer. See docs/WEB_BUILDING.md.
+    option(LIBERTY_WEB_NODERAWFS
+        "Give the web build direct host filesystem access when run under Node.js (testing only)"
+        OFF)
+
+    # OBJECT, not STATIC: nothing references the registrar by symbol, so an
+    # archive member would be dropped by the linker.
+    add_library(gta4_recomp_generated OBJECT ${GENERATED_SOURCES})
+    target_include_directories(gta4_recomp_generated PUBLIC
+        ${CMAKE_CURRENT_SOURCE_DIR}/generated
+    )
+    target_link_libraries(gta4_recomp_generated PUBLIC rex::runtime)
+    # Generated code is not ours to warn about.
+    target_compile_options(gta4_recomp_generated PRIVATE -w)
+    # Same rationale as the macOS build: the registrar is one huge
+    # straight-line function.
+    set_property(SOURCE generated/gta4_register.cpp APPEND PROPERTY COMPILE_OPTIONS
+        "$<$<CONFIG:Release>:-O0>")
+
+    add_executable(LibertyRecomp
+        ${GTA4_APP_SOURCES}
+        src/web/web_platform_bridges.cpp
+    )
+    target_link_libraries(LibertyRecomp PRIVATE
+        gta4_recomp_generated
+        rex::runtime
+        rex-gta4-webgpu
+        xxHash::xxhash
+        SDL3::SDL3
+        utf8cpp
+    )
+    target_include_directories(LibertyRecomp PRIVATE
+        ${CMAKE_CURRENT_SOURCE_DIR}/src
+        ${CMAKE_CURRENT_SOURCE_DIR}/generated
+        ${CMAKE_CURRENT_SOURCE_DIR}/../thirdparty/crypto
+        ${CMAKE_CURRENT_SOURCE_DIR}/../thirdparty/imgui
+        ${CMAKE_CURRENT_SOURCE_DIR}/../thirdparty/inja/third_party/include
+    )
+    set_property(SOURCE src/gta4_native_hooks.cpp APPEND PROPERTY INCLUDE_DIRECTORIES
+        "${CMAKE_CURRENT_SOURCE_DIR}/../src")
+    set_source_files_properties(src/gta4_sony_feedback.cpp src/gta4_sony_event_hooks.cpp
+        PROPERTIES COMPILE_DEFINITIONS GTA4_SONY_PRIMARY_PLAYER_ALIAS)
+    target_compile_definitions(LibertyRecomp PRIVATE
+        GTA4_TOUCH_PRIMARY_PLAYER_ALIAS=1
+        GTA4_RECOMP_ASSET_XEX="${CMAKE_CURRENT_SOURCE_DIR}/assets/default_v8.xex"
+        GTA4_BUTTON_PROMPT_ASSET_ROOT="${LIBERTY_RECOMP_WORKSPACE_ROOT}/LibertyRecompLib/private/button_prompts"
+        GTA4_RPF_AES_KEY_SOURCE="${LIBERTY_RECOMP_WORKSPACE_ROOT}/LibertyRecompLib/aes_key.bin"
+    )
+    # zlib comes from Emscripten's port (RPF extraction inflates entries).
+    target_compile_options(LibertyRecomp PRIVATE -sUSE_ZLIB=1)
+    target_link_options(LibertyRecomp PRIVATE
+        -sUSE_ZLIB=1
+        # main() blocks in its message loop, which the browser main thread
+        # forbids; run it on a worker and keep the page thread free.
+        -sPROXY_TO_PTHREAD=1
+        # 64-bit memory grows on demand; 16 GB is the browser ceiling.
+        -sINITIAL_MEMORY=256MB
+        -sALLOW_MEMORY_GROWTH=1
+        -sMAXIMUM_MEMORY=16GB
+        # Each guest call is a host call, so host stacks run deep.
+        -sSTACK_SIZE=8MB
+        -sDEFAULT_PTHREAD_STACK_SIZE=4MB
+        -sENVIRONMENT=web,worker,node
+        -sEXIT_RUNTIME=1
+        "--pre-js=${CMAKE_CURRENT_SOURCE_DIR}/res/web/webgpu_canvas.js"
+    )
+    set_property(TARGET LibertyRecomp APPEND PROPERTY LINK_DEPENDS
+        "${CMAKE_CURRENT_SOURCE_DIR}/res/web/webgpu_canvas.js")
+    option(LIBERTY_WEB_FUNCTION_NAMES
+        "Keep function names in the web build so traps and profiles are readable"
+        OFF)
+    if(LIBERTY_WEB_FUNCTION_NAMES)
+        target_link_options(LibertyRecomp PRIVATE --profiling-funcs)
+    endif()
+    if(LIBERTY_WEB_NODERAWFS)
+        target_link_options(LibertyRecomp PRIVATE -sNODERAWFS=1
+            "--pre-js=${CMAKE_CURRENT_SOURCE_DIR}/res/web/node_env.js")
+        set_property(TARGET LibertyRecomp APPEND PROPERTY LINK_DEPENDS
+            "${CMAKE_CURRENT_SOURCE_DIR}/res/web/node_env.js")
+    endif()
+    set_target_properties(LibertyRecomp PROPERTIES
+        OUTPUT_NAME "LibertyRecomp"
+        SUFFIX ".js"
+        RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/LibertyRecomp"
+    )
+    rexglue_configure_target(LibertyRecomp)
+    # The page that hosts the module; serve the output directory with
+    # tools/web/serve.py (threads need COOP/COEP headers).
+    add_custom_command(TARGET LibertyRecomp POST_BUILD
+        COMMAND ${CMAKE_COMMAND} -E copy_if_different
+            "${CMAKE_CURRENT_SOURCE_DIR}/res/web/index.html"
+            "$<TARGET_FILE_DIR:LibertyRecomp>/index.html"
         VERBATIM)
 else()
     add_library(gta4_recomp INTERFACE)

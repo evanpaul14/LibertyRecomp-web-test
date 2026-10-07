@@ -18,6 +18,7 @@
 #include <vector>
 
 #include <rex/memory/utils.h>
+#include <rex/memory/web_guest_layout.h>
 #include <rex/memory/access_epoch.h>
 #include <rex/ppc/context.h>  // PPCFunc type (minimal header)
 #include <rex/system/mmio_handler.h>
@@ -29,6 +30,13 @@ class ByteStream;
 
 namespace rex::memory::detail {
 
+#if REX_PLATFORM_WEB
+/// WebAssembly cannot alias pages, so every aliased guest range is folded
+/// onto one copy of physical memory (see rex/memory/web_guest_layout.h).
+constexpr u64 PhysicalHostOffset(u32 guest_addr) noexcept {
+  return web::HostOffset(guest_addr);
+}
+#else
 /// Compensates for Windows 64KB allocation granularity on the 0xE0 physical heap.
 /// The backing file maps the 0xE0 heap at a 0x1000-byte offset, but MapViewOfFileEx
 /// rounds down to 64KB boundaries. Linux mmap handles 4KB offsets natively.
@@ -39,6 +47,7 @@ constexpr u32 PhysicalHostOffset([[maybe_unused]] u32 guest_addr) noexcept {
   return 0u;
 #endif
 }
+#endif
 
 }  // namespace rex::memory::detail
 
