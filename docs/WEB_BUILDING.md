@@ -121,8 +121,9 @@ option back off for the browser.
 
 Node has no WebGPU of its own. Dawn's Node bindings (the npm package `webgpu`)
 provide it; point `LIBERTY_DAWN_NODE` at the package and every worker gets a GPU.
-Without a hardware Vulkan driver, Chromium's bundled SwiftShader works as the
-device. The game also needs the `ws` package once it opens a socket:
+On macOS Dawn uses Metal directly. On Linux without a hardware Vulkan driver,
+Chromium's bundled SwiftShader works as the device (set `VK_ICD_FILENAMES` as
+below). The game also needs the `ws` package once it opens a socket:
 
 ```bash
 npm install --prefix /tmp/dawn webgpu ws
@@ -132,10 +133,14 @@ XDG_DATA_HOME=/path/to/data node out/web/LibertyRecomp/LibertyRecomp.js --diagno
     --webgpu_frame_dump_path=/tmp/frames/f --webgpu_frame_dump_interval=60
 ```
 
-`--webgpu_frame_dump_path` writes every Nth presented frame as a PAM image (RGBA).
-`--webgpu_trace_frame=N` logs every title command of frame N. Every 60 frames the
-renderer logs its draw, clear and resolve counts. `--gpu_plugin=none` restores the
-old headless mode.
+`--webgpu_frame_dump_path` writes every Nth presented frame as a PAM image (RGBA),
+named by the title's frame number. `--webgpu_trace_frame=N` logs every title
+command of that frame (with each draw's decoded vertex inputs, nonzero pixel
+constants and bound textures) and always dumps it; trace lines are info-level, so
+add `--log_level=info`. Every 60 frames the renderer logs its draw, clear and
+resolve counts. `--webgpu_perf_report=true` logs timing every 5 s as warnings.
+`--webgpu_frame_limit` caps presents per second (default 60, 0 = unlimited).
+`--gpu_plugin=none` restores the old headless mode.
 
 ## How the port works
 
@@ -154,6 +159,7 @@ old headless mode.
 | Fibers | ucontext / Win32 fibers | Thread fibers only (`fiber_web.cpp`); GTA IV imports no guest fiber APIs |
 | FFmpeg (XMA) | Platform `config.h` | `thirdparty/ffmpeg-web/config.h`: portable C only |
 | Thread suspend / APC wake | Real-time signals | `pthread_kill`; delivered when the target worker services its mailbox |
+| Host clock | `CLOCK_MONOTONIC_RAW` (Linux), `mach_absolute_time` (macOS) | `CLOCK_MONOTONIC`: Emscripten has no raw clock (`src/core/clock_posix.cpp`) |
 | Community multiplayer | CURL + OpenSSL backend | Not built; selecting it reports an error |
 | Game Center, user music, microphone | Objective-C++ bridges | Report unavailable (`src/web/web_platform_bridges.cpp`) |
 | RenderDoc | Optional | Not available |
@@ -190,6 +196,8 @@ placement resolve from the one written last.
 
 **Presentation.** A present renders the frontbuffer texture into the page canvas
 and acknowledges the frame in the guest device block, which the title waits on.
+Neither the canvas nor Node blocks on vsync, so the presenting thread paces
+itself to `--webgpu_frame_limit` frames a second.
 
 ## Status
 
@@ -233,7 +241,10 @@ runs into gameplay:
   reflections and the HUD radar, at about 8000 draws a frame with no rejected
   draws or WebGPU errors. On a CPU-emulated GPU this takes over 15 minutes to
   reach: the loading screen runs at about 24 fps, gameplay frames take 4–7
-  seconds each.
+  seconds each;
+- with Dawn on Metal (an M1 Mac), the loading-screen artwork renders correctly
+  and the intro is reached in about two minutes at 60 fps; intro gameplay frames
+  (8000+ draws) run at about 5 fps.
 
 `--gta4_log_guest_debug_print=true` logs the title's own debug messages (the
 retail build discards them), which is the quickest way to see why it stops.
@@ -250,8 +261,13 @@ Not working yet:
   forward-pass depth handoff, separate color/alpha blend constants, sampler border
   colors and mirror-clamp addressing (approximated), wireframe fill, and reads of
   3D or block-compressed GPU textures.
-- **Performance.** Every draw compares or copies the 22 KB device block, and
-  nothing is profiled yet.
+- **Intermittent hang under Node.** Most runs now stop presenting at some point
+  (loading, intro or "Starting a new game…") with every game thread waiting and
+  the render queue empty; the cause is not known yet.
+- **Lighting.** In the intro, deferred-lit surfaces (water, ground, the ship)
+  are often black below the horizon, and lamp coronas are hard white shapes.
+- **Performance.** Every draw still copies the 22 KB device block (the Vulkan
+  renderer sends dirty deltas), and pipelines compile synchronously.
 - **Write watches.** The runtime's memory-coherence tracking relies on page
   protection faults, which wasm does not have. The renderer instead relies on the
   title's own unlock notifications.

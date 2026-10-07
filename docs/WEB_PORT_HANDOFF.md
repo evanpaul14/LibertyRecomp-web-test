@@ -1,6 +1,7 @@
 # Web Port Handoff
 
-Status of the WebAssembly port on branch `claude/zen-goodall-jpl0op`.
+Status of the WebAssembly port on branch `webgpu-node-graphics` (branched from
+`main`; earlier work was on `claude/zen-goodall-jpl0op`).
 `WEB_BUILDING.md` is the user-facing guide (build, run, how each subsystem is
 mapped); this file is for whoever continues the work.
 
@@ -50,9 +51,39 @@ mapped); this file is for whoever continues the work.
   --diagnostics_categories=logging --log_level=warn`: other diagnostics print
   a line per draw, and every line blocks the game thread until the page's
   main thread handles it. In the browser that alone held gameplay below 1 fps.
-- Next step candidates: why Chrome gameplay frames come out black (dump frames
-  with `--webgpu_frame_dump_path` and read them back from MEMFS, with the tab
-  in front), the remaining per-draw cost, and the Node stall. Ask the user.
+- Next step candidates, in suggested order: the Node hang (it makes every
+  gameplay test unreliable), the black deferred lighting, then re-checking Chrome
+  with the clock fix. Ask the user.
+- **Node graphics session (Dawn on Metal, M1 Mac, 2026-10-07).**
+  - *Fixed: black loading screens.* Emscripten has no `CLOCK_MONOTONIC_RAW`;
+    `clock_getres`/`clock_gettime` failed and, with asserts compiled out, the
+    host clock was uninitialized memory. Guest frame deltas were ~8e8 s, so the
+    loading screens stayed behind their opaque fade quad (and the game's timers
+    were garbage everywhere). `src/core/clock_posix.cpp` now uses
+    `CLOCK_MONOTONIC` on Emscripten. This bug also affected the browser build,
+    which likely explains the missing loading artwork seen in Chrome.
+  - *Added:* present pacing (`--webgpu_frame_limit`, default 60) and a richer
+    frame trace (see Testing below).
+  - *Open: hang.* Since the clock fix, most Node runs stop presenting at a random
+    point (loading, intro, "Starting a new game…"). It reproduces with
+    `--webgpu_frame_limit=0` and without frame dumps. A `sample` of the stalled
+    process shows the Node main thread idle in libuv and every `em-pthread` parked
+    in `__psynch_cvwait` (no busy spin). The uncommitted render-queue watchdog
+    stayed silent, i.e. the render queue was empty and not waiting on the GPU, so
+    the game threads deadlocked among themselves. Prime suspect: suspend/APC
+    delivery via `pthread_kill` (`src/core/threading_posix.cpp`), which only lands
+    when the target worker services its mailbox; real timeouts may now expose a
+    wait the garbage clock used to break. Not confirmed.
+  - *Open: lighting.* In the intro, water/ground below the horizon is often black
+    and lamp coronas are hard white shapes. Forward-drawn things (sky, text,
+    lamps) look right, so the deferred lighting composite is the suspect.
+  - *Uncommitted in the working tree (builds, unverified):* (1) packed depth
+    aliases: `RegisterVirtualResource` with `packed_depth_source` is now honored;
+    resolved depth is stored as `rg32float` (depth, stencil) and an alias texture
+    is rebuilt as A8R8G8B8 like `gta4_native/packed_depth_alias_ps.glsl`. It caused
+    no GPU errors but did not change the black ground in the one frame checked,
+    and it is not yet confirmed that the title takes this path. (2) A render-thread
+    watchdog that logs `render queue stalled` when queued work stops moving.
 
 ## Key design decisions (and where they live)
 
@@ -97,7 +128,13 @@ ninja -C out/web LibertyRecomp rex-web-memory-test
 - **zlib port:** the proxy blocks GitHub archive downloads. Clone
   `madler/zlib` at `v1.3.2`, unpack it into `$(em-config CACHE)/ports/zlib/zlib-1.3.2`,
   and write the port URL to `ports/zlib/.emscripten_url`.
-- **Node:** use emsdk's Node 24; the system Node 22 lacks Memory64.
+- **Node:** use emsdk's Node 24; the system Node 22 lacks Memory64. (On the
+  user's Mac, Homebrew Node 26 also works.)
+- **User's Mac:** emsdk is at `~/emsdk`; the Node test build is `out/web-node`
+  (`LIBERTY_WEB_NODERAWFS=ON`) and the browser build `out/web`; the game is
+  installed in `~/.local/share/LibertyRecomp/game`. Dawn's npm package lives in a
+  session scratchpad (`.../4f80a7c2-.../scratchpad/npm`); reinstall with
+  `npm install webgpu ws` if it is gone. A relink of `out/web-node` takes ~1.5 min.
 - **Timing:** a full rebuild is about 7 minutes (generated code); a relink alone is about 1.5–6 minutes.
 - **Submodule status:** the patched FFmpeg/libmspack submodules show as
   modified. That is expected; never commit them. This clone sets
@@ -138,8 +175,12 @@ VK_ICD_FILENAMES=/opt/pw-browsers/chromium-1194/chrome-linux/vk_swiftshader_icd.
 XDG_DATA_HOME=<data> node out/web/LibertyRecomp/LibertyRecomp.js --diagnostics=true \
   --webgpu_frame_dump_path=<dir>/f --webgpu_frame_dump_interval=120
 # frames are PAM images (header + raw RGBA; convert with a few lines of Python
-# to view them); --webgpu_trace_frame=N logs every command of frame N.
-# Gameplay starts after roughly 2500-4200 presented frames on SwiftShader.
+# to view them); --webgpu_trace_frame=N logs every command of frame N (with
+# --log_level=info): decoded vertex inputs, nonzero pixel constants, bound
+# textures, resolves and render-phase markers, and dumps that frame too.
+# N and dump names are the title's submitted frame numbers.
+# Gameplay starts after roughly 2500-4200 presented frames on SwiftShader. With
+# Dawn on Metal and 60 fps pacing the intro starts around frame 5000-6000.
 ```
 
 ## Known gaps
@@ -164,7 +205,6 @@ XDG_DATA_HOME=<data> node out/web/LibertyRecomp/LibertyRecomp.js --diagnostics=t
   140 ms per pipeline on Metal).
 - Chrome's audio fails: SDL3's audio callback throws `Cannot mix BigInt and
   other types` in `CPtrToHeap32Index` (a wasm64 bug in SDL's JavaScript).
-- Frames are not paced: loading screens present 400–4000 frames a second.
 - The shader archive is zlib (12 MB); zstd would be 4.7 MB but needs a wasm zstd.
 - The `0x90000000` view does not mirror `0x80000000` on the web.
 - Guest FP rounding and flush modes are recorded but not applied.
