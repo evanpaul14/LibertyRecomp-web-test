@@ -14,6 +14,9 @@
 REXCVAR_DEFINE_BOOL(webgpu_perf_report, false, "GPU/Diagnostics",
                     "Web build: time the renderer's stages and log timing reports as "
                     "warnings every 5 s (shown with --log_level=warn)");
+REXCVAR_DEFINE_BOOL(webgpu_gpu_timing, false, "GPU/Diagnostics",
+                    "Web build: time each render pass on the GPU with timestamp queries and "
+                    "report the costliest with --webgpu_perf_report");
 REXCVAR_DEFINE_DOUBLE(webgpu_shader_warmup_ms, 4.0, "GPU",
                       "Web build: render-thread time per frame spent creating shader modules "
                       "for registered shaders ahead of their first draw (0: create on first use)");
@@ -232,6 +235,13 @@ void Renderer::Initialize(std::function<void(bool, const std::string&)> done) {
                              wgpu::FeatureName::Float32Blendable}) {
           if (adapter.HasFeature(feature)) features.push_back(feature);
         }
+        if (REXCVAR_GET(webgpu_gpu_timing)) {
+          if (adapter.HasFeature(wgpu::FeatureName::TimestampQuery))
+            features.push_back(wgpu::FeatureName::TimestampQuery);
+          else
+            REXLOG_WARN("gta4-webgpu: --webgpu_gpu_timing needs timestamp-query, which the "
+                        "adapter lacks");
+        }
         const auto has = [&](wgpu::FeatureName feature) {
           return std::find(features.begin(), features.end(), feature) != features.end();
         };
@@ -353,6 +363,21 @@ void Renderer::State::InitializeDevice() {
   fallback_sampler = device.CreateSampler(&sampler);
   sampler.minFilter = sampler.magFilter = wgpu::FilterMode::Linear;
   linear_sampler = device.CreateSampler(&sampler);
+
+  if (device.HasFeature(wgpu::FeatureName::TimestampQuery)) {
+    wgpu::QuerySetDescriptor queries{};
+    queries.type = wgpu::QueryType::Timestamp;
+    queries.count = kMaximumPassTimers * 2;
+    timestamp_queries = device.CreateQuerySet(&queries);
+    for (auto& slot : timer_readbacks) {
+      wgpu::BufferDescriptor buffer{};
+      buffer.size = kMaximumPassTimers * 2 * sizeof(uint64_t);
+      buffer.usage = wgpu::BufferUsage::QueryResolve | wgpu::BufferUsage::CopySrc;
+      slot.resolve = device.CreateBuffer(&buffer);
+      buffer.usage = wgpu::BufferUsage::MapRead | wgpu::BufferUsage::CopyDst;
+      slot.readback = device.CreateBuffer(&buffer);
+    }
+  }
 }
 
 bool Renderer::State::Begin(std::string& error) {
@@ -369,13 +394,16 @@ void Renderer::State::EndPass() {
     pass.End();
     pass = nullptr;
   }
+  title_pass_timed = false;
   pass_targets = {};
   pass_state = {};
 }
 
 uint8_t* Renderer::State::ReserveUniforms(uint64_t size, uint64_t& offset, std::string& error,
                                           uint64_t alignment) {
-  const auto aligned = [&] { return (uniforms.used + alignment - 1) & ~(alignment - 1); };
+  const auto aligned = [&] {
+    return (std::max(uniforms.used, kUniformArenaStart) + alignment - 1) & ~(alignment - 1);
+  };
   if (!UniformSpace(aligned() - uniforms.used + size, error)) return nullptr;
   offset = aligned();
   uniforms.used = offset + ((size + kUniformRegisterBytes - 1) & ~uint64_t(kUniformRegisterBytes - 1));
@@ -417,6 +445,7 @@ void Renderer::State::ApplyDeviceDelta(const DeviceDelta& delta) {
   constexpr uint32_t kFirstVertexChunk = 0x780 / kDeviceChunkBytes;
   constexpr uint32_t kFirstPixelChunk = 0x1780 / kDeviceChunkBytes;
   constexpr uint32_t kEndPixelChunk = (0x1780 + 0xE00) / kDeviceChunkBytes;
+  static_assert(kUniformHotBytes % kDeviceChunkBytes == 0);
   static_assert(0x780 % kDeviceChunkBytes == 0 && 0x1780 % kDeviceChunkBytes == 0 &&
                 (0x1780 + 0xE00) % kDeviceChunkBytes == 0);
   const uint8_t* source = delta.bytes.data();
@@ -424,8 +453,13 @@ void Renderer::State::ApplyDeviceDelta(const DeviceDelta& delta) {
     if (!(delta.chunks[chunk / 32] & (1u << (chunk % 32)))) continue;
     std::memcpy(block.data() + size_t(chunk) * kDeviceChunkBytes, source, kDeviceChunkBytes);
     source += kDeviceChunkBytes;
-    if (chunk >= kFirstVertexChunk && chunk < kFirstPixelChunk) ++vertex_constants_serial;
-    if (chunk >= kFirstPixelChunk && chunk < kEndPixelChunk) ++pixel_constants_serial;
+    constexpr uint32_t kHotChunks = kUniformHotBytes / kDeviceChunkBytes;
+    if (chunk >= kFirstVertexChunk && chunk < kFirstPixelChunk)
+      ++constants_serial[chunk < kFirstVertexChunk + kHotChunks ? kVertexHot : kVertexCold];
+    if (chunk >= kFirstPixelChunk && chunk < kEndPixelChunk)
+      ++constants_serial[chunk < kFirstPixelChunk + kHotChunks ? kPixelHot : kPixelCold];
+    if (chunk >= kFirstVertexChunk && chunk < kEndPixelChunk && REXCVAR_GET(webgpu_perf_report))
+      ++timing.constant_chunks[chunk - kFirstVertexChunk];
   }
 }
 
@@ -459,8 +493,8 @@ uint64_t Renderer::State::PushGeometry(std::span<const uint8_t> bytes, std::stri
 bool Renderer::State::Flush(std::string& error) {
   EndPass();
   ++batches;
-  last_uniforms.vertex = last_uniforms.pixel = last_uniforms.shared = UINT64_MAX;
-  last_uniforms.record = UINT64_MAX;
+  last_uniforms.parts.fill(UINT64_MAX);
+  last_uniforms.shared = last_uniforms.record = UINT64_MAX;
   if (!encoder) return true;
   ScopedTimer timer(timing.submit_ms);
   // Arena writes are ordered before the command buffer that reads them.
@@ -471,6 +505,7 @@ bool Renderer::State::Flush(std::string& error) {
   auto commands = encoder.Finish();
   encoder = nullptr;
   queue.Submit(1, &commands);
+  if (pending_timer_readback >= 0) MapPassTimers();
   (void)error;
   return true;
 }
@@ -505,6 +540,10 @@ bool Renderer::State::BeginPass(const Targets& targets, std::string& error) {
     depth.stencilClearValue = 0;
     targets.depth->initialized = true;
     descriptor.depthStencilAttachment = &depth;
+  }
+  if (timestamp_queries) {
+    descriptor.timestampWrites = TimePass(TargetsLabel(targets));
+    title_pass_timed = descriptor.timestampWrites != nullptr;
   }
   pass = encoder.BeginRenderPass(&descriptor);
   pass_targets = targets;
@@ -708,6 +747,8 @@ bool Renderer::State::UtilityPass(const std::string& name, wgpu::TextureView tar
     descriptor.colorAttachmentCount = 1;
     descriptor.colorAttachments = &color;
   }
+  if (timestamp_queries)
+    descriptor.timestampWrites = TimePass(fmt::format("{} {}x{}", name, width, height));
   auto encoder_pass = encoder.BeginRenderPass(&descriptor);
   encoder_pass.SetPipeline(pipeline);
   const uint32_t dynamic_offset = uint32_t(offset);

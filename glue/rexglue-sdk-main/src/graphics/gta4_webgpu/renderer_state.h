@@ -27,6 +27,7 @@
 #include "shader_archive.h"
 
 REXCVAR_DECLARE(bool, webgpu_perf_report);
+REXCVAR_DECLARE(bool, webgpu_gpu_timing);
 
 namespace rex::graphics::gta4_webgpu {
 
@@ -103,6 +104,9 @@ struct Targets {
     return !other.depth || other.depth == depth;
   }
 };
+// Render passes timed per frame with --webgpu_gpu_timing (two queries each).
+inline constexpr uint32_t kMaximumPassTimers = 1024;
+
 // DrawPipeline's `used`: bits 0-3 for the color targets a draw writes, and
 // this one when it tests or writes depth or stencil.
 inline constexpr uint32_t kUsesDepth = 1u << 4;
@@ -255,6 +259,14 @@ struct Renderer::State {
   // Follows the frame just submitted on the GPU; kPending while too many
   // frames are unfinished there.
   Status TrackGpuFrame();
+  // --webgpu_gpu_timing: the timestamp writes for a new render pass (null
+  // when timing is off or the frame's queries are used up).
+  const wgpu::PassTimestampWrites* TimePass(std::string label);
+  std::string TargetsLabel(const Targets& targets) const;
+  // Copies the frame's timestamps to a readback buffer, mapped after the
+  // next submit (MapPassTimers) and added to `timing.gpu_passes`.
+  void ResolvePassTimers(std::string& error);
+  void MapPassTimers();
   Status Readback(const Work& work, std::string& error);
 
   memory::Memory* memory;
@@ -300,15 +312,17 @@ struct Renderer::State {
   // The uniform slots most recently written in this batch (UINT64_MAX:
   // none). A draw uses them again while their inputs are unchanged: the
   // device's constants (by serial) or the shared constants (by value). The
-  // draw record holding them is reused while all three are.
+  // draw record holding them is reused while all of them are.
   struct LastUniforms {
     uint32_t device = 0;
-    uint64_t vertex = UINT64_MAX, pixel = UINT64_MAX, shared = UINT64_MAX;
-    uint64_t vertex_serial = 0, pixel_serial = 0;
+    // By ConstantPart.
+    std::array<uint64_t, 4> parts{UINT64_MAX, UINT64_MAX, UINT64_MAX, UINT64_MAX};
+    std::array<uint64_t, 4> serials{};
+    uint64_t shared = UINT64_MAX;
     uint32_t specialization = 0;
     gta4_native::core::SharedConstants constants{};
     uint64_t record = UINT64_MAX;
-    std::array<uint32_t, 4> record_registers{};
+    std::array<uint32_t, 8> record_registers{};
   } last_uniforms;
   // Group 0 of title pipelines: the uniform arena as one storage buffer.
   wgpu::BindGroupLayout constants_layout;
@@ -364,8 +378,9 @@ struct Renderer::State {
   // Title state carried by commands.
   // Guest device blocks by address, kept current from each draw's delta.
   std::unordered_map<uint32_t, std::vector<uint8_t>> devices;
-  // Bumped when a delta changes the vertex or pixel constants.
-  uint64_t vertex_constants_serial = 0, pixel_constants_serial = 0;
+  // Bumped when a delta changes that part of the vertex or pixel constants.
+  enum ConstantPart : uint32_t { kVertexHot, kVertexCold, kPixelHot, kPixelCold };
+  std::array<uint64_t, 4> constants_serial{};
   std::unordered_map<uint32_t, const ShaderRecord*> shaders;
   std::unordered_map<uint32_t, std::vector<gta4_native::VertexElement>> declarations;
   struct Stream {
@@ -427,9 +442,13 @@ struct Renderer::State {
     double pipeline_latency_ms = 0, pipeline_latency_max_ms = 0;
     uint32_t warmed_modules = 0;
     double warmup_ms = 0;
-    // New uniform slots written: vertex constants, pixel constants, shared.
-    uint32_t vertex_slots = 0, pixel_slots = 0, shared_slots = 0;
+    // New uniform slots written, by ConstantPart, and shared.
+    std::array<uint32_t, 4> part_slots{};
+    uint32_t shared_slots = 0;
     uint32_t redrawn = 0;  // Draws set up again after a flush interrupted them.
+    // Device deltas that changed each 128-byte chunk of the vertex (0-31)
+    // and pixel (32-59) constants.
+    std::array<uint32_t, 60> constant_chunks{};
     // Render pass calls: pipelines, bind groups, vertex and index buffers,
     // fixed state (viewport, scissor, stencil reference, blend constant).
     uint32_t set_pipeline = 0, set_group = 0, set_vertex = 0, set_index = 0, set_state = 0;
@@ -446,7 +465,36 @@ struct Renderer::State {
     // the GPU to finish an earlier frame.
     double gpu_latency_ms = 0, gpu_latency_max_ms = 0;
     uint32_t gpu_frames = 0, gpu_waits = 0;
+    // --webgpu_gpu_timing: GPU time of render passes by label, and per frame
+    // the sum of pass times and the span from the first pass's start to the
+    // last one's end.
+    struct GpuPass {
+      double ms = 0, max_ms = 0;
+      uint32_t passes = 0, draws = 0;
+      uint64_t pixel_shader = 0;  // The costliest pass's first.
+    };
+    std::unordered_map<std::string, GpuPass> gpu_passes;
+    double gpu_pass_ms = 0, gpu_span_ms = 0, gpu_idle_ms = 0, gpu_frame_gap_ms = 0;
+    uint32_t gpu_timed_frames = 0, gpu_timer_drops = 0;
   } timing;
+  // --webgpu_gpu_timing state: this frame's timed passes in query order.
+  struct PassTimer {
+    std::string label;
+    uint32_t draws = 0;
+    uint64_t pixel_shader = 0;
+  };
+  wgpu::QuerySet timestamp_queries;
+  wgpu::PassTimestampWrites timestamp_writes{};
+  std::vector<PassTimer> pass_timers;
+  bool title_pass_timed = false;  // The open title pass is pass_timers.back().
+  struct TimerReadback {
+    wgpu::Buffer resolve, readback;
+    bool busy = false;
+  };
+  std::array<TimerReadback, 4> timer_readbacks;
+  int pending_timer_readback = -1;
+  uint64_t gpu_last_frame_end = 0;  // GPU timestamp of the last timed frame's end.
+  std::vector<PassTimer> pending_timer_passes;
   // The frontbuffer last shown, to tell a frozen picture from a frozen source.
   const TextureResource* presented_source = nullptr;
   uint64_t presented_serial = 0;

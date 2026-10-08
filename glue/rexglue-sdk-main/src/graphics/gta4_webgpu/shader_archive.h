@@ -29,15 +29,22 @@ struct ShaderRecord {
 };
 
 // Group 0 is one read-only storage buffer of 16-byte registers: the
-// renderer's whole uniform arena (tools/webgpu/draw_constants.py). It holds
-// slots of vertex constants (256 registers), pixel constants (256 registers,
-// of which the title sets 224) and shared constants (with the specialization
-// word in their last register), and a draw record per draw: the register
-// index of its three slots. A draw passes its record's register index as
-// firstInstance; the vertex shader reads it with instance_index and hands it
-// to the pixel shader in a flat varying, so no bind group changes per draw.
-inline constexpr uint32_t kUniformVertexBytes = 4096;
-inline constexpr uint32_t kUniformPixelBytes = 4096;
+// renderer's whole uniform arena (tools/webgpu/draw_constants.py and
+// hot_constants.py). It holds slots of each stage's hot constants (registers
+// 0-15, which the title rewrites on almost every draw), its cold constants
+// (registers 16-255; the title sets pixel registers up to 223) and shared
+// constants (with the specialization word in their last register). A shader
+// reads register r at hot + r below 16 and at cold + r above, so a cold slot's
+// index is 16 below its first register. Each draw has a record of two
+// registers, (hot, cold, shared, 0) for the vertex stage and then for the
+// pixel stage. A draw passes its record's register index as firstInstance;
+// the vertex shader reads it with instance_index and hands the pixel stage's
+// half to the pixel shader in a flat varying, so no bind group changes per draw.
+inline constexpr uint32_t kUniformStageBytes = 4096;  // 256 registers.
+inline constexpr uint32_t kUniformHotBytes = 16 * 16;
+inline constexpr uint32_t kUniformColdBytes = kUniformStageBytes - kUniformHotBytes;
+// Below this the arena is unused, so every cold slot's index is valid.
+inline constexpr uint64_t kUniformArenaStart = kUniformHotBytes;
 inline constexpr uint32_t kUniformSharedBytes = 81 * 16;
 inline constexpr uint32_t kUniformSpecializationOffset = 0x500;  // In the shared slot.
 inline constexpr uint32_t kUniformRegisterBytes = 16;

@@ -18,7 +18,8 @@ Both are rewritten here, on the GLSL that SPIRV-Cross produces:
   byte offset into it, and `.value` becomes a typed load. The final WGSL then
   splits it into one part per block (split_uniforms.py), so the renderer can
   reuse each block on its own, and reads the parts from one storage buffer
-  at register indices given by a per-draw record (draw_constants.py).
+  at register indices given by a per-draw record (draw_constants.py), with
+  each stage's hot registers in a slot of their own (hot_constants.py).
 * Every bindless index is a load from a constant shared-constants offset, so
   each one resolves to a fixed texture or sampler slot:
   @group(1) @binding(slot) for textures, @binding(32 + slot) for samplers.
@@ -45,6 +46,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 from spirv_patch import scalarize_sample_mask  # noqa: E402
 from split_uniforms import RewriteError, rewrite as split_uniforms  # noqa: E402
 from draw_constants import rewrite as draw_constants  # noqa: E402
+from hot_constants import rewrite as hot_constants  # noqa: E402
 
 BLOCK_STRIDE = 4096
 UNIFORM_WORDS = (3 * BLOCK_STRIDE) // 16  # uvec4 registers
@@ -467,7 +469,7 @@ def convert_one(spv: Path, stage: str, work: Path) -> tuple[str, dict]:
 
 def finish_wgsl_file(path: Path) -> str:
     try:
-        code = draw_constants(split_uniforms(finish_wgsl(path.read_text())))
+        code = hot_constants(draw_constants(split_uniforms(finish_wgsl(path.read_text()))))
     except RewriteError as e:
         raise ConversionError(f"uniform split: {e}") from e
     path.write_text(code)
@@ -528,13 +530,13 @@ def main() -> int:
     return 0 if not failures else 1
 
 
-# Archive (zlib-compressed): "LRWGSL04", u32 count, then per record (little-endian):
+# Archive (zlib-compressed): "LRWGSL05", u32 count, then per record (little-endian):
 #   u64 hash, u32 stage (0 pixel, 1 vertex), u32 variant (0 early, 1 late),
 #   u32 texture mask, u32 cube mask, u32 sampler mask, u32 spec mask,
 #   u32 color output mask, u32 attribute count, u8 semantic location per
 #   attribute (WGSL @location(i) reads semantic attributes[i]), padding to
 #   four bytes, u32 WGSL length, WGSL bytes, padding to four bytes.
-MAGIC = b"LRWGSL04"
+MAGIC = b"LRWGSL05"
 
 
 def write_archive(path: Path, results: dict) -> None:

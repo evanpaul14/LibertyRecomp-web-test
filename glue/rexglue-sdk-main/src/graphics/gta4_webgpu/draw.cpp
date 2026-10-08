@@ -40,7 +40,7 @@ constexpr uint32_t kDeviceFetchConstants = 0x480;
 constexpr uint32_t kDeviceVertexConstants = 0x780;
 constexpr uint32_t kDevicePixelConstants = 0x1780;
 constexpr uint32_t kPixelConstantBytes = 0xE00;
-static_assert(kPixelConstantBytes <= kUniformPixelBytes);
+static_assert(kPixelConstantBytes <= kUniformStageBytes && kPixelConstantBytes > kUniformHotBytes);
 static_assert(sizeof(core::SharedConstants) <= kUniformSpecializationOffset);
 static_assert(kUniformSpecializationOffset + 4 <= kUniformSharedBytes);
 static_assert(kUniformSharedBytes <= 1536);
@@ -549,8 +549,8 @@ bool Renderer::State::Draw(const Work& work, std::string& error, bool retry) {
   // Room for this draw's uniform slots first: a flush between pushing its
   // geometry (below) and choosing its slots would submit them with the old
   // batch, and flushing later forgets slots it already chose.
-  if (!UniformSpace(kUniformVertexBytes + kUniformPixelBytes + kUniformSharedBytes +
-                        kUniformRegisterBytes,
+  if (!UniformSpace(kUniformArenaStart + 2 * kUniformStageBytes + kUniformSharedBytes +
+                        2 * kUniformRegisterBytes,
                     error))
     return false;
 
@@ -891,24 +891,29 @@ bool Renderer::State::Draw(const Work& work, std::string& error, bool retry) {
   std::optional<ScopedTimer> uniform_timer(std::in_place, timing.uniform_ms);
   auto& last = last_uniforms;
   if (last.device != work.device.device) {
-    last.vertex = last.pixel = UINT64_MAX;
+    last.parts.fill(UINT64_MAX);
     last.device = work.device.device;
   }
-  if (last.vertex == UINT64_MAX || last.vertex_serial != vertex_constants_serial) {
-    uint8_t* slot = ReserveUniforms(kUniformVertexBytes, last.vertex, error);
+  // Hot and cold parts of each stage's registers (see shader_archive.h).
+  const auto part = [&](ConstantPart index, uint32_t source, uint32_t size, uint32_t bytes) {
+    if (last.parts[index] != UINT64_MAX && last.serials[index] == constants_serial[index])
+      return true;
+    uint8_t* slot = ReserveUniforms(size, last.parts[index], error);
     if (!slot) return false;
-    CopySwap32(slot, guest.data() + kDeviceVertexConstants, kUniformVertexBytes);
-    last.vertex_serial = vertex_constants_serial;
-    ++timing.vertex_slots;
-  }
-  if (pixel && (last.pixel == UINT64_MAX || last.pixel_serial != pixel_constants_serial)) {
-    uint8_t* slot = ReserveUniforms(kUniformPixelBytes, last.pixel, error);
-    if (!slot) return false;
-    CopySwap32(slot, guest.data() + kDevicePixelConstants, kPixelConstantBytes);
-    std::memset(slot + kPixelConstantBytes, 0, kUniformPixelBytes - kPixelConstantBytes);
-    last.pixel_serial = pixel_constants_serial;
-    ++timing.pixel_slots;
-  }
+    CopySwap32(slot, guest.data() + source, bytes);
+    if (bytes < size) std::memset(slot + bytes, 0, size - bytes);
+    last.serials[index] = constants_serial[index];
+    ++timing.part_slots[index];
+    return true;
+  };
+  if (!part(kVertexHot, kDeviceVertexConstants, kUniformHotBytes, kUniformHotBytes) ||
+      !part(kVertexCold, kDeviceVertexConstants + kUniformHotBytes, kUniformColdBytes,
+            kUniformColdBytes))
+    return false;
+  if (pixel && (!part(kPixelHot, kDevicePixelConstants, kUniformHotBytes, kUniformHotBytes) ||
+                !part(kPixelCold, kDevicePixelConstants + kUniformHotBytes, kUniformColdBytes,
+                      kPixelConstantBytes - kUniformHotBytes)))
+    return false;
   if (last.shared == UINT64_MAX || last.specialization != specialization ||
       !BytesEqual(&last.constants, &shared, sizeof(shared))) {
     uint8_t* slot = ReserveUniforms(kUniformSharedBytes, last.shared, error);
@@ -920,12 +925,21 @@ bool Renderer::State::Draw(const Work& work, std::string& error, bool retry) {
     last.constants = shared;
     ++timing.shared_slots;
   }
-  // The draw record: register indices of the three slots, selected by
-  // firstInstance. Without a pixel shader the pixel slot is unread.
-  const std::array<uint32_t, 4> registers{
-      uint32_t(last.vertex / kUniformRegisterBytes),
-      uint32_t((pixel ? last.pixel : last.vertex) / kUniformRegisterBytes),
-      uint32_t(last.shared / kUniformRegisterBytes), 0};
+  // The draw record, selected by firstInstance: register indices of each
+  // stage's hot, cold and shared slots. Without a pixel shader its half is
+  // unread.
+  constexpr uint32_t kHotRegisters = kUniformHotBytes / kUniformRegisterBytes;
+  const auto hot = [&](ConstantPart index) {
+    return uint32_t(last.parts[index] / kUniformRegisterBytes);
+  };
+  const auto cold = [&](ConstantPart index) {
+    return uint32_t(last.parts[index] / kUniformRegisterBytes) - kHotRegisters;
+  };
+  const uint32_t shared_register = uint32_t(last.shared / kUniformRegisterBytes);
+  const std::array<uint32_t, 8> registers{
+      hot(kVertexHot), cold(kVertexCold), shared_register, 0,
+      pixel ? hot(kPixelHot) : hot(kVertexHot), pixel ? cold(kPixelCold) : cold(kVertexCold),
+      shared_register, 0};
   if (last.record == UINT64_MAX || last.record_registers != registers) {
     uint8_t* record = ReserveUniforms(sizeof(registers), last.record, error);
     if (!record) return false;
@@ -943,7 +957,8 @@ bool Renderer::State::Draw(const Work& work, std::string& error, bool retry) {
                               streams[inputs->streams[0].stream].offset + inputs->streams[0].elements[0]->offset,
                           position);
     float c0[4];
-    std::memcpy(c0, uniforms.bytes.data() + last_uniforms.vertex + 208 * 16, sizeof(c0));
+    std::memcpy(c0, uniforms.bytes.data() + last_uniforms.parts[kVertexCold] + (208 - 16) * 16,
+                sizeof(c0));
     if (up && !work.up_vertices.empty() && !inputs->streams.empty())
       DecodeVertexElement(inputs->streams[0].elements[0]->type,
                           work.up_vertices.data() + inputs->streams[0].elements[0]->offset, position);
@@ -985,7 +1000,9 @@ bool Renderer::State::Draw(const Work& work, std::string& error, bool retry) {
     if (pixel) {
       for (uint32_t i = 0; i < kPixelConstantBytes / 16; ++i) {
         float value[4];
-        std::memcpy(value, uniforms.bytes.data() + last_uniforms.pixel + i * 16, sizeof(value));
+        const uint64_t at = i < 16 ? last_uniforms.parts[kPixelHot] + i * 16
+                                   : last_uniforms.parts[kPixelCold] + (i - 16) * 16;
+        std::memcpy(value, uniforms.bytes.data() + at, sizeof(value));
         if (value[0] || value[1] || value[2] || value[3])
           detail += fmt::format(" c{}={},{},{},{}", i, value[0], value[1], value[2], value[3]);
       }
@@ -1079,6 +1096,11 @@ bool Renderer::State::Draw(const Work& work, std::string& error, bool retry) {
     if (targets.colors[i]) targets.colors[i]->content_serial = ++content_serial;
   if (targets.depth && ((fixed.depth_enable && fixed.depth_write_enable) || fixed.stencil_enable))
     targets.depth->content_serial = ++content_serial;
+  if (title_pass_timed) {
+    auto& timer = pass_timers.back();
+    ++timer.draws;
+    if (!timer.pixel_shader && pixel) timer.pixel_shader = pixel->hash;
+  }
   ++draws;
   ++frame_draws;
   ++stats.draws;
@@ -1154,6 +1176,9 @@ bool Renderer::State::ClearSurface(const std::shared_ptr<SurfaceResource>& surfa
       descriptor.colorAttachmentCount = 1;
       descriptor.colorAttachments = &color_attachment;
     }
+    if (timestamp_queries)
+      descriptor.timestampWrites = TimePass(fmt::format(
+          "clear {} {}x{}", surface->depth ? "depth" : "color", surface->width, surface->height));
     encoder.BeginRenderPass(&descriptor).End();
   } else if (surface->depth) {
     if (aspects & 2u) {

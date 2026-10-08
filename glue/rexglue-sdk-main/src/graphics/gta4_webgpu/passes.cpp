@@ -376,7 +376,7 @@ Renderer::Status Renderer::State::Present(const Work& work, std::string& error) 
                       "{:.0f} max {:.0f} ms, {:.0f} draws a frame waited; warmed {} shader modules, {:.2f} ms a "
                       "frame, {} queued) textures={} ({} KB) "
                       "buffers={} ({} "
-                      "KB) groups={}; new uniform slots: vertex {} pixel {} shared {}; redrawn {}; calls per draw: "
+                      "KB) groups={}; new uniform slots: vertex {}+{} pixel {}+{} (hot+cold) shared {}; redrawn {}; calls per draw: "
                       "pipeline {:.2f}, group {:.2f}, vertex {:.2f}, index {:.2f}, state {:.2f}",
                       frames * 1000.0 / elapsed, timing.frames, timing.draws / frames,
                       timing.passes / frames,
@@ -394,8 +394,9 @@ Renderer::Status Renderer::State::Present(const Work& work, std::string& error) 
                       timing.warmed_modules, timing.warmup_ms / frames,
                       module_queue.size() + late_module_queue.size(),
                       timing.new_textures, timing.texture_bytes / 1024, timing.new_buffers,
-                      timing.buffer_bytes / 1024, timing.new_groups, timing.vertex_slots,
-                      timing.pixel_slots, timing.shared_slots, timing.redrawn,
+                      timing.buffer_bytes / 1024, timing.new_groups, timing.part_slots[kVertexHot],
+                      timing.part_slots[kVertexCold], timing.part_slots[kPixelHot],
+                      timing.part_slots[kPixelCold], timing.shared_slots, timing.redrawn,
                       timing.set_pipeline / draws, timing.set_group / draws,
                       timing.set_vertex / draws, timing.set_index / draws, timing.set_state / draws);
       WEBGPU_PERF_LOG("gta4-webgpu: presents shown={} new-content={} no-source={} no-canvas={} "
@@ -413,6 +414,35 @@ Renderer::Status Renderer::State::Present(const Work& work, std::string& error) 
                       timing.longest_ms, timing.longest_busy_ms, timing.longest_pipeline_ms,
                       timing.gpu_frames ? timing.gpu_latency_ms / timing.gpu_frames : 0.0,
                       timing.gpu_latency_max_ms, timing.gpu_waits);
+      {
+        std::string chunks;
+        for (size_t i = 0; i < timing.constant_chunks.size(); ++i)
+          chunks += fmt::format("{}{:.0f}", i == 0 ? "" : i == 32 ? " | " : " ",
+                                timing.constant_chunks[i] / frames);
+        WEBGPU_PERF_LOG("gta4-webgpu: constant chunk changes a frame (8 registers each; vertex | "
+                        "pixel): {}", chunks);
+      }
+      if (timing.gpu_timed_frames) {
+        const double timed = timing.gpu_timed_frames;
+        std::vector<std::pair<std::string, Timing::GpuPass>> passes(timing.gpu_passes.begin(),
+                                                                    timing.gpu_passes.end());
+        std::sort(passes.begin(), passes.end(),
+                  [](const auto& a, const auto& b) { return a.second.ms > b.second.ms; });
+        WEBGPU_PERF_LOG("gta4-webgpu: gpu passes {:.2f} ms a frame, idle between them {:.2f} "
+                        "(first start to last end {:.2f} ms), idle between frames {:.2f} ms; "
+                        "over {} timed frames, {} labels, {} frames not timed",
+                        timing.gpu_pass_ms / timed, timing.gpu_idle_ms / timed,
+                        timing.gpu_span_ms / timed, timing.gpu_frame_gap_ms / timed,
+                        timing.gpu_timed_frames, passes.size(), timing.gpu_timer_drops);
+        for (size_t i = 0; i < std::min<size_t>(passes.size(), 16); ++i) {
+          const auto& [label, pass] = passes[i];
+          WEBGPU_PERF_LOG("gta4-webgpu: gpu {:6.2f} ms a frame ({:4.1f}%), {:.1f} passes a frame, "
+                          "{:.0f} draws a pass, max {:.2f} ms (ps {:016X}): {}",
+                          pass.ms / timed, 100.0 * pass.ms / std::max(timing.gpu_pass_ms, 1e-9),
+                          pass.passes / timed, pass.passes ? double(pass.draws) / pass.passes : 0.0,
+                          pass.max_ms, pass.pixel_shader, label);
+        }
+      }
     }
     timing = {};
     timing.start_ms = now;
@@ -429,6 +459,7 @@ Renderer::Status Renderer::State::Present(const Work& work, std::string& error) 
     PresentToCanvas(*source, error);
   else
     ++timing.no_source;
+  ResolvePassTimers(error);
   const std::string dump_path = REXCVAR_GET(webgpu_frame_dump_path);
   const uint32_t interval = std::max(1u, REXCVAR_GET(webgpu_frame_dump_interval));
   // The traced frame is always dumped, so its picture matches its trace.
@@ -524,6 +555,113 @@ Renderer::Status Renderer::State::TrackGpuFrame() {
   gpu_waiting = true;
   ++timing.gpu_waits;
   return Status::kPending;
+}
+
+const wgpu::PassTimestampWrites* Renderer::State::TimePass(std::string label) {
+  if (!timestamp_queries) return nullptr;
+  if (pass_timers.size() >= kMaximumPassTimers) return nullptr;
+  const uint32_t index = uint32_t(pass_timers.size());
+  pass_timers.push_back({std::move(label)});
+  timestamp_writes = {};
+  timestamp_writes.querySet = timestamp_queries;
+  timestamp_writes.beginningOfPassWriteIndex = index * 2;
+  timestamp_writes.endOfPassWriteIndex = index * 2 + 1;
+  return &timestamp_writes;
+}
+
+std::string Renderer::State::TargetsLabel(const Targets& targets) const {
+  const auto name = [](wgpu::TextureFormat format) -> std::string_view {
+    switch (format) {
+      case wgpu::TextureFormat::RGBA8Unorm: return "rgba8";
+      case wgpu::TextureFormat::RGBA16Float: return "rgba16f";
+      case wgpu::TextureFormat::R32Float: return "r32f";
+      case wgpu::TextureFormat::RG16Float: return "rg16f";
+      case wgpu::TextureFormat::Depth32FloatStencil8: return "d32s8";
+      case wgpu::TextureFormat::Depth24PlusStencil8: return "d24s8";
+      default: return "?";
+    }
+  };
+  std::string label = fmt::format("title {}x{}", targets.width, targets.height);
+  for (uint32_t i = 0; i < kRenderTargetCount; ++i)
+    if (const auto& color = targets.colors[i])
+      label += fmt::format(" c{}={:08X}/{}", i, color->descriptor.handle, name(color->format));
+  if (targets.depth)
+    label += fmt::format(" d={:08X}/{}", targets.depth->descriptor.handle, name(targets.depth->format));
+  return label;
+}
+
+void Renderer::State::ResolvePassTimers(std::string& error) {
+  if (pass_timers.empty()) return;
+  int free_slot = -1;
+  for (size_t i = 0; i < timer_readbacks.size(); ++i)
+    if (!timer_readbacks[i].busy && int(i) != pending_timer_readback) free_slot = int(i);
+  if (free_slot < 0 || pending_timer_readback >= 0) {
+    ++timing.gpu_timer_drops;
+    pass_timers.clear();
+    return;
+  }
+  EndPass();
+  if (!Begin(error)) return;
+  auto& slot = timer_readbacks[free_slot];
+  const uint32_t queries = uint32_t(pass_timers.size()) * 2;
+  encoder.ResolveQuerySet(timestamp_queries, 0, queries, slot.resolve, 0);
+  encoder.CopyBufferToBuffer(slot.resolve, 0, slot.readback, 0, queries * sizeof(uint64_t));
+  slot.busy = true;
+  pending_timer_readback = free_slot;
+  pending_timer_passes = std::move(pass_timers);
+  pass_timers.clear();
+}
+
+void Renderer::State::MapPassTimers() {
+  auto& slot = timer_readbacks[pending_timer_readback];
+  pending_timer_readback = -1;
+  auto passes = std::move(pending_timer_passes);
+  pending_timer_passes.clear();
+  const uint64_t bytes = passes.size() * 2 * sizeof(uint64_t);
+  slot.readback.MapAsync(
+      wgpu::MapMode::Read, 0, bytes, wgpu::CallbackMode::AllowSpontaneous,
+      [this, &slot, passes = std::move(passes), bytes](wgpu::MapAsyncStatus status,
+                                                       wgpu::StringView) {
+        if (status == wgpu::MapAsyncStatus::Success) {
+          const auto* stamps = static_cast<const uint64_t*>(slot.readback.GetConstMappedRange(0, bytes));
+          // The GPU overlaps neighboring passes, so each pass is charged
+          // only for how far it moved the end of the timeline; time with no
+          // pass running is idle.
+          uint64_t first = UINT64_MAX, cursor = 0;
+          double total = 0, idle = 0;
+          for (size_t i = 0; i < passes.size(); ++i) {
+            const uint64_t begin = stamps[i * 2], end = stamps[i * 2 + 1];
+            if (!begin || end < begin) continue;
+            if (first == UINT64_MAX) {
+              if (gpu_last_frame_end && begin > gpu_last_frame_end)
+                timing.gpu_frame_gap_ms += double(begin - gpu_last_frame_end) / 1e6;
+              first = cursor = begin;
+            }
+            if (begin > cursor) idle += double(begin - cursor) / 1e6;
+            const double ms = end > std::max(begin, cursor)
+                                  ? double(end - std::max(begin, cursor)) / 1e6 : 0.0;
+            cursor = std::max(cursor, end);
+            total += ms;
+            auto& entry = timing.gpu_passes[passes[i].label];
+            entry.ms += ms;
+            ++entry.passes;
+            entry.draws += passes[i].draws;
+            if (ms > entry.max_ms) {
+              entry.max_ms = ms;
+              entry.pixel_shader = passes[i].pixel_shader;
+            }
+          }
+          timing.gpu_pass_ms += total;
+          timing.gpu_idle_ms += idle;
+          if (first != UINT64_MAX) {
+            timing.gpu_span_ms += double(cursor - first) / 1e6;
+            gpu_last_frame_end = cursor;
+          }
+          ++timing.gpu_timed_frames;
+          slot.readback.Unmap();
+        }
+        slot.busy = false;
+      });
 }
 
 void Renderer::State::ReportPixelProbes(std::string& error) {

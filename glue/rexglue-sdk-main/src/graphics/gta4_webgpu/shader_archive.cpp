@@ -12,7 +12,7 @@ namespace {
 constexpr uint8_t kArchive[] = {
 #embed GTA4_WEBGPU_SHADER_ARCHIVE
 };
-constexpr char kMagic[8] = {'L', 'R', 'W', 'G', 'S', 'L', '0', '4'};
+constexpr char kMagic[8] = {'L', 'R', 'W', 'G', 'S', 'L', '0', '5'};
 
 class Reader {
  public:
