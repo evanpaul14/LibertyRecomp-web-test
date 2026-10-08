@@ -181,8 +181,8 @@ mapped); this file is for whoever continues the work.
     order (never instantiated before; fixed).
   Result (Node + Dawn on Metal, same intro): the heaviest stretch now holds
   938 of 938 frames per 5 s with the mixer thread ~40% idle; renderer fps
-  unchanged (13–19 fps there). **Not rechecked in Chrome yet** (the browser
-  extension was not connected): run with `?arg=--diagnostics=true&arg=--diagnostics_categories=logging&arg=--log_level=warn&arg=--audio_perf_report=true`,
+  unchanged (13–19 fps there). Confirmed in Chrome, except while pipelines
+  compile (see Chrome recheck 2026-10-08 below). To check: run with `?arg=--diagnostics=true&arg=--diagnostics_categories=logging&arg=--log_level=warn&arg=--audio_perf_report=true`,
   click the page so audio starts, and look for `audio:` underrun lines (logged
   only when underruns happen) and `audio mixer:` lines near 938 frames.
 - **Constants by `firstInstance` (2026-10-08).** The per-draw uniform
@@ -202,10 +202,10 @@ mapped); this file is for whoever continues the work.
   3.0 → 2.15 µs a draw, render thread 7.55 → 6.75 µs a draw, bind-group calls
   0.80 → 0.39 a draw (the rest are texture groups); the same closing shot
   (~5,870 draws) went from 14.0–14.5 to 15.0–15.7 fps. Frame dumps look the
-  same (skinned characters, credits, lighting). Not checked in Chrome yet,
-  where storage reads could cost GPU time on GPU-bound scenes (Apple GPUs
-  preload uniform buffers but not storage reads at dynamic indices); compare
-  heavy-scene GPU frame latency there.
+  same (skinned characters, credits, lighting). In Chrome, heavy-scene GPU
+  frame latency is about what it was before the change (see Chrome recheck
+  2026-10-08 below), so the storage reads (Apple GPUs preload uniform buffers
+  but not storage reads at dynamic indices) show no clear GPU cost.
 - **Shader archive regenerated from SPIR-V (2026-10-08).** The archive was
   rebuilt with the full pipeline on the user's Mac (naga-cli 30.0.1,
   SPIRV-Cross 2026-09-16 from Homebrew, glslang 16.3.0, SPIRV-Tools
@@ -219,8 +219,54 @@ mapped); this file is for whoever continues the work.
   15.1 fps, GPU frame latency 66.2 vs 67.6 ms in the heavy stretch (noise);
   frame dumps render correctly. Heavy scenes in Node are partly GPU-bound
   too: most presents there wait for the GPU (latency ~60–70 ms).
-- Next step candidates, in suggested order: recheck audio and the renderer in
-  Chrome, then a game-file picker. Ask the user.
+- **Chrome recheck (2026-10-08, build of 81d6c011: audio fixes, `firstInstance`
+  constants, regenerated archive).** Chrome 154 on the M1 Mac, game served by
+  `serve.py` on localhost, flags
+  `--diagnostics=true --diagnostics_categories=logging --log_level=warn
+  --audio_perf_report=true --webgpu_perf_report=true`, one click on the page
+  ~3–10 s in to start audio. Three runs:
+  1. *First run after the archive change* (the user's profile, a tab in the
+     extension's tab group): the opening cutscene ran its light first ~30 s
+     (300–960 draws, 22–30 passes) and then the game went straight to
+     gameplay on the docks; the heavy deck shots never appeared. During those
+     30 s, new pipelines took 1.4–4 s on average (max 5.7 s) with 28–90 draws
+     a frame waiting; the guest mixer made only 753–867 of 938 frames per 5 s
+     (9–11 underruns per 5 s) the whole time.
+  2. *Reload, same profile (warm shader cache):* the whole intro played (deck,
+     docks meeting with Roman, Roman's car, in-world credits; checked 3.5 min
+     in). Mixer at 931–958 frames per 5 s throughout, including the
+     ~8,800-draw shots; the only underruns (5–6 per 5 s) were during a 10 s
+     burst of pipeline compiles (latency up to 3.4 s even with the cache warm).
+  3. *Fresh Chrome profile (cold shader cache)*, driven over the DevTools
+     protocol from a script (fresh `--user-data-dir`, `--remote-debugging-port`,
+     console to a file, a screenshot every 10 s): compiles as slow as run 1
+     (1.6–2.5 s on average, max 5.3 s) and the mixer dropped to 619–689 frames
+     in three windows (10–22 underruns), yet the intro played through (the
+     user watched it). So slow compiles and a mixer shortfall alone do not
+     skip the intro; what did in run 1 is unknown. Not ruled out: the run-1
+     tab was in the extension's tab group, and the mixer stayed low for the
+     whole 25 s there instead of recovering between bursts. An idea not yet
+     tried: log the cutscene prepare/stop hooks in `gta4_transition_hooks.cpp`
+     (`sub_82526268`, `sub_82526058`, which today report only to the
+     file-based audio handoff trace) with their callers, and repeat cold
+     runs until one skips.
+  Renderer (run 2; no GPU errors, every present showed new content):
+
+  | Draws a frame | fps | GPU frame latency | Render thread per draw |
+  |---|---|---|---|
+  | 300–900 | 52–60 | 12–21 ms | ~11–12 µs |
+  | ~4,000 | 17–19 | 55–60 ms | ~8 µs |
+  | 7,600–8,800 | 10–12 | 85–100 ms | ~7.4 µs |
+
+  Heavy scenes are GPU-bound (nearly every present waits for the GPU). The
+  2026-10-07 Chrome recheck (before `firstInstance`) had 4,000–5,400-draw
+  scenes at 13–18 fps with 40–80 ms latency, so the storage-buffer constants
+  show no clear GPU cost; these runs are not an exact comparison (different
+  tab and run). Gameplay in run 1 reached 10,000–11,000 draws at 6–8 fps
+  with ~150 ms GPU latency. The synthetic click throws `WrongDocumentError`
+  (pointer lock refused); harmless.
+- Next step candidates, in suggested order: reduce GPU time in heavy scenes,
+  find the intro skip (above), then a game-file picker. Ask the user.
 - **Node graphics session (Dawn on Metal, M1 Mac, 2026-10-07).**
   - *Fixed: black loading screens.* Emscripten has no `CLOCK_MONOTONIC_RAW`;
     `clock_getres`/`clock_gettime` failed and, with asserts compiled out, the
@@ -482,17 +528,23 @@ node out/web-node/LibertyRecomp/LibertyRecomp.js --diagnostics=true \
   briefly reached playable frame rates in gameplay, with stutter: Chrome
   caches compiled shaders by their WGSL, so any change to the archive makes
   the next run compile every pipeline again. Asynchronous pipeline creation
-  and the shader module warm-up are meant to remove that stutter; not yet
-  rechecked in Chrome.
+  and the shader module warm-up removed the stalls in Chrome (longest frame
+  ≤ 140 ms with the render thread busy ≤ 111 ms of it), but a cold cache still
+  takes 1.5–5 s to compile each new pipeline, so their draws are missing for
+  that long and the guest audio mixer falls behind meanwhile (Where it stands
+  › Chrome recheck 2026-10-08).
   At most two frames are in flight on the GPU (`TrackGpuFrame`): a present
   waits for an earlier frame to finish, so the render thread cannot queue
   frames behind slow GPU work. The perf report's second line gives the
   window's longest frame (render-thread busy and pipeline time in it), GPU
   frame latency (submit to completion, as seen by the render thread) and how
   many presents waited for the GPU.
-- Chrome's audio crackled and ran slow in busier scenes; the causes found in
-  Node are fixed, unconfirmed in Chrome (see Where it stands › Audio
-  shortfall fixed in Node).
+- Chrome's audio now holds real time in heavy scenes, but underruns (5–22 per
+  5 s) while Chrome compiles a burst of new pipelines, worst with a cold
+  shader cache.
+- The opening cutscene skipped to gameplay once in Chrome (first run after
+  an archive change) and could not be reproduced; cause unknown (Where it
+  stands › Chrome recheck 2026-10-08).
 - The shader archive is zlib (11 MB); zstd would be 4.7 MB but needs a wasm zstd.
 - The `0x90000000` view does not mirror `0x80000000` on the web.
 - Guest FP rounding and flush modes are recorded but not applied.
@@ -514,9 +566,10 @@ node out/web-node/LibertyRecomp/LibertyRecomp.js --diagnostics=true \
    shader modules made ahead of use; draws share render passes (~28 a frame).
    The per-draw uniform bind-group call is gone (constants by
    `firstInstance`, under Where it stands).
-   Next: recheck the stutter in Chrome and record `perf` lines for a heavy
-   cutscene and gameplay in the benchmark table, including GPU frame latency
-   before and after the storage-buffer constants.
+   Chrome is GPU-bound in heavy scenes (10–12 fps at 7,600–8,800 draws, GPU
+   frame latency 85–100 ms; Where it stands › Chrome recheck 2026-10-08), so
+   next is GPU time: profile a heavy frame on the GPU (Xcode's Metal capture
+   of Chrome's GPU process, or timestamp queries) before cutting more CPU.
    Later: close the fidelity gaps above.
 2. **In-browser game files.** A file or folder picker (File System Access API /
    OPFS), mounted so the existing `gta4::install::Install()` can read it;
@@ -524,6 +577,7 @@ node out/web-node/LibertyRecomp/LibertyRecomp.js --diagnostics=true \
    are 7–8 GB, so stream them rather than preloading into MEMFS. (Local runs
    already stream an installed game from `serve.py`; the lazy mount in
    `res/web/index.html` is a model for this.)
-3. **Audio, input and page lifecycle.** Recheck audio in Chrome after the
-   real-time fixes (see Where it stands › Audio shortfall fixed in Node);
-   then pointer lock and fullscreen.
+3. **Audio, input and page lifecycle.** Audio holds real time in Chrome
+   except during pipeline-compile bursts; the one-off intro skip is still
+   open. Then pointer lock (a DevTools-protocol click got `WrongDocumentError`;
+   not checked with a real click) and fullscreen.

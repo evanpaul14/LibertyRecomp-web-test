@@ -270,12 +270,20 @@ Working:
   or GPU errors. Gameplay is playable: walking and driving around Liberty City
   works. Before the per-draw work of 2026-10-07, light scenes ran at 40–59 fps,
   the heaviest cutscene stretch (about 6,000 draws a frame) at 3–6 fps and
-  gameplay at about 3–10 fps. Since then it is clearly faster and gameplay
-  briefly reaches playable frame rates, with stutter from shader compiles (no
-  Chrome measurements recorded yet). The first run after the shader archive
-  changed stalled for about a second at a time while Chrome compiled every
-  pipeline; pipelines are now created asynchronously and shader modules ahead
-  of use, which has not been rechecked in Chrome yet.
+  gameplay at about 3–10 fps. Measured on 2026-10-08 (with Chrome's shader
+  cache warm): light scenes hold 52–60 fps, scenes of about 4,000 draws run at
+  17–19 fps and the heaviest intro shots (7,600–8,800 draws) at 10–12 fps,
+  limited by the GPU (frame latency 85–100 ms); no GPU errors. Pipelines are
+  created asynchronously, so the first run after the shader archive changes
+  no longer stalls, but it compiles for longer: new pipelines take 1.5–5 s
+  each, and the opening shots stutter while they do.
+- **Intro skip (seen once).** On the first Chrome run after the archive
+  changed, the opening cutscene ended about 30 s in and the game went straight
+  to gameplay on the docks. A second run (warm cache) and a run with a fresh
+  Chrome profile (cold cache) both played the whole intro, so the cause is not
+  known; the skipped run was the only one where the guest audio mixer stayed
+  below real time (750–870 of 938 frames per 5 s) for the whole first 25 s of
+  the cutscene.
 
 `rex-web-memory-test` checks the memory layout and MMIO routing under Node 24:
 
@@ -337,8 +345,9 @@ Not working yet:
   scenes because the title's audio was produced at only ~75–80% of real time.
   Three web-specific costs caused that: multi-object waits polled every
   millisecond, `fma` ran in software, and the timer thread spun. They are fixed,
-  and under Node the heaviest intro scenes now hold real time; this has not
-  been rechecked in Chrome yet. SDL3's own pointer conversion broke on wasm64
+  and the heaviest intro scenes now hold real time under Node and in Chrome
+  (931–958 frames per 5 s through the whole intro), except while Chrome compiles
+  a burst of new pipelines (619–870 frames, 5–22 underruns per 5 s). SDL3's own pointer conversion broke on wasm64
   (every callback threw `Cannot mix BigInt and other types`);
   `res/web/sdl_wasm64.js` replaces it. After the queue runs dry, the SDL driver
   waits for `--audio_refill_frames` (12 on the web) before playing again, and
