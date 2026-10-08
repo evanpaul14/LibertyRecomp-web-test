@@ -41,7 +41,7 @@ mapped); this file is for whoever continues the work.
   installer cannot map a 7.8 GB `.iso` under Node), the build reaches gameplay
   in Chrome. An earlier run showed black gameplay at about 5 fps; it predated
   the clock, hang, stencil-rebuild and downsample-resolve fixes below.
-  - *Rechecked with those fixes:* the intro cutscenes render lit and correct
+  - *Rechecked with those fixes (before the per-draw work below):* the intro cutscenes render lit and correct
     (ship's cabin, the docks meeting with the in-world credits) with no stalls
     or GPU errors. Light scenes (400–700 draws) run at 40–59 fps; the heaviest
     stretch (~6,000–6,600 draws) dropped to 3–6 fps, at ~20–32 µs of
