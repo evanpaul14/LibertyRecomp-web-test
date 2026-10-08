@@ -26,6 +26,9 @@ REXCVAR_DEFINE_STRING(webgpu_trace_pixel, "", "GPU/Diagnostics",
                       "texel x,y of their first color target");
 REXCVAR_DEFINE_STRING(webgpu_skip_pixel_shader, "", "GPU/Diagnostics",
                       "Web build: skip draws that use these pixel shader hashes (hex, comma-separated)");
+REXCVAR_DEFINE_BOOL(webgpu_async_pipelines, true, "GPU",
+                    "Web build: create title pipelines asynchronously and skip their draws "
+                    "until they are ready (traced frames still create them synchronously)");
 
 namespace rex::graphics::gta4_webgpu {
 namespace {
@@ -250,12 +253,45 @@ Pipeline* Renderer::State::DrawPipeline(
     fragment.targets = colors.data();
     descriptor.fragment = &fragment;
   }
-  result.pipeline = device.CreateRenderPipeline(&descriptor);
   if (pipelines.size() >= 8192) {
     pipelines.clear();
+    ++pipeline_generation;
     pass_state.pipeline = nullptr;  // A new pipeline could reuse the handle.
   }
-  return &pipelines.emplace(key, std::move(result)).first->second;
+  if (!REXCVAR_GET(webgpu_async_pipelines) || trace) {
+    result.pipeline = device.CreateRenderPipeline(&descriptor);
+    return &pipelines.emplace(key, std::move(result)).first->second;
+  }
+  // A synchronous creation stalls everything after it (in the browser, the
+  // GPU process compiles it before later commands; under Node, this thread
+  // waits), so draws using it are skipped until the callback brings it.
+  Pipeline* entry = &pipelines.emplace(key, std::move(result)).first->second;
+  device.CreateRenderPipelineAsync(
+      &descriptor, wgpu::CallbackMode::AllowSpontaneous,
+      [this, entry, generation = pipeline_generation, requested = emscripten_get_now(), label](
+          wgpu::CreatePipelineAsyncStatus status, wgpu::RenderPipeline created,
+          wgpu::StringView message) {
+        // The cache was cleared since (or the renderer is shutting down).
+        if (status == wgpu::CreatePipelineAsyncStatus::CallbackCancelled ||
+            generation != pipeline_generation)
+          return;
+        const double latency = emscripten_get_now() - requested;
+        timing.pipeline_latency_ms += latency;
+        timing.pipeline_latency_max_ms = std::max(timing.pipeline_latency_max_ms, latency);
+        if (status == wgpu::CreatePipelineAsyncStatus::Success && created) {
+          entry->pipeline = std::move(created);
+          ++timing.pipelines_ready;
+          return;
+        }
+        entry->failed = true;
+        if (++timing.pipelines_failed <= 32)
+          REXLOG_ERROR("gta4-webgpu: pipeline {} creation failed ({}): {}", label, uint32_t(status),
+                       std::string_view(message.data ? message.data : "",
+                                        message.data && message.length != WGPU_STRLEN
+                                            ? message.length
+                                            : message.data ? std::strlen(message.data) : 0));
+      });
+  return entry;
 }
 
 const InputLayout* Renderer::State::Inputs(const ShaderRecord& vertex, uint32_t declaration,
@@ -660,6 +696,15 @@ bool Renderer::State::Draw(const Work& work, std::string& error, bool retry) {
                                 uint32_t(topology), strip_format, *inputs, requested_colors,
                                 error);
   if (!pipeline) return false;
+  if (!pipeline->pipeline) {
+    if (pipeline->failed) {
+      error = "Title pipeline creation failed";
+      return false;
+    }
+    ++stats.waiting;
+    ++timing.waiting_draws;
+    return true;
+  }
 
   // Shared constants, then textures.
   core::SharedConstants shared{};

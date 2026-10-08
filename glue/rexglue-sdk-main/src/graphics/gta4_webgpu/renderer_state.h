@@ -2,6 +2,7 @@
 
 #include <array>
 #include <cstdint>
+#include <deque>
 #include <functional>
 #include <map>
 #include <memory>
@@ -76,7 +77,9 @@ struct Arena {
 };
 
 struct Pipeline {
+  // Null while an asynchronous creation is pending, or after it failed.
   wgpu::RenderPipeline pipeline;
+  bool failed = false;
   wgpu::BindGroupLayout textures;  // Group 1; null when the shaders sample nothing.
   uint32_t texture_mask = 0, cube_mask = 0, sampler_mask = 0;
 };
@@ -171,6 +174,8 @@ struct Renderer::State {
   uint64_t PushGeometry(std::span<const uint8_t> bytes, std::string& error,
                         uint64_t alignment = 16);
   wgpu::ShaderModule Module(const ShaderRecord& record, bool late, std::string& error);
+  // Creates queued shader modules for up to --webgpu_shader_warmup_ms.
+  void WarmModules();
   wgpu::ShaderModule UtilityModule(const char* name, const char* code);
   wgpu::BindGroupLayout TextureLayout(uint32_t texture_mask, uint32_t cube_mask,
                                       uint32_t sampler_mask);
@@ -298,10 +303,18 @@ struct Renderer::State {
   wgpu::Sampler fallback_sampler, linear_sampler;
 
   std::unordered_map<uint64_t, wgpu::ShaderModule> modules;
+  // Registered shaders whose modules are not made yet, created a few at a
+  // time between frames: creating one parses and validates its WGSL
+  // synchronously (up to ~150 ms), even when its pipeline is asynchronous.
+  // Alpha-test variants wait until the others are done.
+  std::deque<const ShaderRecord*> module_queue, late_module_queue;
   std::unordered_map<std::string, wgpu::ShaderModule> utility_modules;
   std::unordered_map<uint64_t, wgpu::BindGroupLayout> texture_layouts;
   std::unordered_map<uint64_t, wgpu::PipelineLayout> pipeline_layouts;
   std::unordered_map<Words, Pipeline, WordsHash> pipelines;
+  // Bumped when `pipelines` is cleared, so a pending creation's callback
+  // knows its entry is gone.
+  uint64_t pipeline_generation = 0;
   std::unordered_map<std::string, wgpu::RenderPipeline> utility_pipelines;
   std::unordered_map<Words, wgpu::Sampler, WordsHash> samplers;
   // Samplers by raw fetch constant and texture mip count, ahead of decoding
@@ -376,6 +389,7 @@ struct Renderer::State {
   // Per-frame diagnostics, reported with presents.
   struct FrameStats {
     uint32_t draws = 0, no_targets = 0, empty_viewport = 0, empty_scissor = 0, failed = 0;
+    uint32_t waiting = 0;  // Skipped while their pipeline is created.
     uint32_t clears = 0, resolves = 0;
     std::array<uint32_t, 32> commands{};
   } stats;
@@ -385,6 +399,13 @@ struct Renderer::State {
     double encode_ms = 0, uniform_ms = 0, inputs_ms = 0, bind_ms = 0, draw_ms = 0;
     uint32_t frames = 0, draws = 0, new_pipelines = 0, new_textures = 0, new_buffers = 0;
     uint32_t new_groups = 0;
+    // Asynchronous pipeline creation: draws skipped while their pipeline was
+    // pending, creations finished and failed, and their latency (request to
+    // callback).
+    uint32_t waiting_draws = 0, pipelines_ready = 0, pipelines_failed = 0;
+    double pipeline_latency_ms = 0, pipeline_latency_max_ms = 0;
+    uint32_t warmed_modules = 0;
+    double warmup_ms = 0;
     // New uniform slots written: vertex constants, pixel constants, shared.
     uint32_t vertex_slots = 0, pixel_slots = 0, shared_slots = 0;
     uint32_t redrawn = 0;  // Draws set up again after a flush interrupted them.

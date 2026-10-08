@@ -154,6 +154,11 @@ resolve counts. `--webgpu_perf_report=true` logs timing every 5 s as warnings:
 fps, render-thread time per stage, WebGPU calls per draw, the longest frame and
 GPU frame latency.
 `--webgpu_frame_limit` caps presents per second (default 60, 0 = unlimited).
+Title pipelines are created asynchronously, and a draw is skipped until its
+pipeline is ready (`--webgpu_async_pipelines=false` creates them synchronously;
+a traced frame always does). Shader modules for registered shaders are created
+ahead of their first draw, `--webgpu_shader_warmup_ms` (default 4) of
+render-thread time a frame, mostly during the first loading screens.
 With a traced frame, `--webgpu_trace_pixel=X,Y` logs every draw that changed
 that texel of its first color target, and `--webgpu_skip_pixel_shader=HASH,...`
 drops draws by pixel shader, to see what an effect contributes.
@@ -255,8 +260,9 @@ Working:
   gameplay at about 3–10 fps. Since then it is clearly faster and gameplay
   briefly reaches playable frame rates, with stutter from shader compiles (no
   Chrome measurements recorded yet). The first run after the shader archive
-  changes stalls for about a second at a time while Chrome compiles every
-  pipeline; later runs reuse Chrome's shader cache.
+  changed stalled for about a second at a time while Chrome compiled every
+  pipeline; pipelines are now created asynchronously and shader modules ahead
+  of use, which has not been rechecked in Chrome yet.
 
 `rex-web-memory-test` checks the memory layout and MMIO routing under Node 24:
 
@@ -304,8 +310,9 @@ Not working yet:
   wireframe fill, and reads of 3D or block-compressed GPU textures.
 - **Performance.** Heavy scenes are limited by the render thread's per-draw
   cost, about 10 µs a draw in Node with Dawn on Metal (down from about 20), of
-  which about 4 µs is WebGPU calls. Pipelines compile synchronously, which
-  causes stutter when new shaders appear.
+  which about 4 µs is WebGPU calls. Pipelines compile asynchronously, so a new
+  shader no longer stalls the frame; its draws are missing for the few frames
+  until it is ready.
 - **Write watches.** The runtime's memory-coherence tracking relies on page
   protection faults, which wasm does not have. The renderer instead relies on the
   title's own unlock notifications.

@@ -14,6 +14,9 @@
 REXCVAR_DEFINE_BOOL(webgpu_perf_report, false, "GPU/Diagnostics",
                     "Web build: log renderer timing reports as warnings (shown with "
                     "--log_level=warn)");
+REXCVAR_DEFINE_DOUBLE(webgpu_shader_warmup_ms, 4.0, "GPU",
+                      "Web build: render-thread time per frame spent creating shader modules "
+                      "for registered shaders ahead of their first draw (0: create on first use)");
 REXCVAR_DEFINE_UINT32(webgpu_trace_frame, 0, "GPU/Diagnostics",
                       "Web build: log every title command of this presented frame");
 
@@ -521,6 +524,25 @@ wgpu::ShaderModule Renderer::State::Module(const ShaderRecord& record, bool late
   return module;
 }
 
+void Renderer::State::WarmModules() {
+  const double budget = REXCVAR_GET(webgpu_shader_warmup_ms);
+  if (budget <= 0 || !ready) return;
+  const double start = emscripten_get_now();
+  std::string error;
+  for (auto* queue : {&module_queue, &late_module_queue}) {
+    const bool late = queue == &late_module_queue;
+    while (!queue->empty() && emscripten_get_now() - start < budget) {
+      const ShaderRecord& record = *queue->front();
+      queue->pop_front();
+      const uint64_t key = record.hash * 4 + uint64_t(record.stage) * 2 + (late ? 1 : 0);
+      if (modules.contains(key)) continue;
+      Module(record, late, error);
+      ++timing.warmed_modules;
+    }
+  }
+  timing.warmup_ms += emscripten_get_now() - start;
+}
+
 wgpu::ShaderModule Renderer::State::UtilityModule(const char* name, const char* code) {
   if (auto found = utility_modules.find(name); found != utility_modules.end()) return found->second;
   const std::string text = std::string(kUtilityCommon) + code;
@@ -763,6 +785,8 @@ Renderer::Status Renderer::Execute(Work& work, std::string& error) {
         return Status::kDone;
       }
       s.shaders[c.shader] = record;
+      s.module_queue.push_back(record);
+      if (!record->late.empty()) s.late_module_queue.push_back(record);
       return Status::kDone;
     }
     case CommandType::kRegisterVertexDeclaration: {

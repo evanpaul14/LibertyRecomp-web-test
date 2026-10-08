@@ -342,10 +342,10 @@ Renderer::Status Renderer::State::Present(const Work& work, std::string& error) 
   };
   if (c.submitted_frame <= 3 || c.submitted_frame % 60 == 0)
     REXLOG_INFO("gta4-webgpu: frame={} draws={} no-targets={} empty-viewport={} empty-scissor={} "
-                "failed={} clears={} resolves={} frontbuffer={:08X} source={} {}x{} "
+                "failed={} waiting={} clears={} resolves={} frontbuffer={:08X} source={} {}x{} "
                 "pipelines={} textures={} surfaces={}",
                 c.submitted_frame, stats.draws, stats.no_targets, stats.empty_viewport,
-                stats.empty_scissor, stats.failed, stats.clears, stats.resolves,
+                stats.empty_scissor, stats.failed, stats.waiting, stats.clears, stats.resolves,
                 c.frontbuffer_texture, !source ? "none" : source->gpu_produced ? "gpu" : "cpu",
                 source ? source->width : 0, source ? source->height : 0, pipelines.size(),
                 textures.size(), surfaces.size());
@@ -370,7 +370,10 @@ Renderer::Status Renderer::State::Present(const Work& work, std::string& error) 
     WEBGPU_PERF_LOG("gta4-webgpu: perf {:.1f} fps over {} frames; per frame: {:.0f} draws, "
                     "render-thread {:.2f} ms (draws {:.2f}: pipelines {:.2f}, textures {:.2f}, "
                     "geometry {:.2f}, inputs {:.2f}, bindings {:.2f}, uniforms {:.2f}, encode "
-                    "{:.2f}; submit {:.2f}); new pipelines={} textures={} ({} KB) buffers={} ({} "
+                    "{:.2f}; submit {:.2f}); new pipelines={} (ready {}, failed {}, latency avg "
+                    "{:.0f} max {:.0f} ms, {:.0f} draws a frame waited; warmed {} shader modules, {:.2f} ms a "
+                    "frame, {} queued) textures={} ({} KB) "
+                    "buffers={} ({} "
                     "KB) groups={}; new uniform slots: vertex {} pixel {} shared {}; redrawn {}; calls per draw: "
                     "pipeline {:.2f}, group {:.2f}, vertex {:.2f}, index {:.2f}, state {:.2f}",
                     frames * 1000.0 / elapsed, timing.frames, timing.draws / frames,
@@ -379,6 +382,14 @@ Renderer::Status Renderer::State::Present(const Work& work, std::string& error) 
                     timing.geometry_ms / frames, timing.inputs_ms / frames,
                     timing.bind_ms / frames, timing.uniform_ms / frames,
                     timing.encode_ms / frames, timing.submit_ms / frames, timing.new_pipelines,
+                    timing.pipelines_ready, timing.pipelines_failed,
+                    timing.pipelines_ready + timing.pipelines_failed
+                        ? timing.pipeline_latency_ms /
+                              (timing.pipelines_ready + timing.pipelines_failed)
+                        : 0.0,
+                    timing.pipeline_latency_max_ms, timing.waiting_draws / frames,
+                    timing.warmed_modules, timing.warmup_ms / frames,
+                    module_queue.size() + late_module_queue.size(),
                     timing.new_textures, timing.texture_bytes / 1024, timing.new_buffers,
                     timing.buffer_bytes / 1024, timing.new_groups, timing.vertex_slots,
                     timing.pixel_slots, timing.shared_slots, timing.redrawn,

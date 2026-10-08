@@ -62,7 +62,9 @@ mapped); this file is for whoever continues the work.
     tab group (it stayed dark there while a normal tab rendered); use a tab
     opened normally (`open -a "Google Chrome" <url>`) and a screen capture.
 - **Profiling.** `--webgpu_perf_report=true` logs every 5 s as warnings: a
-  `perf` line (fps, draws a frame, render-thread time per stage, new uniform
+  `perf` line (fps, draws a frame, render-thread time per stage, new
+  pipelines with how many became ready or failed, their latency and the draws
+  that waited for them, shader modules warmed and still queued, new uniform
   slots, redrawn draws, WebGPU calls per draw), a stall line (the longest
   frame with the render thread's busy and pipeline time in it, GPU frame
   latency, presents that waited for the GPU), a `presents` line (presents
@@ -85,10 +87,29 @@ mapped); this file is for whoever continues the work.
   about a second at a time (Chrome recompiles every pipeline when the WGSL
   changes), which fast-forwarded the opening cutscene. No Chrome perf numbers
   were recorded yet.
-- Next step candidates, in suggested order: asynchronous pipeline creation
-  (the remaining stutter: in Node every spike over ~300 ms was pipeline
-  creation), the ~3 µs of untimed per-draw setup and ~4 µs of encode (see
-  Known gaps), then a game-file picker. Ask the user.
+- **Asynchronous pipelines (2026-10-07, after e8e98c5f).** Title pipelines
+  are created with `CreateRenderPipelineAsync`; a draw whose pipeline is still
+  pending is skipped (`waiting` in the per-frame log, `draws a frame waited` in
+  the perf line), and a failed creation is logged and its draws fail.
+  `--webgpu_async_pipelines=false` restores synchronous creation; a traced
+  frame always creates them synchronously, so its trace is complete. That alone
+  left most of the stall: creating a *shader module* parses and validates its
+  WGSL synchronously (2.4 s over the intro's first 222 pipelines, up to 144 ms
+  for one module). So `kRegisterShader` now queues the shader, and after each
+  present `WarmModules` creates queued modules for up to
+  `--webgpu_shader_warmup_ms` (default 4; one large module can overrun it).
+  Alpha-test (late) variants are queued after the rest. The title registers
+  about 1,970 variants during the first loading screens, which are all done
+  within ~15 s, while those screens drop to ~36 fps. In the Node intro
+  benchmark the longest frame of any 5 s window fell from 490–860 ms to at most
+  ~170 ms, with pipeline time in it ≤ 10 ms; few draws wait (at most 7 a frame
+  in a window, while ~45 new pipelines arrive) and the frame dumps show no
+  visible gaps. Per-draw cost is unchanged. Not yet checked in Chrome, where the
+  same costs land in the GPU process instead of the render thread.
+- Next step candidates, in suggested order: recheck in Chrome and record perf
+  lines (first run after a build, then a cached run), the ~3 µs of untimed
+  per-draw setup and ~4 µs of encode (see Known gaps), then a game-file picker.
+  Ask the user.
 - **Node graphics session (Dawn on Metal, M1 Mac, 2026-10-07).**
   - *Fixed: black loading screens.* Emscripten has no `CLOCK_MONOTONIC_RAW`;
     `clock_getres`/`clock_gettime` failed and, with asserts compiled out, the
@@ -167,6 +188,7 @@ mapped); this file is for whoever continues the work.
 | GPU | Statically linked WebGPU title-command renderer (no `dlopen` on web); created in `GTA4App::OnPreSetup`. `--gpu_plugin=none` = headless | `src/graphics/gta4_webgpu/`, `include/rex/graphics/gta4_webgpu.h`, `gta4-recomp/src/gta4_app.cpp` |
 | GPU threading | One render pthread owns the device and runs from the JS event loop (needed for `mapAsync` and canvas presentation), woken via `emscripten_proxy_async`; at most two frames are in flight on the GPU (`TrackGpuFrame`); after each present it yields with a `MessageChannel` message, since a proxied wake can run in the same task and the canvas only updates when the task ends. Game threads capture device block/buffers/textures at submit (`Capture` in `graphics_system.cpp`) | `gta4_webgpu/graphics_system.cpp`, `work.h` |
 | Shaders | Stock SPIR-V → GLSL (SPIRV-Cross) → rewrite BDA constants to one UBO (VS 0, PS 4096, shared 8192, spec word 8192+0x500) and bindless to fixed slots → glslang → spirv-opt → naga → WGSL, then split the UBO into three group-0 bindings (VS, PS, shared + spec word 0x500), each with its own dynamic offset; dynamic register reads go through `xc_load`. naga undoes the Vulkan y-flip itself | `tools/webgpu/spirv_to_wgsl.py`, `tools/webgpu/split_uniforms.py`, `LibertyRecompLib/shader/webgpu_shader_archive.bin` |
+| Pipelines | Title pipelines by full state key, created with `CreateRenderPipelineAsync`; draws are skipped while pending (`--webgpu_async_pipelines`). Shader modules for registered shaders are made between frames (`WarmModules`, `--webgpu_shader_warmup_ms`), since module creation is synchronous. Utility-pass pipelines stay synchronous | `gta4_webgpu/draw.cpp` (`DrawPipeline`), `renderer.cpp` (`WarmModules`) |
 | Vertex data | Every attribute decoded to `float32x4` on the CPU per buffer generation (shaders read vec4 floats; WebGPU cannot feed integer formats to them) | `gta4_webgpu/vertex_decode.h`, `resources.cpp` |
 | Render targets | Single-sampled; resolved depth stored as `rg32float` (depth, stencil), with packed A8R8G8B8 aliases rebuilt on demand; resolves pick the latest surface at the same EDRAM placement, and map samples when its MSAA layout differs from the resolved view (`resolve_color`) | `gta4_webgpu/resources.cpp`, `passes.cpp`, `renderer.cpp` |
 | Depth handoff | Depth from the resolved snapshot (`source_texture`); `kRebuildSceneCoverage` clears stencil to 0x80 and writes 0xFF via stencil Replace where packed depth is nonzero, as the Metal renderer | `gta4_webgpu/passes.cpp` (`Handoff`) |
@@ -307,6 +329,7 @@ node out/web-node/LibertyRecomp/LibertyRecomp.js --diagnostics=true \
   | + pooled vertex/index buffers (ec1b0ee8) | ~6,200–8,800 draws | 8.1–11.2 | ~9.5–11.8 (3.9 / 1.5–2.2 / 0.9 / 0.8–1.5 / 1.3–1.7) |
   | + split uniform bindings (20b5a24a) | ~6,600–8,800 draws | 9.3–10.9 (6.5 while compiling pipelines) | ~9.4–10.1 excluding compiles (4.0 / 0.4 / 0.8 / 0.9–1.5 / 1.4) |
   | + two GPU frames in flight (e8e98c5f) | ~6,600–8,800 draws | 8.1–12.1 | unchanged |
+  | + async pipelines, shader warm-up | ~6,000–8,900 draws | 8.4–10.6 | ~9.7–11.6; longest frame ≤ 170 ms (was up to 860) |
 
   Light scenes (300–850 draws) hold the 60 fps cap throughout. Converted
   vertex and index data now live in 32 MB pooled buffers (`BufferPool`): draws
@@ -320,17 +343,18 @@ node out/web-node/LibertyRecomp/LibertyRecomp.js --diagnostics=true \
   the new batch (`redrawn` in the perf line). What remains per draw: ~4 µs of
   encode (mostly the uniform bind group, ~1 call a draw since vertex
   constants change on most draws), ~3 µs of untimed setup (fixed state,
-  shared constants, targets, pipeline key), ~1.4 µs of uploads (pixel
-  constants change on ~75% as many draws as vertex constants), and
-  synchronous pipeline compiles (native Dawn, about 140 ms per pipeline on
-  Metal; they dominate the windows that hit them).
+  shared constants, targets, pipeline key) and ~1.4 µs of uploads (pixel
+  constants change on ~75% as many draws as vertex constants). Pipeline
+  compiles no longer stall the render thread (asynchronous creation and the
+  shader module warm-up, under Where it stands).
   In Chrome (user report, 2026-10-07, after the split): faster, but the first
   run stalled for about a second at a time, which fast-forwarded parts of the
   opening cutscene and froze gameplay. A second run was much smoother and
   briefly reached playable frame rates in gameplay, with stutter: Chrome
   caches compiled shaders by their WGSL, so any change to the archive makes
   the next run compile every pipeline again. Asynchronous pipeline creation
-  is the fix for the remaining stutter.
+  and the shader module warm-up are meant to remove that stutter; not yet
+  rechecked in Chrome.
   At most two frames are in flight on the GPU (`TrackGpuFrame`): a present
   waits for an earlier frame to finish, so the render thread cannot queue
   frames behind slow GPU work. The perf report's second line gives the
@@ -356,11 +380,11 @@ node out/web-node/LibertyRecomp/LibertyRecomp.js --diagnostics=true \
    renderer (the same interface the desktop gta4-native and gta4-metal
    renderers use, not Xenos emulation), and Chrome renders the intro correctly
    (see above). Per-draw cost is down to ~10 µs (Node, Dawn on Metal; see
-   Known gaps › Performance). Next: create pipelines asynchronously (skip or
-   substitute a draw until its pipeline is ready) to remove the stutter, then
-   the untimed per-draw setup (fixed state, shared constants, targets,
-   pipeline key) and the remaining uniform bind-group call. Record Chrome
-   `perf` lines for a heavy cutscene and gameplay in the benchmark table.
+   Known gaps › Performance), and pipelines are created asynchronously with
+   shader modules made ahead of use. Next: recheck the stutter in Chrome and
+   record `perf` lines for a heavy cutscene and gameplay in the benchmark
+   table, then the untimed per-draw setup (fixed state, shared constants,
+   targets, pipeline key) and the remaining uniform bind-group call.
    Later: close the fidelity gaps above.
 2. **In-browser game files.** A file or folder picker (File System Access API /
    OPFS), mounted so the existing `gta4::install::Install()` can read it;
