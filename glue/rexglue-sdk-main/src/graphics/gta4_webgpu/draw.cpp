@@ -484,14 +484,15 @@ bool Renderer::State::Draw(const Work& work, std::string& error) {
       error = "Indexed draw has no captured index buffer";
       return false;
     }
-    index_buffer = IndexBuffer(*work.indices, index32, error);
+    uint64_t index_base = 0;
+    index_buffer = IndexBuffer(*work.indices, index32, index_base, error);
     if (!index_buffer) return false;
     const size_t element = index32 ? 4 : 2;
     if (uint64_t(first) + count > work.indices->bytes.size() / element) {
       error = "Index draw exceeds its captured buffer";
       return false;
     }
-    index_offset = uint64_t(first) * element;
+    index_offset = index_base + uint64_t(first) * element;
   }
   const bool strip = type == 3 || type == 6 || (type == 8 && !up);
   if (type == 5 || type == 13 || (strip && restart)) {
@@ -614,17 +615,34 @@ bool Renderer::State::Draw(const Work& work, std::string& error) {
       }
       binding.offset = PushGeometry({reinterpret_cast<const uint8_t*>(decoded.data()),
                                      decoded.size() * sizeof(float)},
-                                    error);
+                                    error, components * sizeof(float));
       if (binding.offset == UINT64_MAX) return false;
       binding.buffer = geometry.buffer;
       binding.size = decoded.size() * sizeof(float);
     } else {
-      binding.buffer = VertexBuffer(*work.streams[input.stream], streams[input.stream].offset,
-                                    streams[input.stream].stride, input.elements, binding.size,
-                                    error);
-      if (!binding.buffer) return false;
+      if (!VertexBuffer(*work.streams[input.stream], streams[input.stream].offset,
+                        streams[input.stream].stride, input.elements, binding, error))
+        return false;
     }
     bindings.push_back(binding);
+  }
+  // Every stream's offset is a multiple of its stride. When they all start
+  // the same number of vertices in, bind the buffers from their start and
+  // select the vertices with baseVertex/firstVertex instead, so draws from
+  // the same pooled buffer keep its binding.
+  uint32_t vertex_shift = 0;
+  if (!bindings.empty()) {
+    bool shared = true;
+    const uint64_t shift = bindings[0].offset / inputs->layouts[0].arrayStride;
+    for (size_t i = 1; i < bindings.size(); ++i)
+      shared = shared && bindings[i].offset / inputs->layouts[i].arrayStride == shift;
+    if (shared && shift <= uint64_t(INT32_MAX / 2)) {
+      vertex_shift = uint32_t(shift);
+      for (auto& binding : bindings) {
+        binding.offset = 0;
+        binding.size = wgpu::kWholeSize;
+      }
+    }
   }
   if (inputs->defaults) bindings.push_back({zero_vertices, 0, 64});
   if (up && type == 8) count *= 2;
@@ -929,9 +947,10 @@ bool Renderer::State::Draw(const Work& work, std::string& error) {
       bound.index_buffer = index_buffer.Get();
       bound.index_format = format;
     }
-    pass.DrawIndexed(count, 1, uint32_t(index_offset / element), base_vertex, 0);
+    pass.DrawIndexed(count, 1, uint32_t(index_offset / element),
+                     base_vertex + int32_t(vertex_shift), 0);
   } else {
-    pass.Draw(count, 1, up ? 0 : first, 0);
+    pass.Draw(count, 1, (up ? 0 : first) + vertex_shift, 0);
   }
   for (uint32_t i = 0; i < kRenderTargetCount; ++i)
     if (targets.colors[i]) targets.colors[i]->content_serial = ++content_serial;

@@ -302,6 +302,11 @@ void Renderer::State::InitializeDevice() {
   layout.entries = &uniform;
   uniform_layout = device.CreateBindGroupLayout(&layout);
 
+  constexpr uint64_t kPoolPage = 32u * 1024u * 1024u;
+  vertex_pool.Initialize(device, wgpu::BufferUsage::Vertex | wgpu::BufferUsage::CopyDst, kPoolPage);
+  index16_pool.Initialize(device, wgpu::BufferUsage::Index | wgpu::BufferUsage::CopyDst, kPoolPage);
+  index32_pool.Initialize(device, wgpu::BufferUsage::Index | wgpu::BufferUsage::CopyDst, kPoolPage);
+
   wgpu::BufferDescriptor zero{};
   zero.size = 64;
   zero.usage = wgpu::BufferUsage::Vertex | wgpu::BufferUsage::CopyDst;
@@ -432,13 +437,15 @@ void Renderer::State::ApplyDeviceDelta(const DeviceDelta& delta) {
   }
 }
 
-uint64_t Renderer::State::PushGeometry(std::span<const uint8_t> bytes, std::string& error) {
+uint64_t Renderer::State::PushGeometry(std::span<const uint8_t> bytes, std::string& error,
+                                       uint64_t alignment) {
   const uint64_t size = (bytes.size() + 15) & ~uint64_t(15);
   if (size > kMaximumArena) {
     error = "Per-draw geometry exceeds its bound";
     return UINT64_MAX;
   }
-  if (geometry.used + size > geometry.capacity) {
+  const auto aligned = [&] { return (geometry.used + alignment - 1) / alignment * alignment; };
+  if (aligned() + size > geometry.capacity) {
     if (geometry.used && !Flush(error)) return UINT64_MAX;
     if (!Begin(error)) return UINT64_MAX;
     if (size > geometry.capacity) {
@@ -451,8 +458,8 @@ uint64_t Renderer::State::PushGeometry(std::span<const uint8_t> bytes, std::stri
       geometry.buffer = device.CreateBuffer(&descriptor);
     }
   }
-  const uint64_t offset = geometry.used;
-  geometry.used += size;
+  const uint64_t offset = aligned();
+  geometry.used = offset + size;
   std::memcpy(geometry.bytes.data() + offset, bytes.data(), bytes.size());
   return offset;
 }

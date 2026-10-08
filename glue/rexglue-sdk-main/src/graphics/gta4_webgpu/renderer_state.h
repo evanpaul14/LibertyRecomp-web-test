@@ -3,6 +3,7 @@
 #include <array>
 #include <cstdint>
 #include <functional>
+#include <map>
 #include <memory>
 #include <span>
 #include <string>
@@ -99,6 +100,40 @@ struct VertexBinding {
   uint64_t size = 0;
 };
 
+// Converted vertex and index data, suballocated from large shared buffers so
+// that draws from one buffer keep its binding and select their data with
+// firstIndex/baseVertex: every pass call crosses into the browser's WebGPU.
+class BufferPool {
+ public:
+  struct Range {
+    uint32_t page = UINT32_MAX;  // UINT32_MAX: allocation failed.
+    uint64_t offset = 0, size = 0;
+  };
+  void Initialize(wgpu::Device device, wgpu::BufferUsage usage, uint64_t page_size) {
+    device_ = std::move(device);
+    usage_ = usage;
+    page_size_ = page_size;
+  }
+  // `alignment` need not be a power of two (vertex data aligns to its stride).
+  Range Allocate(uint64_t size, uint64_t alignment);
+  void Free(const Range& range);
+  void Clear() { pages_.clear(); }
+  const wgpu::Buffer& buffer(uint32_t page) const { return pages_[page].buffer; }
+  uint64_t page_size(uint32_t page) const { return pages_[page].size; }
+
+ private:
+  struct Page {
+    wgpu::Buffer buffer;  // Null once an oversized page is released.
+    uint64_t size = 0;
+    std::map<uint64_t, uint64_t> free;  // Offset -> size.
+  };
+  Range AllocateIn(uint32_t page, uint64_t size, uint64_t alignment);
+  wgpu::Device device_;
+  wgpu::BufferUsage usage_ = wgpu::BufferUsage::None;
+  uint64_t page_size_ = 0;
+  std::vector<Page> pages_;
+};
+
 // How a vertex shader's inputs are fed for one declaration and set of bound
 // streams: a buffer per guest stream with every attribute decoded to float4,
 // then a zero buffer for attributes the declaration lacks.
@@ -131,7 +166,9 @@ struct Renderer::State {
   uint8_t* ReserveUniforms(uint64_t& offset, std::string& error);
   uint64_t CommitUniforms(uint64_t offset, size_t size);
   void ApplyDeviceDelta(const DeviceDelta& delta);
-  uint64_t PushGeometry(std::span<const uint8_t> bytes, std::string& error);
+  // `alignment` (a multiple of 16) need not be a power of two.
+  uint64_t PushGeometry(std::span<const uint8_t> bytes, std::string& error,
+                        uint64_t alignment = 16);
   wgpu::ShaderModule Module(const ShaderRecord& record, bool late, std::string& error);
   wgpu::ShaderModule UtilityModule(const char* name, const char* code);
   wgpu::BindGroupLayout TextureLayout(uint32_t texture_mask, uint32_t cube_mask,
@@ -162,10 +199,14 @@ struct Renderer::State {
                                                     std::string& error);
   wgpu::Sampler Sampler(const xenos::xe_gpu_texture_fetch_t& fetch,
                         const TextureResource* texture);
-  wgpu::Buffer IndexBuffer(const BufferCapture& capture, bool& index32, std::string& error);
-  wgpu::Buffer VertexBuffer(const BufferCapture& capture, uint32_t offset, uint32_t stride,
-                            std::span<const gta4_native::VertexElement* const> elements,
-                            uint64_t& size, std::string& error);
+  // The converted indices' buffer, and the offset of index 0 in it.
+  wgpu::Buffer IndexBuffer(const BufferCapture& capture, bool& index32, uint64_t& base,
+                           std::string& error);
+  // A binding of the converted stream; its offset is a multiple of the
+  // converted stride (16 bytes per element).
+  bool VertexBuffer(const BufferCapture& capture, uint32_t offset, uint32_t stride,
+                    std::span<const gta4_native::VertexElement* const> elements,
+                    VertexBinding& binding, std::string& error);
   void ReleaseResource(uint32_t handle);
   void ClearResources();
   void BeginFrame();
@@ -309,13 +350,16 @@ struct Renderer::State {
   // Textures the title samples as A8R8G8B8 views of a resolved depth texture,
   // by alias handle: the resolved texture's handle.
   std::unordered_map<uint32_t, uint32_t> packed_depth_aliases;
+  // Converted copies of guest buffers, in the pools below.
   struct ConvertedBuffer {
-    wgpu::Buffer buffer;
-    uint64_t size = 0;
+    BufferPool::Range range;
     uint64_t frame = 0;
+    bool index32 = false;  // Index buffers: which pool.
   };
   std::unordered_map<Words, ConvertedBuffer, WordsHash> vertex_buffers;
   std::unordered_map<uint64_t, ConvertedBuffer> index_buffers;
+  BufferPool vertex_pool, index16_pool, index32_pool;
+  std::vector<uint8_t> convert_scratch;
   std::unordered_map<Words, std::pair<wgpu::BindGroup, uint64_t>, WordsHash> texture_groups;
 
   uint64_t frame = 0;

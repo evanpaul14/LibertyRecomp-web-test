@@ -286,16 +286,19 @@ node out/web-node/LibertyRecomp/LibertyRecomp.js --diagnostics=true \
   | Build | Heaviest stretch | fps there | µs per draw (encode / uniforms / inputs / bindings / submit) |
   |---|---|---|---|
   | Before (743d745b) | ~8,400 draws | 4.5–4.8 | ~20 (8.2 / 3.2 / 2.1 / 1.6 / 2.2) |
-  | Deltas + uniform reuse + input cache | ~6,500 draws | 9.0 | ~13.3 (6.8 / 1.6 / 1.0 / 0.8 / 1.8) |
+  | Deltas + uniform reuse + input cache (b08f89bb) | ~6,500 draws | 9.0 | ~13.3 (6.8 / 1.6 / 1.0 / 0.8 / 1.8) |
+  | + pooled vertex/index buffers | ~6,200–8,800 draws | 8.1–11.2 | ~9.5–11.8 (3.9 / 1.5–2.2 / 0.9 / 0.8–1.5 / 1.3–1.7) |
 
-  Light scenes (300–850 draws) hold the 60 fps cap in both. Encode is now about
-  half of each draw, at ~1.6 µs per WebGPU call; draws make ~1 vertex-buffer,
-  ~0.9 index-buffer and ~0.9 bind-group call each (the perf line reports calls
-  per draw). Still open: pooled vertex/index buffers addressed by
-  `baseVertex`/`firstIndex`, ~9.7 KB of uniforms uploaded per new slot (a
-  split per-stage layout needs regenerated shaders), and asynchronous pipeline
-  compiles (native Dawn compiles synchronously, about 140 ms per pipeline on
-  Metal).
+  Light scenes (300–850 draws) hold the 60 fps cap throughout. Converted
+  vertex and index data now live in 32 MB pooled buffers (`BufferPool`): draws
+  bind a pool buffer from its start and select their data with
+  `firstIndex`/`baseVertex`, so vertex-buffer calls fell from ~1.0 to ~0.25 per
+  draw and index-buffer calls from ~0.9 to ~0 (the perf line reports calls per
+  draw). What remains per draw is mostly the uniform bind group (~1 call, each
+  new slot at its own dynamic offset), building new ~9.7 KB uniform slots and
+  uploading them (a split per-stage layout needs regenerated shaders), and
+  asynchronous pipeline compiles are still open (native Dawn compiles
+  synchronously, about 140 ms per pipeline on Metal).
 - Chrome's audio fails: SDL3's audio callback throws `Cannot mix BigInt and
   other types` in `CPtrToHeap32Index` (a wasm64 bug in SDL's JavaScript).
 - The shader archive is zlib (12 MB); zstd would be 4.7 MB but needs a wasm zstd.

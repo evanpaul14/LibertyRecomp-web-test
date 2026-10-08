@@ -336,53 +336,110 @@ wgpu::Sampler Renderer::State::Sampler(const xenos::xe_gpu_texture_fetch_t& fetc
   return memo = sampler;
 }
 
+BufferPool::Range BufferPool::AllocateIn(uint32_t index, uint64_t size, uint64_t alignment) {
+  auto& page = pages_[index];
+  for (auto it = page.free.begin(); it != page.free.end(); ++it) {
+    const uint64_t start = it->first, end = start + it->second;
+    const uint64_t aligned = (start + alignment - 1) / alignment * alignment;
+    if (aligned + size > end) continue;
+    page.free.erase(it);
+    if (aligned > start) page.free[start] = aligned - start;
+    if (aligned + size < end) page.free[aligned + size] = end - aligned - size;
+    return {index, aligned, size};
+  }
+  return {};
+}
+
+BufferPool::Range BufferPool::Allocate(uint64_t size, uint64_t alignment) {
+  for (uint32_t i = 0; i < pages_.size(); ++i) {
+    if (!pages_[i].buffer) continue;
+    if (auto range = AllocateIn(i, size, alignment); range.page != UINT32_MAX) return range;
+  }
+  // Data larger than a page gets a page of its own, released once freed.
+  uint32_t index = 0;
+  while (index < pages_.size() && pages_[index].buffer) ++index;
+  if (index == pages_.size()) pages_.emplace_back();
+  auto& page = pages_[index];
+  page.size = std::max(page_size_, (size + 3) & ~uint64_t(3));
+  wgpu::BufferDescriptor descriptor{};
+  descriptor.size = page.size;
+  descriptor.usage = usage_;
+  page.buffer = device_.CreateBuffer(&descriptor);
+  page.free = {{0, page.size}};
+  return AllocateIn(index, size, alignment);
+}
+
+void BufferPool::Free(const Range& range) {
+  if (range.page >= pages_.size() || !pages_[range.page].buffer) return;
+  auto& page = pages_[range.page];
+  uint64_t start = range.offset, end = range.offset + range.size;
+  auto next = page.free.lower_bound(start);
+  if (next != page.free.end() && next->first == end) {
+    end += next->second;
+    next = page.free.erase(next);
+  }
+  if (next != page.free.begin()) {
+    const auto previous = std::prev(next);
+    if (previous->first + previous->second == start) {
+      start = previous->first;
+      page.free.erase(previous);
+    }
+  }
+  page.free[start] = end - start;
+  if (page.size > page_size_ && end - start == page.size) page = {};
+}
+
 wgpu::Buffer Renderer::State::IndexBuffer(const BufferCapture& capture, bool& index32,
-                                          std::string& error) {
+                                          uint64_t& base, std::string& error) {
   if ((capture.flags & 0xFu) != 2) {
     error = "Index buffer has the wrong resource type";
     return nullptr;
   }
   index32 = (capture.flags & 0x80000000u) != 0;
-  const size_t element = index32 ? 4 : 2;
+  auto& pool = index32 ? index32_pool : index16_pool;
   if (auto found = index_buffers.find(capture.generation); found != index_buffers.end()) {
     found->second.frame = frame;
-    return found->second.buffer;
+    base = found->second.range.offset;
+    return pool.buffer(found->second.range.page);
   }
   ScopedTimer timer(timing.geometry_ms);
   ++timing.new_buffers;
+  const size_t element = index32 ? 4 : 2;
   const size_t count = capture.bytes.size() / element;
-  wgpu::BufferDescriptor descriptor{};
-  descriptor.size = std::max<uint64_t>(4, (count * element + 3) & ~uint64_t(3));
-  descriptor.usage = wgpu::BufferUsage::Index;
-  descriptor.mappedAtCreation = true;
-  auto buffer = device.CreateBuffer(&descriptor);
-  auto* destination = static_cast<uint8_t*>(buffer.GetMappedRange());
+  const uint64_t size = std::max<uint64_t>(4, (count * element + 3) & ~uint64_t(3));
+  auto& converted = convert_scratch;
+  converted.assign(size, 0);
   for (size_t i = 0; i < count; ++i) {
     if (index32) {
       uint32_t value;
       std::memcpy(&value, capture.bytes.data() + i * 4, 4);
       value = __builtin_bswap32(value) & 0x00FFFFFFu;
-      std::memcpy(destination + i * 4, &value, 4);
+      std::memcpy(converted.data() + i * 4, &value, 4);
     } else {
       uint16_t value;
       std::memcpy(&value, capture.bytes.data() + i * 2, 2);
       value = __builtin_bswap16(value);
-      std::memcpy(destination + i * 2, &value, 2);
+      std::memcpy(converted.data() + i * 2, &value, 2);
     }
   }
-  buffer.Unmap();
-  timing.buffer_bytes += descriptor.size;
-  index_buffers[capture.generation] = {buffer, descriptor.size, frame};
-  return buffer;
+  const auto range = pool.Allocate(size, 4);
+  if (range.page == UINT32_MAX) {
+    error = "Index pool allocation failed";
+    return nullptr;
+  }
+  queue.WriteBuffer(pool.buffer(range.page), range.offset, converted.data(), size);
+  timing.buffer_bytes += size;
+  index_buffers[capture.generation] = {range, frame, index32};
+  base = range.offset;
+  return pool.buffer(range.page);
 }
 
-wgpu::Buffer Renderer::State::VertexBuffer(const BufferCapture& capture, uint32_t offset,
-                                           uint32_t stride,
-                                           std::span<const VertexElement* const> elements,
-                                           uint64_t& size, std::string& error) {
+bool Renderer::State::VertexBuffer(const BufferCapture& capture, uint32_t offset, uint32_t stride,
+                                   std::span<const VertexElement* const> elements,
+                                   VertexBinding& binding, std::string& error) {
   if ((capture.flags & 0xFu) != 1 || !stride || offset >= capture.bytes.size()) {
     error = "Vertex buffer range or type mismatch";
-    return nullptr;
+    return false;
   }
   Words& key = buffer_key;
   key = {uint32_t(capture.generation), uint32_t(capture.generation >> 32), offset, stride};
@@ -392,23 +449,22 @@ wgpu::Buffer Renderer::State::VertexBuffer(const BufferCapture& capture, uint32_
   }
   if (auto found = vertex_buffers.find(key); found != vertex_buffers.end()) {
     found->second.frame = frame;
-    size = found->second.size;
-    return found->second.buffer;
+    const auto& range = found->second.range;
+    binding = {vertex_pool.buffer(range.page), range.offset, range.size};
+    return true;
   }
   const size_t vertices = (capture.bytes.size() - offset) / stride;
   if (!vertices) {
     error = "Vertex stream holds no complete vertex";
-    return nullptr;
+    return false;
   }
   ScopedTimer timer(timing.geometry_ms);
   ++timing.new_buffers;
   const size_t output_stride = elements.size() * 16;
-  wgpu::BufferDescriptor descriptor{};
-  descriptor.size = std::max<uint64_t>(16, vertices * output_stride);
-  descriptor.usage = wgpu::BufferUsage::Vertex;
-  descriptor.mappedAtCreation = true;
-  auto buffer = device.CreateBuffer(&descriptor);
-  auto* destination = static_cast<float*>(buffer.GetMappedRange());
+  const uint64_t size = vertices * output_stride;
+  auto& converted = convert_scratch;
+  converted.resize(size);
+  auto* destination = reinterpret_cast<float*>(converted.data());
   for (size_t vertex = 0; vertex < vertices; ++vertex) {
     const uint8_t* source = capture.bytes.data() + offset + vertex * stride;
     for (size_t i = 0; i < elements.size(); ++i) {
@@ -420,11 +476,16 @@ wgpu::Buffer Renderer::State::VertexBuffer(const BufferCapture& capture, uint32_
       }
     }
   }
-  buffer.Unmap();
-  size = descriptor.size;
+  const auto range = vertex_pool.Allocate(size, output_stride);
+  if (range.page == UINT32_MAX) {
+    error = "Vertex pool allocation failed";
+    return false;
+  }
+  queue.WriteBuffer(vertex_pool.buffer(range.page), range.offset, converted.data(), size);
   timing.buffer_bytes += size;
-  vertex_buffers[key] = {buffer, size, frame};
-  return buffer;
+  vertex_buffers[key] = {range, frame};
+  binding = {vertex_pool.buffer(range.page), range.offset, range.size};
+  return true;
 }
 
 std::shared_ptr<TextureResource> Renderer::State::PackedDepthAlias(
@@ -493,6 +554,9 @@ void Renderer::State::ClearResources() {
   packed_depth_aliases.clear();
   vertex_buffers.clear();
   index_buffers.clear();
+  vertex_pool.Clear();
+  index16_pool.Clear();
+  index32_pool.Clear();
   texture_groups.clear();
 }
 
@@ -500,10 +564,18 @@ void Renderer::State::BeginFrame() {
   ++frame;
   std::erase_if(texture_groups,
                 [&](const auto& entry) { return frame - entry.second.second > kGroupRetainFrames; });
-  std::erase_if(vertex_buffers,
-                [&](const auto& entry) { return frame - entry.second.frame > kCacheRetainFrames; });
-  std::erase_if(index_buffers,
-                [&](const auto& entry) { return frame - entry.second.frame > kCacheRetainFrames; });
+  // Freed ranges are reused by later queue writes, which run after every
+  // command buffer already submitted; nothing in the open batch uses them.
+  std::erase_if(vertex_buffers, [&](const auto& entry) {
+    if (frame - entry.second.frame <= kCacheRetainFrames) return false;
+    vertex_pool.Free(entry.second.range);
+    return true;
+  });
+  std::erase_if(index_buffers, [&](const auto& entry) {
+    if (frame - entry.second.frame <= kCacheRetainFrames) return false;
+    (entry.second.index32 ? index32_pool : index16_pool).Free(entry.second.range);
+    return true;
+  });
 }
 
 }  // namespace rex::graphics::gta4_webgpu

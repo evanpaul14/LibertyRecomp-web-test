@@ -263,6 +263,7 @@ bool Gta4WebGpuGraphicsSystem::CaptureDevice(Work& work, uint32_t device, std::s
   const bool full = sent.empty();
   if (full) sent.resize(kGuestDeviceSize);
   work.device.device = device;
+  work.device.bytes.reserve(full ? kGuestDeviceSize : 8 * kDeviceChunkBytes);
   for (uint32_t chunk = 0; chunk < kDeviceChunkCount; ++chunk) {
     const size_t offset = size_t(chunk) * kDeviceChunkBytes;
     if (!full && BytesEqual(sent.data() + offset, bytes + offset, kDeviceChunkBytes)) continue;
