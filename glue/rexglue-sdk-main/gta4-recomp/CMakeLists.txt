@@ -380,9 +380,11 @@ elseif(EMSCRIPTEN)
         -sENVIRONMENT=web,worker,node
         -sEXIT_RUNTIME=1
         "--pre-js=${CMAKE_CURRENT_SOURCE_DIR}/res/web/webgpu_canvas.js"
+        "--pre-js=${CMAKE_CURRENT_SOURCE_DIR}/res/web/sdl_wasm64.js"
     )
     set_property(TARGET LibertyRecomp APPEND PROPERTY LINK_DEPENDS
-        "${CMAKE_CURRENT_SOURCE_DIR}/res/web/webgpu_canvas.js")
+        "${CMAKE_CURRENT_SOURCE_DIR}/res/web/webgpu_canvas.js"
+        "${CMAKE_CURRENT_SOURCE_DIR}/res/web/sdl_wasm64.js")
     option(LIBERTY_WEB_FUNCTION_NAMES
         "Keep function names in the web build so traps and profiles are readable"
         OFF)

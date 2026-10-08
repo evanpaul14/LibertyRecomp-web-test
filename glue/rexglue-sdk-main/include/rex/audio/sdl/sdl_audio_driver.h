@@ -55,6 +55,17 @@ class SDLAudioDriver : public AudioDriver {
   std::queue<float*> frames_queued_ = {};
   std::stack<float*> frames_unused_ = {};
   std::mutex frames_mutex_ = {};
+
+  // After the queue runs dry, play silence until this many frames are queued
+  // again (--audio_refill_frames), so one late guest frame costs one gap
+  // instead of a crackle per callback. Guarded by frames_mutex_.
+  bool refilling_ = true;
+  // Underrun statistics, logged every 5 s while they occur (web only).
+  struct Stats {
+    uint64_t start_ms = 0;
+    uint32_t callbacks = 0, played = 0, silent = 0, underruns = 0;
+    size_t min_queued = SIZE_MAX, max_queued = 0;
+  } stats_;
 };
 
 }  // namespace rex::audio::sdl

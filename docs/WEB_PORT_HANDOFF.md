@@ -131,9 +131,33 @@ mapped); this file is for whoever continues the work.
   `firstInstance` and storage-buffer reads in every shader, plus a flat varying
   to give the pixel shader the draw index; some vertex shaders already output
   18 varyings, so that needs checking against `maxInterStageShaderVariables`.
-- Next step candidates, in suggested order: recheck in Chrome and record perf
-  lines (first run after a build, then a cached run), the `firstInstance`
-  uniform selection above, then a game-file picker. Ask the user.
+- **Chrome recheck (2026-10-07, after 4ca42b25).** Intro cutscenes: 28 passes
+  a frame, render thread ~6–7 µs a draw (was 20–32), no pipeline stalls (0 ms
+  pipelines, no draws waiting), longest frame 1–1.5× the average. Heavy
+  scenes (4,000–5,400 draws) run 13–18 fps and are GPU-bound: every present
+  waited for the GPU, GPU frame latency 40–80 ms. The game thread spends
+  ~40% of its time capturing draws (2.1 s per 5 s). Light scenes hold 60 fps.
+- **Audio in Chrome (2026-10-07).** SDL3's `CPtrToHeap32Index` divided an
+  EM_ASM pointer (a Number) by `4n`, so every audio callback threw and nothing
+  played. `res/web/sdl_wasm64.js` (pre-js) defines it first; SDL keeps an
+  existing definition, so the submodule is untouched. Audio now plays but
+  crackles and sometimes runs slow. SDL's web backend pulls 2048 samples
+  (~43 ms, 8 guest frames) per callback on the page's main thread; when the
+  queue is empty the driver plays silence, and the guest's audio clock only
+  advances on played frames. The driver now waits for `--audio_refill_frames`
+  (12 on the web, 0 elsewhere) after an underrun and logs underrun stats every
+  5 s (web only). Measured: ~940 frames are needed per 5 s; light scenes kept
+  up (queue 40–64 frames), but scenes of 600–760 draws played only 707–730 with
+  210–234 silent (18–19 underruns, queue never above 16–18), even at 60 fps.
+  So the title produces audio at ~75–80% of real time there; buffering cannot
+  fix that. Likely the abrupt cutscene cuts with sped-up animation the user saw
+  come from the cutscene clock following this audio clock (not verified). Next:
+  pace Node's silent fallback by a real-time clock (it sleeps a fixed 5.3 ms
+  after each frame, so it always runs slow and hides the shortfall), then
+  profile the audio threads (XMA decode via FFmpeg, the title's mixer, or CPU
+  contention with the game thread's capture).
+- Next step candidates, in suggested order: the audio shortfall above, the
+  `firstInstance` uniform selection, then a game-file picker. Ask the user.
 - **Node graphics session (Dawn on Metal, M1 Mac, 2026-10-07).**
   - *Fixed: black loading screens.* Emscripten has no `CLOCK_MONOTONIC_RAW`;
     `clock_getres`/`clock_gettime` failed and, with asserts compiled out, the
@@ -387,8 +411,8 @@ node out/web-node/LibertyRecomp/LibertyRecomp.js --diagnostics=true \
   window's longest frame (render-thread busy and pipeline time in it), GPU
   frame latency (submit to completion, as seen by the render thread) and how
   many presents waited for the GPU.
-- Chrome's audio fails: SDL3's audio callback throws `Cannot mix BigInt and
-  other types` in `CPtrToHeap32Index` (a wasm64 bug in SDL's JavaScript).
+- Chrome's audio crackles and runs slow in busier scenes (see Where it
+  stands › Audio in Chrome).
 - The shader archive is zlib (12 MB); zstd would be 4.7 MB but needs a wasm zstd.
 - The `0x90000000` view does not mirror `0x80000000` on the web.
 - Guest FP rounding and flush modes are recorded but not applied.
@@ -418,4 +442,6 @@ node out/web-node/LibertyRecomp/LibertyRecomp.js --diagnostics=true \
    are 7–8 GB, so stream them rather than preloading into MEMFS. (Local runs
    already stream an installed game from `serve.py`; the lazy mount in
    `res/web/index.html` is a model for this.)
-3. **Audio, input and page lifecycle** (SDL audio context unlock, pointer lock, fullscreen).
+3. **Audio, input and page lifecycle.** Audio plays but the title produces it
+   below real time in busier scenes (see Where it stands › Audio in Chrome);
+   then pointer lock and fullscreen.

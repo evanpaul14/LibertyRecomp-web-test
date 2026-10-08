@@ -321,8 +321,14 @@ Not working yet:
   it has its own backing; nothing is known to rely on the mirror.
 - **Game files.** The browser can only read game files from a local
   `serve.py`; there is no file or folder picker yet.
-- **Audio in Chrome.** SDL3's audio callback throws `Cannot mix BigInt and other
-  types` (a wasm64 bug in SDL's JavaScript), so the browser build is silent.
+- **Audio in Chrome.** Audio plays, but it crackles and runs slow in busier
+  scenes: the title's audio thread produces only ~75–80% of real time there,
+  and the gaps are filled with silence. SDL3's own pointer conversion broke on
+  wasm64 (every callback threw `Cannot mix BigInt and other types`);
+  `res/web/sdl_wasm64.js` replaces it. After the queue runs dry, the SDL driver
+  waits for `--audio_refill_frames` (12 on the web) before playing again, and
+  logs `audio: … frames played, … silent (… underruns)` every 5 s while it
+  underruns.
 
 ## Roadmap
 

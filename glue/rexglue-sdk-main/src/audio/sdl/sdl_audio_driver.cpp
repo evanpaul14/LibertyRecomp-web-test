@@ -26,6 +26,15 @@
 #include <SDL3/SDL.h>
 
 REXCVAR_DEFINE_BOOL(audio_mute, false, "Audio", "Mute audio output");
+#ifdef __EMSCRIPTEN__
+// Browsers pull audio in large chunks (2048 samples, 8 guest frames) on the
+// page's main thread, so the queue needs more than a chunk in hand.
+constexpr int32_t kDefaultRefillFrames = 12;
+#else
+constexpr int32_t kDefaultRefillFrames = 0;
+#endif
+REXCVAR_DEFINE_INT32(audio_refill_frames, kDefaultRefillFrames, "Audio",
+                     "After an underrun, frames to queue before playing again (SDL driver)");
 
 namespace rex::audio::sdl {
 
@@ -279,10 +288,24 @@ void SDLAudioDriver::SDLCallback(void* userdata, SDL_AudioStream* stream, int ad
     REXAPU_ERROR("SDLAudioDriver::SDLCallback failed to allocate {} samples", sample_count);
     return;
   }
+  std::unique_lock<std::mutex> stats_guard(driver->frames_mutex_);
+  auto& stats = driver->stats_;
+  ++stats.callbacks;
+  stats.min_queued = std::min(stats.min_queued, driver->frames_queued_.size());
+  stats.max_queued = std::max(stats.max_queued, driver->frames_queued_.size());
+  const size_t refill = size_t(std::max(REXCVAR_GET(audio_refill_frames), 0));
+  if (driver->refilling_ && driver->frames_queued_.size() >= std::max<size_t>(refill, 1))
+    driver->refilling_ = false;
+  stats_guard.unlock();
   while (additional_amount > 0) {
     static uint32_t sdl_callback_count = 0;
     std::unique_lock<std::mutex> guard(driver->frames_mutex_);
-    if (driver->frames_queued_.empty()) {
+    if (driver->frames_queued_.empty() && !driver->refilling_) {
+      driver->refilling_ = refill > 0;
+      ++stats.underruns;
+    }
+    if (driver->frames_queued_.empty() || driver->refilling_) {
+      ++stats.silent;
       if (sdl_callback_count < 10) {
         REXAPU_DEBUG("SDLCallback: no frames queued (silence)");
         sdl_callback_count++;
@@ -296,6 +319,7 @@ void SDLAudioDriver::SDLCallback(void* userdata, SDL_AudioStream* stream, int ad
     } else {
       auto buffer = driver->frames_queued_.front();
       driver->frames_queued_.pop();
+      ++stats.played;
       if (REXCVAR_GET(audio_mute)) {
         std::memset(data, 0, len);
       } else {
@@ -324,6 +348,20 @@ void SDLAudioDriver::SDLCallback(void* userdata, SDL_AudioStream* stream, int ad
     }
   }
   SDL_stack_free(data);
+#ifdef __EMSCRIPTEN__
+  std::unique_lock<std::mutex> guard(driver->frames_mutex_);
+  const uint64_t now = SDL_GetTicks();
+  if (!stats.start_ms) stats.start_ms = now;
+  if (now - stats.start_ms >= 5000) {
+    if (stats.underruns)
+      REXAPU_WARN("audio: {} callbacks over {} ms: {} frames played, {} silent ({} underruns); "
+                  "queued {}-{} frames",
+                  stats.callbacks, now - stats.start_ms, stats.played, stats.silent,
+                  stats.underruns, stats.min_queued, stats.max_queued);
+    stats = {};
+    stats.start_ms = now;
+  }
+#endif
 }
 
 }  // namespace rex::audio::sdl
