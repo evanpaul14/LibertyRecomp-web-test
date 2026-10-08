@@ -61,17 +61,34 @@ mapped); this file is for whoever continues the work.
   - The Claude-in-Chrome extension could not see the WebGPU canvas in its own
     tab group (it stayed dark there while a normal tab rendered); use a tab
     opened normally (`open -a "Google Chrome" <url>`) and a screen capture.
-- **Profiling.** `--webgpu_perf_report=true` logs render-thread and capture
-  timing every 5 s as warnings, plus a `presents` line: presents shown on the
-  canvas, those with new frontbuffer contents, those skipped (no source, no
-  canvas, no surface texture with its status), canvas size, frontbuffer and GPU
-  error count. Use it with `--diagnostics=true
+- **Profiling.** `--webgpu_perf_report=true` logs every 5 s as warnings: a
+  `perf` line (fps, draws a frame, render-thread time per stage, new uniform
+  slots, redrawn draws, WebGPU calls per draw), a stall line (the longest
+  frame with the render thread's busy and pipeline time in it, GPU frame
+  latency, presents that waited for the GPU), a `presents` line (presents
+  shown on the canvas, those with new frontbuffer contents, those skipped: no
+  source, no canvas, no surface texture with its status; canvas size,
+  frontbuffer, GPU error count) and the game thread's `capture` line. Use it
+  with `--diagnostics=true
   --diagnostics_categories=logging --log_level=warn`: other diagnostics print
   a line per draw, and every line blocks the game thread until the page's
   main thread handles it. In the browser that alone held gameplay below 1 fps.
-- Next step candidates, in suggested order: per-draw render-thread cost
-  (gameplay runs at 3–10 fps and the heavy cutscene stretch at 3–6 fps; see
-  the Chrome numbers above), then a game-file picker. Ask the user.
+- **Per-draw performance session (2026-10-07, commits b08f89bb..e8e98c5f).**
+  Render-thread cost per draw fell from ~20 to ~10 µs in Node with Dawn on
+  Metal (heaviest intro stretch 4.5 → 9–11 fps; details and a benchmark table
+  under Known gaps › Performance). Changes: device-block deltas, per-binding
+  uniform reuse (the shader archive is now `LRWGSL03` with three uniform
+  bindings), cached input layouts, pooled vertex/index buffers, retry of a
+  draw interrupted by a flush, and at most two GPU frames in flight. The user
+  reports Chrome is clearly faster and gameplay briefly reached playable frame
+  rates, with stutter; the first run after the shader change stalled for
+  about a second at a time (Chrome recompiles every pipeline when the WGSL
+  changes), which fast-forwarded the opening cutscene. No Chrome perf numbers
+  were recorded yet.
+- Next step candidates, in suggested order: asynchronous pipeline creation
+  (the remaining stutter: in Node every spike over ~300 ms was pipeline
+  creation), the ~3 µs of untimed per-draw setup and ~4 µs of encode (see
+  Known gaps), then a game-file picker. Ask the user.
 - **Node graphics session (Dawn on Metal, M1 Mac, 2026-10-07).**
   - *Fixed: black loading screens.* Emscripten has no `CLOCK_MONOTONIC_RAW`;
     `clock_getres`/`clock_gettime` failed and, with asserts compiled out, the
@@ -148,7 +165,7 @@ mapped); this file is for whoever continues the work.
 | FPSCR | Per-thread virtual control word; wasm always rounds to nearest | `include/rex/platform/fpscr.h` |
 | Fibers | Thread fibers only; `Create`/`SwitchTo` fail loudly (GTA IV uses none) | `src/core/fiber_web.cpp` |
 | GPU | Statically linked WebGPU title-command renderer (no `dlopen` on web); created in `GTA4App::OnPreSetup`. `--gpu_plugin=none` = headless | `src/graphics/gta4_webgpu/`, `include/rex/graphics/gta4_webgpu.h`, `gta4-recomp/src/gta4_app.cpp` |
-| GPU threading | One render pthread owns the device and runs from the JS event loop (needed for `mapAsync` and canvas presentation), woken via `emscripten_proxy_async`; after each present it yields with a `MessageChannel` message, since a proxied wake can run in the same task and the canvas only updates when the task ends. Game threads capture device block/buffers/textures at submit (`Capture` in `graphics_system.cpp`) | `gta4_webgpu/graphics_system.cpp`, `work.h` |
+| GPU threading | One render pthread owns the device and runs from the JS event loop (needed for `mapAsync` and canvas presentation), woken via `emscripten_proxy_async`; at most two frames are in flight on the GPU (`TrackGpuFrame`); after each present it yields with a `MessageChannel` message, since a proxied wake can run in the same task and the canvas only updates when the task ends. Game threads capture device block/buffers/textures at submit (`Capture` in `graphics_system.cpp`) | `gta4_webgpu/graphics_system.cpp`, `work.h` |
 | Shaders | Stock SPIR-V → GLSL (SPIRV-Cross) → rewrite BDA constants to one UBO (VS 0, PS 4096, shared 8192, spec word 8192+0x500) and bindless to fixed slots → glslang → spirv-opt → naga → WGSL, then split the UBO into three group-0 bindings (VS, PS, shared + spec word 0x500), each with its own dynamic offset; dynamic register reads go through `xc_load`. naga undoes the Vulkan y-flip itself | `tools/webgpu/spirv_to_wgsl.py`, `tools/webgpu/split_uniforms.py`, `LibertyRecompLib/shader/webgpu_shader_archive.bin` |
 | Vertex data | Every attribute decoded to `float32x4` on the CPU per buffer generation (shaders read vec4 floats; WebGPU cannot feed integer formats to them) | `gta4_webgpu/vertex_decode.h`, `resources.cpp` |
 | Render targets | Single-sampled; resolved depth stored as `rg32float` (depth, stencil), with packed A8R8G8B8 aliases rebuilt on demand; resolves pick the latest surface at the same EDRAM placement, and map samples when its MSAA layout differs from the resolved view (`resolve_color`) | `gta4_webgpu/resources.cpp`, `passes.cpp`, `renderer.cpp` |
@@ -272,10 +289,10 @@ node out/web-node/LibertyRecomp/LibertyRecomp.js --diagnostics=true \
 - Write watches (page-protection faults) never fire; the renderer trusts the
   title's `ResourceUnlock` notifications plus a byte compare when a capture is
   marked dirty. A buffer the title writes without unlocking would go stale.
-- Performance: identical uniform blocks share a slot within a batch, and a
-  draw whose constants and shared state did not change reuses the previous
-  slot outright; redundant pass state is skipped; texture bind groups,
-  samplers and vertex input layouts are cached; draws send only the 128-byte
+- Performance: each uniform binding (vertex, pixel, shared constants) keeps
+  its slot while its inputs are unchanged; redundant pass state is skipped;
+  texture bind groups, samplers and vertex input layouts are cached; converted
+  vertex and index data share pooled buffers; draws send only the 128-byte
   chunks of the device block that changed (the render thread keeps its own
   copy); the hot byte compares and swaps use SIMD128 (Emscripten's libc does
   them per byte). Measured in Chrome before the delta/reuse work: ~20–32 µs of
@@ -288,7 +305,8 @@ node out/web-node/LibertyRecomp/LibertyRecomp.js --diagnostics=true \
   | Before (743d745b) | ~8,400 draws | 4.5–4.8 | ~20 (8.2 / 3.2 / 2.1 / 1.6 / 2.2) |
   | Deltas + uniform reuse + input cache (b08f89bb) | ~6,500 draws | 9.0 | ~13.3 (6.8 / 1.6 / 1.0 / 0.8 / 1.8) |
   | + pooled vertex/index buffers (ec1b0ee8) | ~6,200–8,800 draws | 8.1–11.2 | ~9.5–11.8 (3.9 / 1.5–2.2 / 0.9 / 0.8–1.5 / 1.3–1.7) |
-  | + split uniform bindings | ~6,600–8,800 draws | 9.3–10.9 (6.5 while compiling pipelines) | ~9.4–10.1 excluding compiles (4.0 / 0.4 / 0.8 / 0.9–1.5 / 1.4) |
+  | + split uniform bindings (20b5a24a) | ~6,600–8,800 draws | 9.3–10.9 (6.5 while compiling pipelines) | ~9.4–10.1 excluding compiles (4.0 / 0.4 / 0.8 / 0.9–1.5 / 1.4) |
+  | + two GPU frames in flight (e8e98c5f) | ~6,600–8,800 draws | 8.1–12.1 | unchanged |
 
   Light scenes (300–850 draws) hold the 60 fps cap throughout. Converted
   vertex and index data now live in 32 MB pooled buffers (`BufferPool`): draws
@@ -337,12 +355,13 @@ node out/web-node/LibertyRecomp/LibertyRecomp.js --diagnostics=true \
 1. **WebGPU renderer performance.** The renderer is done as a title-command
    renderer (the same interface the desktop gta4-native and gta4-metal
    renderers use, not Xenos emulation), and Chrome renders the intro correctly
-   (see above). In Chrome, pipeline compiles and texture decoding are already
-   near zero per frame; the cost is per-draw setup (inputs, bindings,
-   uniforms, encoding) and the game thread's captures. Next: cut per-draw work
-   and allocations, and send device-block dirty deltas; gameplay in Chrome
-   is playable but runs at only 3–10 fps. Later: compile pipelines off the
-   render thread and close the fidelity gaps above.
+   (see above). Per-draw cost is down to ~10 µs (Node, Dawn on Metal; see
+   Known gaps › Performance). Next: create pipelines asynchronously (skip or
+   substitute a draw until its pipeline is ready) to remove the stutter, then
+   the untimed per-draw setup (fixed state, shared constants, targets,
+   pipeline key) and the remaining uniform bind-group call. Record Chrome
+   `perf` lines for a heavy cutscene and gameplay in the benchmark table.
+   Later: close the fidelity gaps above.
 2. **In-browser game files.** A file or folder picker (File System Access API /
    OPFS), mounted so the existing `gta4::install::Install()` can read it;
    reuse the non-interactive install path in `GTA4App::OnFinalizePaths`. Files

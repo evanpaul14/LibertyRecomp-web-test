@@ -150,7 +150,9 @@ named by the title's frame number. `--webgpu_trace_frame=N` logs every title
 command of that frame (with each draw's decoded vertex inputs, nonzero pixel
 constants and bound textures) and always dumps it; trace lines are info-level, so
 add `--log_level=info`. Every 60 frames the renderer logs its draw, clear and
-resolve counts. `--webgpu_perf_report=true` logs timing every 5 s as warnings.
+resolve counts. `--webgpu_perf_report=true` logs timing every 5 s as warnings:
+fps, render-thread time per stage, WebGPU calls per draw, the longest frame and
+GPU frame latency.
 `--webgpu_frame_limit` caps presents per second (default 60, 0 = unlimited).
 With a traced frame, `--webgpu_trace_pixel=X,Y` logs every draw that changed
 that texel of its first color target, and `--webgpu_skip_pixel_shader=HASH,...`
@@ -192,8 +194,9 @@ and buffer mapping and canvas presentation only happen when that worker returns 
 its event loop. One render thread therefore owns the device and runs from the event
 loop; it is woken through Emscripten's proxying queue. The game's threads, which
 expect guest memory to be read when a command is submitted, capture what each
-command needs (the 22 KB device block, vertex and index buffers, texture data, UP
-vertices) and queue it. Captured buffers and textures are reused until the title
+command needs (the parts of the 22 KB device block that changed since the last
+draw, vertex and index buffers, texture data, UP vertices) and queue it; the
+render thread keeps its own copy of each device block. Captured buffers and textures are reused until the title
 reports a write (`ResourceUnlock`), so static assets are copied once.
 Synchronous commands (texture locks) wait for the render thread.
 
@@ -203,6 +206,14 @@ to `float32x4` on the CPU once per buffer generation. Shader inputs are renumber
 densely (WebGPU allows 16 vertex locations; the title uses semantic locations up to
 21). Fans, quads and restart strips become 32-bit index lists, as in the Metal
 renderer, and UP rectangle lists get their fourth corner reconstructed.
+Converted vertex and index data share large pooled buffers; a draw selects its
+data with `firstIndex` and `baseVertex`, so consecutive draws keep one binding
+(every WebGPU call crosses from wasm into the browser).
+
+**Constants.** The title's vertex constants, pixel constants and shared
+constants are three uniform bindings, each with its own dynamic offset. A draw
+writes a new slot only for a part whose inputs changed, judged by which chunks
+of the device block changed.
 
 **Targets and resolves.** Every render target is single-sampled (WebGPU only has 1×
 and 4× MSAA). Color resolves copy directly or through a small conversion pass
@@ -222,7 +233,8 @@ a fixed-function stencil Replace.
 **Presentation.** A present renders the frontbuffer texture into the page canvas
 and acknowledges the frame in the guest device block, which the title waits on.
 Neither the canvas nor Node blocks on vsync, so the presenting thread paces
-itself to `--webgpu_frame_limit` frames a second.
+itself to `--webgpu_frame_limit` frames a second. At most two frames are in
+flight on the GPU; a present waits for an earlier one to finish.
 
 ## Status
 
@@ -237,9 +249,14 @@ Working:
   unreadable.`).
 - With game files served by `tools/web/serve.py`, Chrome on an M1 Mac renders
   the loading screens and the intro cutscenes lit and correct, with no stalls
-  or GPU errors. Light scenes run at 40–59 fps; the heaviest cutscene stretch
-  (about 6,000 draws a frame) drops to 3–6 fps. Gameplay is playable: walking
-  and driving around Liberty City runs at about 3–10 fps.
+  or GPU errors. Gameplay is playable: walking and driving around Liberty City
+  works. Before the per-draw work of 2026-10-07, light scenes ran at 40–59 fps,
+  the heaviest cutscene stretch (about 6,000 draws a frame) at 3–6 fps and
+  gameplay at about 3–10 fps. Since then it is clearly faster and gameplay
+  briefly reaches playable frame rates, with stutter from shader compiles (no
+  Chrome measurements recorded yet). The first run after the shader archive
+  changes stalls for about a second at a time while Chrome compiles every
+  pipeline; later runs reuse Chrome's shader cache.
 
 `rex-web-memory-test` checks the memory layout and MMIO routing under Node 24:
 
@@ -266,8 +283,9 @@ runs into gameplay:
   reach: the loading screen runs at about 24 fps, gameplay frames take 4–7
   seconds each;
 - with Dawn on Metal (an M1 Mac), the loading-screen artwork renders correctly
-  and the intro is reached in about two minutes at 60 fps; intro gameplay frames
-  (8000+ draws) run at about 5 fps. The intro's deferred lighting, coronas and
+  and the intro is reached in about two minutes at 60 fps; the heaviest intro
+  frames (6,600–8,800 draws) run at about 8–12 fps (about 4.5 fps before the
+  per-draw work). The intro's deferred lighting, coronas and
   bloom render correctly, and a 19-minute run reached gameplay without stalling.
 
 `--gta4_log_guest_debug_print=true` logs the title's own debug messages (the
@@ -285,9 +303,9 @@ Not working yet:
   constants, sampler border colors and mirror-clamp addressing (approximated),
   wireframe fill, and reads of 3D or block-compressed GPU textures.
 - **Performance.** Heavy scenes are limited by the render thread's per-draw
-  setup (about 20–32 µs a draw in Chrome), and the game thread spends about a
-  third of its time capturing. Every draw still copies the 22 KB device block
-  (the Vulkan renderer sends dirty deltas), and pipelines compile synchronously.
+  cost, about 10 µs a draw in Node with Dawn on Metal (down from about 20), of
+  which about 4 µs is WebGPU calls. Pipelines compile synchronously, which
+  causes stutter when new shaders appear.
 - **Write watches.** The runtime's memory-coherence tracking relies on page
   protection faults, which wasm does not have. The renderer instead relies on the
   title's own unlock notifications.
