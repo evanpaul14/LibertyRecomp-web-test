@@ -22,7 +22,8 @@ class Renderer {
   enum class Status {
     kDone,     // Finished; keep draining.
     kYield,    // Finished; return to the event loop first (a frame was presented).
-    kPending,  // Waiting on the GPU (a readback); the resume callback continues.
+    kPending,  // Waiting on the GPU (a readback, or frames in flight); the resume
+               // callback continues.
   };
 
   Renderer(memory::Memory* memory, const ShaderArchive* archive);

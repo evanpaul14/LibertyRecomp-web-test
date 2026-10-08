@@ -1,9 +1,10 @@
 # Web / WebAssembly Build (Experimental)
 
 > [!WARNING]
-> The web port is at an early stage. It builds, links and starts in a browser and
-> renders with **WebGPU**, but the browser cannot load your game files yet, so the
-> game itself has only been run under Node.js so far.
+> The web port is at an early stage. It builds, links and runs in a browser and
+> renders with **WebGPU**, but the page cannot load your game files yet: it runs
+> the game only from a local install served by `tools/web/serve.py`, or under
+> Node.js.
 > See [Status](#status) and [Roadmap](#roadmap).
 
 The web build compiles the RexGlue runtime and the recompiled GTA IV code to
@@ -81,7 +82,10 @@ merges the three constant blocks into one uniform buffer (vertex constants at by
 0, pixel constants at 4096, shared constants at 8192), resolves each bindless index
 to a fixed texture slot (`@group(1) @binding(slot)`, its sampler at `32 + slot`),
 turns the pipeline specialization constant into a uniform word, removes switch
-fall-through, and then runs `spirv-opt` and naga. All 2062 shader variants
+fall-through, and then runs `spirv-opt` and naga. Finally `split_uniforms.py`
+splits the uniform buffer into three bindings of group 0 (vertex constants,
+pixel constants, shared constants), each with its own dynamic offset, so the
+renderer can reuse each one while it is unchanged. All 2062 shader variants
 translate and pass Tint's validation in Dawn.
 
 ## Run
@@ -96,6 +100,14 @@ python3 tools/web/serve.py            # serves out/web/LibertyRecomp on :8080
 
 Then open <http://localhost:8080/>. Command-line options can be passed as
 repeated `arg` query parameters, for example `?arg=--diagnostics=true`.
+
+For local testing, the server also exposes an installed game directory
+(`--game`, default `$XDG_DATA_HOME/LibertyRecomp/game`, the same contents as a
+desktop install) at `/game/` with a manifest and HTTP range requests. The page
+mounts those files lazily into Emscripten's filesystem, so the archives are read
+in chunks rather than copied into memory. Install the game first (for example
+with the Node build below); the installer cannot map a 7.8 GB `.iso` under Node,
+so give it an extracted disc folder.
 
 The page has two stacked canvases: WebGPU draws into `#liberty-gpu`, which the
 renderer's thread receives as an `OffscreenCanvas`, and SDL keeps `#canvas` on top
@@ -121,8 +133,9 @@ option back off for the browser.
 
 Node has no WebGPU of its own. Dawn's Node bindings (the npm package `webgpu`)
 provide it; point `LIBERTY_DAWN_NODE` at the package and every worker gets a GPU.
-Without a hardware Vulkan driver, Chromium's bundled SwiftShader works as the
-device. The game also needs the `ws` package once it opens a socket:
+On macOS Dawn uses Metal directly. On Linux without a hardware Vulkan driver,
+Chromium's bundled SwiftShader works as the device (set `VK_ICD_FILENAMES` as
+below). The game also needs the `ws` package once it opens a socket:
 
 ```bash
 npm install --prefix /tmp/dawn webgpu ws
@@ -132,10 +145,26 @@ XDG_DATA_HOME=/path/to/data node out/web/LibertyRecomp/LibertyRecomp.js --diagno
     --webgpu_frame_dump_path=/tmp/frames/f --webgpu_frame_dump_interval=60
 ```
 
-`--webgpu_frame_dump_path` writes every Nth presented frame as a PAM image (RGBA).
-`--webgpu_trace_frame=N` logs every title command of frame N. Every 60 frames the
-renderer logs its draw, clear and resolve counts. `--gpu_plugin=none` restores the
-old headless mode.
+`--webgpu_frame_dump_path` writes every Nth presented frame as a PAM image (RGBA),
+named by the title's frame number. `--webgpu_trace_frame=N` logs every title
+command of that frame (with each draw's decoded vertex inputs, nonzero pixel
+constants and bound textures) and always dumps it; trace lines are info-level, so
+add `--log_level=info`. Every 60 frames the renderer logs its draw, clear and
+resolve counts. `--webgpu_perf_report=true` times the renderer's stages and logs
+every 5 s as warnings: fps, draws and render passes a frame, render-thread
+time per stage, WebGPU calls per draw, the longest frame and GPU frame latency.
+Without it no stage timing runs (each clock read is a call out to JavaScript).
+`--webgpu_frame_limit` caps presents per second (default 60, 0 = unlimited).
+Title pipelines are created asynchronously, and a draw is skipped until its
+pipeline is ready (`--webgpu_async_pipelines=false` creates them synchronously;
+a traced frame always does). Shader modules for registered shaders are created
+ahead of their first draw, `--webgpu_shader_warmup_ms` (default 4) of
+render-thread time a frame, mostly during the first loading screens.
+With a traced frame, `--webgpu_trace_pixel=X,Y` logs every draw that changed
+that texel of its first color target, and `--webgpu_skip_pixel_shader=HASH,...`
+drops draws by pixel shader, to see what an effect contributes.
+`--gpu_plugin=none` restores the old headless mode. If no frame is presented
+for 15 seconds, the renderer logs every thread and what it is waiting on.
 
 ## How the port works
 
@@ -154,6 +183,7 @@ old headless mode.
 | Fibers | ucontext / Win32 fibers | Thread fibers only (`fiber_web.cpp`); GTA IV imports no guest fiber APIs |
 | FFmpeg (XMA) | Platform `config.h` | `thirdparty/ffmpeg-web/config.h`: portable C only |
 | Thread suspend / APC wake | Real-time signals | `pthread_kill`; delivered when the target worker services its mailbox |
+| Host clock | `CLOCK_MONOTONIC_RAW` (Linux), `mach_absolute_time` (macOS) | `CLOCK_MONOTONIC`: Emscripten has no raw clock (`src/core/clock_posix.cpp`) |
 | Community multiplayer | CURL + OpenSSL backend | Not built; selecting it reports an error |
 | Game Center, user music, microphone | Objective-C++ bridges | Report unavailable (`src/web/web_platform_bridges.cpp`) |
 | RenderDoc | Optional | Not available |
@@ -170,8 +200,9 @@ and buffer mapping and canvas presentation only happen when that worker returns 
 its event loop. One render thread therefore owns the device and runs from the event
 loop; it is woken through Emscripten's proxying queue. The game's threads, which
 expect guest memory to be read when a command is submitted, capture what each
-command needs (the 22 KB device block, vertex and index buffers, texture data, UP
-vertices) and queue it. Captured buffers and textures are reused until the title
+command needs (the parts of the 22 KB device block that changed since the last
+draw, vertex and index buffers, texture data, UP vertices) and queue it; the
+render thread keeps its own copy of each device block. Captured buffers and textures are reused until the title
 reports a write (`ResourceUnlock`), so static assets are copied once.
 Synchronous commands (texture locks) wait for the render thread.
 
@@ -181,15 +212,35 @@ to `float32x4` on the CPU once per buffer generation. Shader inputs are renumber
 densely (WebGPU allows 16 vertex locations; the title uses semantic locations up to
 21). Fans, quads and restart strips become 32-bit index lists, as in the Metal
 renderer, and UP rectangle lists get their fourth corner reconstructed.
+Converted vertex and index data share large pooled buffers; a draw selects its
+data with `firstIndex` and `baseVertex`, so consecutive draws keep one binding
+(every WebGPU call crosses from wasm into the browser).
+
+**Constants.** The title's vertex constants, pixel constants and shared
+constants are three uniform bindings, each with its own dynamic offset. A draw
+writes a new slot only for a part whose inputs changed, judged by which chunks
+of the device block changed.
 
 **Targets and resolves.** Every render target is single-sampled (WebGPU only has 1×
 and 4× MSAA). Color resolves copy directly or through a small conversion pass
-(exponent bias, format change); resolved depth is stored as `r32float` so title
+(exponent bias, format change); resolved depth is stored as `rg32float` (depth and stencil) so title
 shaders can sample it with a filtering sampler. Surfaces that share an EDRAM
-placement resolve from the one written last.
+placement resolve from the one written last. When that surface has a different
+MSAA layout than the resolved view (the title downsamples its bloom and exposure
+chain by resolving a 4× view of a 1× surface), the selected samples are mapped
+onto it and averaged, as the native renderer's conversion shader does.
+
+**Depth handoff.** After the G-buffer, the title moves scene depth to the forward
+depth surface and asks for the stencil to be rebuilt: 0x80 where the scene is
+empty, 0xFF where it is covered. The deferred lighting passes test that stencil.
+The renderer copies depth from the resolved snapshot and writes the stencil with
+a fixed-function stencil Replace.
 
 **Presentation.** A present renders the frontbuffer texture into the page canvas
 and acknowledges the frame in the guest device block, which the title waits on.
+Neither the canvas nor Node blocks on vsync, so the presenting thread paces
+itself to `--webgpu_frame_limit` frames a second. At most two frames are in
+flight on the GPU; a present waits for an earlier one to finish.
 
 ## Status
 
@@ -198,17 +249,21 @@ Working:
 - The full RexGlue runtime (core, system, kernel, filesystem, audio, input, UI)
   and FFmpeg compile for wasm64.
 - All generated GTA IV code compiles, and the app links to a single module.
-- In Chromium (tested with headless Chromium 141) the page is cross-origin
-  isolated, the module instantiates, and `main()` runs on its worker. Startup
-  resolves the title paths in Emscripten's virtual filesystem, applies the
-  graphics policies, and reaches the installation check. Without game files it
-  stops there with `GTA IV installation is not launch-ready: default.xex is
-  missing or unreadable.`
-- The canvas hand-off to the render thread works in Chromium: the canvas arrives
-  in the render worker at the page size, and surface configuration and rendering
-  run without WebGPU errors. Headless Chromium in a container without a GPU does
-  not show WebGPU canvas contents in screenshots, so the browser's picture has not
-  been checked by eye yet.
+- In Chromium the page is cross-origin isolated, the module instantiates, and
+  `main()` runs on its worker. Without game files it stops at the installation
+  check (`GTA IV installation is not launch-ready: default.xex is missing or
+  unreadable.`).
+- With game files served by `tools/web/serve.py`, Chrome on an M1 Mac renders
+  the loading screens and the intro cutscenes lit and correct, with no stalls
+  or GPU errors. Gameplay is playable: walking and driving around Liberty City
+  works. Before the per-draw work of 2026-10-07, light scenes ran at 40–59 fps,
+  the heaviest cutscene stretch (about 6,000 draws a frame) at 3–6 fps and
+  gameplay at about 3–10 fps. Since then it is clearly faster and gameplay
+  briefly reaches playable frame rates, with stutter from shader compiles (no
+  Chrome measurements recorded yet). The first run after the shader archive
+  changed stalled for about a second at a time while Chrome compiled every
+  pipeline; pipelines are now created asynchronously and shader modules ahead
+  of use, which has not been rechecked in Chrome yet.
 
 `rex-web-memory-test` checks the memory layout and MMIO routing under Node 24:
 
@@ -233,7 +288,12 @@ runs into gameplay:
   reflections and the HUD radar, at about 8000 draws a frame with no rejected
   draws or WebGPU errors. On a CPU-emulated GPU this takes over 15 minutes to
   reach: the loading screen runs at about 24 fps, gameplay frames take 4–7
-  seconds each.
+  seconds each;
+- with Dawn on Metal (an M1 Mac), the loading-screen artwork renders correctly
+  and the intro is reached in about two minutes at 60 fps; the heaviest intro
+  frames (6,600–8,800 draws) run at about 8–12 fps (about 4.5 fps before the
+  per-draw work). The intro's deferred lighting, coronas and
+  bloom render correctly, and a 19-minute run reached gameplay without stalling.
 
 `--gta4_log_guest_debug_print=true` logs the title's own debug messages (the
 retail build discards them), which is the quickest way to see why it stops.
@@ -246,26 +306,38 @@ Not working yet:
 - **Renderer gaps** (all present in the Metal renderer): MSAA, temporal AA and
   upscaling, SMAA/FXAA, the modern post-processing effects (depth of field, sun
   shafts, FusionFix tone mapping), vector font replacement, virtual and reflection
-  targets at a different physical resolution, the stencil rebuild of the
-  forward-pass depth handoff, separate color/alpha blend constants, sampler border
-  colors and mirror-clamp addressing (approximated), wireframe fill, and reads of
-  3D or block-compressed GPU textures.
-- **Performance.** Every draw compares or copies the 22 KB device block, and
-  nothing is profiled yet.
+  targets at a different physical resolution, separate color/alpha blend
+  constants, sampler border colors and mirror-clamp addressing (approximated),
+  wireframe fill, and reads of 3D or block-compressed GPU textures.
+- **Performance.** Heavy scenes are limited by the render thread's per-draw
+  cost, about 10 µs a draw in Node with Dawn on Metal (down from about 20), of
+  which about 4 µs is WebGPU calls. Pipelines compile asynchronously, so a new
+  shader no longer stalls the frame; its draws are missing for the few frames
+  until it is ready.
 - **Write watches.** The runtime's memory-coherence tracking relies on page
   protection faults, which wasm does not have. The renderer instead relies on the
   title's own unlock notifications.
 - **`0x90000000` mirror.** Natively this view mirrors `0x80000000`. On the web
   it has its own backing; nothing is known to rely on the mirror.
-- **Game files.** There is no way yet to give the browser build your game files.
+- **Game files.** The browser can only read game files from a local
+  `serve.py`; there is no file or folder picker yet.
+- **Audio in Chrome.** Audio plays, but it crackles and runs slow in busier
+  scenes: the title's audio thread produces only ~75–80% of real time there,
+  and the gaps are filled with silence. SDL3's own pointer conversion broke on
+  wasm64 (every callback threw `Cannot mix BigInt and other types`);
+  `res/web/sdl_wasm64.js` replaces it. After the queue runs dry, the SDL driver
+  waits for `--audio_refill_frames` (12 on the web) before playing again, and
+  logs `audio: … frames played, … silent (… underruns)` every 5 s while it
+  underruns.
 
 ## Roadmap
 
 1. **Memory and MMIO.** Done. The web memory macros live in the generated
    header (`gta4_init.h`) and its codegen template (`init_h.inja`), so the
    per-function generated code did not need regenerating.
-2. **Game files.** Load the user's files through the File System Access API or
-   OPFS, and adapt the installer to the browser.
+2. **Game files.** Local runs read an installed game from `serve.py`. Still to
+   do: load the user's own files through the File System Access API or OPFS, and
+   adapt the installer to the browser.
 3. **WebGPU renderer.** Done for the title-command path; see the gaps above.
 4. **Audio, input and networking.** Hook SDL audio and input up to the page
    lifecycle. Replace the UDP and HTTP online backends with WebRTC and `fetch`.

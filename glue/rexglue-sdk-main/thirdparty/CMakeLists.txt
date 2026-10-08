@@ -283,6 +283,12 @@ else()
     set(SDL_DIALOG ON CACHE BOOL "" FORCE)
 endif()
 set(SDL_TRAY OFF CACHE BOOL "" FORCE)
+if(EMSCRIPTEN)
+    # The web build is multithreaded (-pthread). SDL defaults to its
+    # thread-less build there, whose mutexes do nothing: game threads pushing
+    # UI wakeups would then race the UI thread on the event queue.
+    set(SDL_PTHREADS ON CACHE BOOL "" FORCE)
+endif()
 set(SDL_CAMERA OFF CACHE BOOL "" FORCE)
 
 # Disable graphics APIs (unused without video) — only on non-Apple

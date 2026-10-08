@@ -78,7 +78,7 @@ elseif(UNIX)
     if(ANDROID)
         set(REXCORE_POSIX_FIBER fiber_android.cpp)
     elseif(EMSCRIPTEN)
-        set(REXCORE_POSIX_FIBER fiber_web.cpp)
+        set(REXCORE_POSIX_FIBER fiber_web.cpp wait_trace_web.cpp)
         # No mmap aliasing or page protection in wasm linear memory.
         set(REXCORE_POSIX_MEMORY memory_web.cpp)
     else()

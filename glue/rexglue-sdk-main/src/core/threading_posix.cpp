@@ -34,6 +34,7 @@ static_assert(REX_PLATFORM_LINUX || REX_PLATFORM_MAC, "This file is POSIX-only")
 #include <rex/chrono/chrono_steady_cast.h>
 #include <rex/logging.h>
 #include <rex/thread/timer_queue.h>
+#include <rex/thread/wait_trace.h>
 
 #include <sched.h>
 
@@ -150,6 +151,7 @@ static void SetPthreadName(pthread_t thread, const std::string& name) {
 #if REX_PLATFORM_WEB
   // No pthread_setname_np; this names the Web Worker in browser devtools.
   emscripten_set_thread_name(thread, name.c_str());
+  wait_trace::SetThreadName(uintptr_t(thread), name.c_str());
 #else
   pthread_setname_np(thread, name.c_str());
 #endif
@@ -884,10 +886,12 @@ class PosixCondition<Thread> : public PosixConditionBase {
     }
 
     if (is_current_thread) {
+      wait_trace::Scope wait_scope("suspended (self)");
       WaitSuspended();
       return true;
     }
 
+    wait_trace::Increment(wait_trace::Counter::kSuspendSent);
     int result = pthread_kill(thread_, GetSystemSignal(SignalType::kThreadSuspend));
     return result == 0;
   }
@@ -1438,7 +1442,12 @@ static void signal_handler(int signal, siginfo_t* /*info*/, void* /*context*/) {
       if (!current_thread_) {
         return;
       }
-      current_thread_->WaitSuspended();
+      wait_trace::Increment(wait_trace::Counter::kSuspendDelivered);
+      {
+        wait_trace::Scope wait_scope("suspended (signal handler)");
+        current_thread_->WaitSuspended();
+      }
+      wait_trace::Increment(wait_trace::Counter::kSuspendWaitDone);
     } break;
     case SignalType::kThreadUserCallback: {
       // Callbacks are drained from alertable waits in normal thread context.

@@ -63,7 +63,8 @@ class Gta4WebGpuGraphicsSystem final : public system::IGraphicsSystem {
   // Producer side, under capture_mutex_.
   bool Capture(const void* command, size_t size, Work& work, std::string& error);
   bool CaptureDraw(Work& work, uint32_t device, bool indexed, std::string& error);
-  bool SnapshotDevice(Work& work, uint32_t device, std::string& error);
+  bool CaptureDevice(Work& work, uint32_t device, std::string& error);
+  bool ReadTargets(Work& work, uint32_t device, std::string& error);
   std::shared_ptr<const BufferCapture> CaptureBuffer(uint32_t handle, std::string& error);
   std::shared_ptr<const TextureCapture> CaptureTexture(uint32_t handle,
                                                        const xenos::xe_gpu_texture_fetch_t& fetch,
@@ -73,12 +74,16 @@ class Gta4WebGpuGraphicsSystem final : public system::IGraphicsSystem {
   const uint8_t* GuestPhysical(uint32_t address, size_t size) const;
   void ForgetResource(uint32_t handle);
   void Enqueue(std::unique_ptr<Work> work, bool present);
+  void PacePresent();
 
   // Render thread.
   static void* RenderThreadMain(void* self);
   static void DrainThunk(void* self);
+  static void WatchdogThunk(void* self);
+  static void ResumeThunk(void* self);
   void Drain();
   void ScheduleDrain();
+  void YieldToEventLoop();
 
   memory::Memory* memory_ = nullptr;
   const ShaderArchive* archive_ = nullptr;
@@ -95,8 +100,14 @@ class Gta4WebGpuGraphicsSystem final : public system::IGraphicsSystem {
   // and reflection targets): never captured from guest memory.
   std::unordered_set<uint32_t> gpu_textures_;
   uint64_t next_generation_ = 1;
-  std::shared_ptr<std::vector<uint8_t>> last_device_;
-  uint32_t last_device_address_ = 0;
+  // Submitting-thread time (ms) since the last report, under capture_mutex_
+  // except blocked_ms_ (under queue_mutex_).
+  double capture_ms_ = 0, snapshot_ms_ = 0, buffer_capture_ms_ = 0, texture_capture_ms_ = 0, report_start_ms_ = 0;
+  uint64_t captured_bytes_ = 0, snapshots_ = 0, snapshot_bytes_ = 0;
+  double blocked_ms_ = 0;
+  double next_present_ms_ = 0;  // Earliest time of the next present (presenting thread).
+  // Each device block as last sent to the render thread, by guest address.
+  std::unordered_map<uint32_t, std::vector<uint8_t>> sent_devices_;
 
   std::mutex queue_mutex_;
   std::condition_variable queue_space_;
@@ -105,6 +116,15 @@ class Gta4WebGpuGraphicsSystem final : public system::IGraphicsSystem {
   std::atomic<bool> drain_scheduled_{false};
   bool render_running_ = false;
   bool waiting_on_gpu_ = false;
+  uint64_t executed_ = 0;  // Commands the render thread has run (under queue_mutex_).
+  uint32_t last_type_ = 0;
+  uint64_t presents_executed_ = 0;  // Under queue_mutex_.
+  uint64_t watchdog_executed_ = 0;  // Render thread only.
+  uint64_t watchdog_presents_ = 0;  // Render thread only.
+  // Render thread only: a present returned to the event loop and the drain
+  // resumes from ResumeThunk; drain_scheduled_ stays set until then.
+  bool yield_pending_ = false;
+  uint32_t watchdog_idle_ticks_ = 0;  // Render thread only.
 
   pthread_t render_thread_{};
   bool render_thread_started_ = false;

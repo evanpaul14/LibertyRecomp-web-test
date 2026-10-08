@@ -15,6 +15,7 @@
 #include <algorithm>
 #include <string>
 
+#include <rex/thread/wait_trace.h>
 #include <rex/chrono/chrono_steady_cast.h>
 #include <rex/kernel/xboxkrnl/private.h>
 #include <rex/kernel/xboxkrnl/rtl.h>
@@ -399,6 +400,8 @@ void RtlEnterCriticalSection_entry(ppc_ptr_t<X_RTL_CRITICAL_SECTION> cs) {
 
   if (rex::thread::atomic_inc(&cs->lock_count) != 0) {
     // Create a full waiter.
+    rex::thread::wait_trace::Scope wait_scope("critical section %08X owned by thread %08X",
+                                              cs.guest_address(), uint32_t(cs->owning_thread));
     xeKeWaitForSingleObject(reinterpret_cast<void*>(cs.host_address()), 8, 0, 0, nullptr);
   }
 

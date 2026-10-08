@@ -1,14 +1,22 @@
 #include "renderer_state.h"
+#include "simd_bytes.h"
 
 #include <algorithm>
 #include <atomic>
 #include <cstring>
+#include <optional>
 
 #include <fmt/format.h>
 
 #include <rex/cvar.h>
 #include <rex/logging.h>
 
+REXCVAR_DEFINE_BOOL(webgpu_perf_report, false, "GPU/Diagnostics",
+                    "Web build: time the renderer's stages and log timing reports as "
+                    "warnings every 5 s (shown with --log_level=warn)");
+REXCVAR_DEFINE_DOUBLE(webgpu_shader_warmup_ms, 4.0, "GPU",
+                      "Web build: render-thread time per frame spent creating shader modules "
+                      "for registered shaders ahead of their first draw (0: create on first use)");
 REXCVAR_DEFINE_UINT32(webgpu_trace_frame, 0, "GPU/Diagnostics",
                       "Web build: log every title command of this presented frame");
 
@@ -16,7 +24,8 @@ namespace rex::graphics::gta4_webgpu {
 namespace {
 using namespace gta4_native;
 
-constexpr uint64_t kUniformStride = 9728;  // Bytes used per draw, 256-aligned.
+constexpr std::array<uint64_t, kUniformBindings> kUniformSizes{
+    kUniformVertexBytes, kUniformPixelBytes, kUniformSharedBytes};
 constexpr uint64_t kInitialUniformArena = 16u * 1024u * 1024u;
 constexpr uint64_t kInitialGeometryArena = 8u * 1024u * 1024u;
 constexpr uint64_t kMaximumArena = 256u * 1024u * 1024u;
@@ -40,6 +49,23 @@ fn source_coord(p: vec4<f32>) -> vec2<i32> {
   let rel = (p.xy - params.a.zw) * params.b.xy / params.b.zw;
   return vec2<i32>(params.a.xy + floor(rel));
 }
+// The guest's 24-bit depth encodings (unorm, or 20e4 float when c.x is set).
+fn depth20e4(depth: f32) -> u32 {
+  if (!(depth > 0.0)) { return 0u; }
+  var bits = bitcast<u32>(depth);
+  if (bits >= 0x3FFFFFF8u) { return 0xFFFFFFu; }
+  if (bits < 0x38800000u) {
+    let shift = min(113u - (bits >> 23u), 24u);
+    bits = (0x800000u | (bits & 0x7FFFFFu)) >> shift;
+  } else {
+    bits += 0xC8000000u;
+  }
+  return (bits >> 3u) & 0xFFFFFFu;
+}
+fn packed_depth(depth: f32) -> u32 {
+  return select(u32(round(clamp(depth, 0.0, 1.0) * 16777215.0)), depth20e4(depth),
+                params.c.x != 0.0);
+}
 )";
 constexpr char kCopyColor[] = R"(
 @group(1) @binding(0) var source: texture_2d<f32>;
@@ -47,16 +73,87 @@ constexpr char kCopyColor[] = R"(
   return textureLoad(source, source_coord(p), 0) * params.c.x;
 }
 )";
+// A color resolve through a surface whose MSAA layout differs from the one
+// that holds the EDRAM contents, as gta4_native/resolve_convert_ps.glsl: the
+// selected samples of each requested pixel are fetched from the owner (one
+// value per guest pixel) and averaged. a: source origin (requested pixels),
+// destination origin; b: requested and owner sample scales; c.x: exponent
+// scale, c.y: CopySampleSelect.
+constexpr char kResolveColor[] = R"(
+@group(1) @binding(0) var source: texture_2d<f32>;
+fn requested_sample(pixel: vec2<i32>, index: u32) -> vec4<f32> {
+  let scale = vec2<i32>(params.b.xy);
+  let offset = vec2<i32>(select(0, i32((index >> 1u) & 1u), scale.x == 2),
+                         select(0, i32(index & 1u), scale.y == 2));
+  let owner = (pixel * scale + offset) / vec2<i32>(params.b.zw);
+  return textureLoad(source, clamp(owner, vec2<i32>(0), vec2<i32>(textureDimensions(source)) - 1), 0);
+}
+@fragment fn fs(@builtin(position) p: vec4<f32>) -> @location(0) vec4<f32> {
+  let pixel = vec2<i32>(params.a.xy) + vec2<i32>(floor(p.xy)) - vec2<i32>(params.a.zw);
+  let select_samples = u32(params.c.y);
+  var color: vec4<f32>;
+  if (select_samples <= 3u) {
+    color = requested_sample(pixel, select_samples);
+  } else if (select_samples == 4u) {
+    color = (requested_sample(pixel, 0u) + requested_sample(pixel, 1u)) * 0.5;
+  } else if (select_samples == 5u) {
+    color = (requested_sample(pixel, 2u) + requested_sample(pixel, 3u)) * 0.5;
+  } else {
+    color = (requested_sample(pixel, 0u) + requested_sample(pixel, 1u) +
+             requested_sample(pixel, 2u) + requested_sample(pixel, 3u)) * 0.25;
+  }
+  return color * params.c.x;
+}
+)";
+// Resolved depth keeps its stencil in green (see SampledFormat).
 constexpr char kCopyDepthToColor[] = R"(
 @group(1) @binding(0) var source: texture_depth_2d;
+@group(1) @binding(1) var stencil: texture_2d<u32>;
 @fragment fn fs(@builtin(position) p: vec4<f32>) -> @location(0) vec4<f32> {
-  return vec4<f32>(textureLoad(source, source_coord(p), 0), 0.0, 0.0, 1.0);
+  let coord = source_coord(p);
+  return vec4<f32>(textureLoad(source, coord, 0), f32(textureLoad(stencil, coord, 0).r), 0.0, 1.0);
+}
+)";
+// A resolved depth/stencil snapshot read back as A8R8G8B8 (sub_828D9768), as
+// gta4_native/packed_depth_alias_ps.glsl. c.x: 20e4 float depth, c.y: the
+// fetch constant's swizzle.
+constexpr char kPackedDepthAlias[] = R"(
+@group(1) @binding(0) var source: texture_2d<f32>;
+@fragment fn fs(@builtin(position) p: vec4<f32>) -> @location(0) vec4<f32> {
+  let value = textureLoad(source, vec2<i32>(p.xy), 0);
+  let packed = (packed_depth(value.r) << 8u) | (u32(value.g) & 255u);
+  let raw = vec4<f32>(vec4<u32>(packed, packed >> 8u, packed >> 16u, packed >> 24u) & vec4<u32>(255u)) / 255.0;
+  let swizzle = u32(params.c.y);
+  var color: vec4<f32>;
+  for (var channel = 0u; channel < 4u; channel++) {
+    let component = (swizzle >> (3u * channel)) & 7u;
+    color[channel] = select(f32(component & 1u), raw[min(component, 3u)], component < 4u);
+  }
+  return color;
 }
 )";
 constexpr char kCopyDepth[] = R"(
 @group(1) @binding(0) var source: texture_depth_2d;
 @fragment fn fs(@builtin(position) p: vec4<f32>) -> @builtin(frag_depth) f32 {
   return textureLoad(source, source_coord(p), 0);
+}
+)";
+// Depth from a resolved snapshot (rg32float, depth in red).
+constexpr char kCopyDepthValues[] = R"(
+@group(1) @binding(0) var source: texture_2d<f32>;
+@fragment fn fs(@builtin(position) p: vec4<f32>) -> @builtin(frag_depth) f32 {
+  return textureLoad(source, vec2<i32>(p.xy), 0).r;
+}
+)";
+// The scene-to-forward handoff, as gta4_native/scene_depth_handoff_ps.glsl:
+// the pass clears stencil to kForwardEmptySceneStencil and its stencil state
+// replaces it with kForwardCoveredSceneStencil wherever packed depth is nonzero.
+constexpr char kSceneDepthHandoff[] = R"(
+@group(1) @binding(0) var source: texture_2d<f32>;
+@fragment fn fs(@builtin(position) p: vec4<f32>) -> @builtin(frag_depth) f32 {
+  let depth = textureLoad(source, vec2<i32>(p.xy), 0).r;
+  if (packed_depth(depth) == 0u) { discard; }
+  return depth;
 }
 )";
 constexpr char kClearColor[] = R"(
@@ -76,13 +173,20 @@ constexpr char kPresent[] = R"(
 struct UtilityKind {
   const char* name;
   const char* code;
-  // Group 1 source: 0 none, 1 float texture, 2 depth texture, 3 float texture + sampler.
+  // Group 1 source: 0 none, 1 float texture, 2 depth texture, 3 float texture + sampler,
+  // 4 depth texture + stencil texture.
   int source;
+  // Writes kForwardCoveredSceneStencil where it passes, over a stencil
+  // cleared to kForwardEmptySceneStencil.
+  bool scene_coverage = false;
 };
 constexpr UtilityKind kUtilities[] = {
-    {"copy_color", kCopyColor, 1},     {"copy_depth_to_color", kCopyDepthToColor, 2},
-    {"copy_depth", kCopyDepth, 2},     {"clear_color", kClearColor, 0},
-    {"clear_depth", kClearDepth, 0},   {"present", kPresent, 3},
+    {"copy_color", kCopyColor, 1},     {"resolve_color", kResolveColor, 1},
+    {"copy_depth_to_color", kCopyDepthToColor, 4},
+    {"copy_depth", kCopyDepth, 2},     {"copy_depth_values", kCopyDepthValues, 1},
+    {"clear_color", kClearColor, 0},   {"clear_depth", kClearDepth, 0},
+    {"present", kPresent, 3},          {"packed_depth_alias", kPackedDepthAlias, 1},
+    {"scene_depth_handoff", kSceneDepthHandoff, 1, true},
 };
 const UtilityKind* FindUtility(std::string_view name) {
   for (const auto& kind : kUtilities)
@@ -191,16 +295,23 @@ void Renderer::Initialize(std::function<void(bool, const std::string&)> done) {
 }
 
 void Renderer::State::InitializeDevice() {
-  wgpu::BindGroupLayoutEntry uniform{};
-  uniform.binding = 0;
-  uniform.visibility = wgpu::ShaderStage::Vertex | wgpu::ShaderStage::Fragment;
-  uniform.buffer.type = wgpu::BufferBindingType::Uniform;
-  uniform.buffer.hasDynamicOffset = true;
-  uniform.buffer.minBindingSize = kUniformBlockSize;
+  std::array<wgpu::BindGroupLayoutEntry, kUniformBindings> uniform{};
+  for (uint32_t i = 0; i < kUniformBindings; ++i) {
+    uniform[i].binding = i;
+    uniform[i].visibility = wgpu::ShaderStage::Vertex | wgpu::ShaderStage::Fragment;
+    uniform[i].buffer.type = wgpu::BufferBindingType::Uniform;
+    uniform[i].buffer.hasDynamicOffset = true;
+    uniform[i].buffer.minBindingSize = kUniformSizes[i];
+  }
   wgpu::BindGroupLayoutDescriptor layout{};
-  layout.entryCount = 1;
-  layout.entries = &uniform;
+  layout.entryCount = uniform.size();
+  layout.entries = uniform.data();
   uniform_layout = device.CreateBindGroupLayout(&layout);
+
+  constexpr uint64_t kPoolPage = 32u * 1024u * 1024u;
+  vertex_pool.Initialize(device, wgpu::BufferUsage::Vertex | wgpu::BufferUsage::CopyDst, kPoolPage);
+  index16_pool.Initialize(device, wgpu::BufferUsage::Index | wgpu::BufferUsage::CopyDst, kPoolPage);
+  index32_pool.Initialize(device, wgpu::BufferUsage::Index | wgpu::BufferUsage::CopyDst, kPoolPage);
 
   wgpu::BufferDescriptor zero{};
   zero.size = 64;
@@ -255,52 +366,77 @@ void Renderer::State::EndPass() {
     pass = nullptr;
   }
   pass_targets = {};
+  pass_state = {};
 }
 
-uint64_t Renderer::State::PushUniforms(std::span<const uint8_t> bytes, std::string& error) {
-  // One kUniformStride slot per draw. Bindings span kUniformBlockSize from the
-  // slot start, so the buffer keeps that much headroom past the last slot.
-  if (bytes.size() > kUniformStride) {
-    error = "Uniform block exceeds its slot";
-    return UINT64_MAX;
-  }
-  if (uniforms.bytes.size() + kUniformStride + kUniformBlockSize > uniforms.capacity) {
-    if (!uniforms.bytes.empty() && !Flush(error)) return UINT64_MAX;
-    if (!Begin(error)) return UINT64_MAX;
-    if (kUniformStride + kUniformBlockSize > uniforms.capacity) {
+uint8_t* Renderer::State::ReserveUniforms(uint64_t size, uint64_t& offset, std::string& error) {
+  size = (size + 255) & ~uint64_t(255);
+  if (!UniformSpace(size, error)) return nullptr;
+  offset = uniforms.used;
+  uniforms.used += size;
+  return uniforms.bytes.data() + offset;
+}
+
+bool Renderer::State::UniformSpace(uint64_t size, std::string& error) {
+  if (uniforms.used + size > uniforms.capacity) {
+    if (uniforms.used && !Flush(error)) return false;
+    if (!Begin(error)) return false;
+    if (size > uniforms.capacity) {
       uniforms.capacity = kInitialUniformArena;
+      uniforms.bytes.assign(uniforms.capacity, 0);
       wgpu::BufferDescriptor descriptor{};
       descriptor.size = uniforms.capacity;
       descriptor.usage = wgpu::BufferUsage::Uniform | wgpu::BufferUsage::CopyDst;
       uniforms.buffer = device.CreateBuffer(&descriptor);
-      wgpu::BindGroupEntry entry{};
-      entry.binding = 0;
-      entry.buffer = uniforms.buffer;
-      entry.size = kUniformBlockSize;
+      std::array<wgpu::BindGroupEntry, kUniformBindings> entries{};
+      for (uint32_t i = 0; i < kUniformBindings; ++i) {
+        entries[i].binding = i;
+        entries[i].buffer = uniforms.buffer;
+        entries[i].size = kUniformSizes[i];
+      }
       wgpu::BindGroupDescriptor group{};
       group.layout = uniform_layout;
-      group.entryCount = 1;
-      group.entries = &entry;
+      group.entryCount = entries.size();
+      group.entries = entries.data();
       uniform_group = device.CreateBindGroup(&group);
     }
   }
-  const uint64_t offset = uniforms.bytes.size();
-  uniforms.bytes.resize(offset + kUniformStride);
-  std::memcpy(uniforms.bytes.data() + offset, bytes.data(), bytes.size());
-  return offset;
+  return true;
 }
 
-uint64_t Renderer::State::PushGeometry(std::span<const uint8_t> bytes, std::string& error) {
+void Renderer::State::ApplyDeviceDelta(const DeviceDelta& delta) {
+  auto& block = devices[delta.device];
+  if (block.empty()) block.resize(kGuestDeviceSize);
+  // Chunks holding vertex and pixel constants.
+  constexpr uint32_t kFirstVertexChunk = 0x780 / kDeviceChunkBytes;
+  constexpr uint32_t kFirstPixelChunk = 0x1780 / kDeviceChunkBytes;
+  constexpr uint32_t kEndPixelChunk = (0x1780 + 0xE00) / kDeviceChunkBytes;
+  static_assert(0x780 % kDeviceChunkBytes == 0 && 0x1780 % kDeviceChunkBytes == 0 &&
+                (0x1780 + 0xE00) % kDeviceChunkBytes == 0);
+  const uint8_t* source = delta.bytes.data();
+  for (uint32_t chunk = 0; chunk < kDeviceChunkCount; ++chunk) {
+    if (!(delta.chunks[chunk / 32] & (1u << (chunk % 32)))) continue;
+    std::memcpy(block.data() + size_t(chunk) * kDeviceChunkBytes, source, kDeviceChunkBytes);
+    source += kDeviceChunkBytes;
+    if (chunk >= kFirstVertexChunk && chunk < kFirstPixelChunk) ++vertex_constants_serial;
+    if (chunk >= kFirstPixelChunk && chunk < kEndPixelChunk) ++pixel_constants_serial;
+  }
+}
+
+uint64_t Renderer::State::PushGeometry(std::span<const uint8_t> bytes, std::string& error,
+                                       uint64_t alignment) {
   const uint64_t size = (bytes.size() + 15) & ~uint64_t(15);
   if (size > kMaximumArena) {
     error = "Per-draw geometry exceeds its bound";
     return UINT64_MAX;
   }
-  if (geometry.bytes.size() + size > geometry.capacity) {
-    if (!geometry.bytes.empty() && !Flush(error)) return UINT64_MAX;
+  const auto aligned = [&] { return (geometry.used + alignment - 1) / alignment * alignment; };
+  if (aligned() + size > geometry.capacity) {
+    if (geometry.used && !Flush(error)) return UINT64_MAX;
     if (!Begin(error)) return UINT64_MAX;
     if (size > geometry.capacity) {
       geometry.capacity = std::max<uint64_t>(kInitialGeometryArena, size * 2);
+      geometry.bytes.assign(geometry.capacity, 0);
       wgpu::BufferDescriptor descriptor{};
       descriptor.size = geometry.capacity;
       descriptor.usage = wgpu::BufferUsage::Vertex | wgpu::BufferUsage::Index |
@@ -308,22 +444,23 @@ uint64_t Renderer::State::PushGeometry(std::span<const uint8_t> bytes, std::stri
       geometry.buffer = device.CreateBuffer(&descriptor);
     }
   }
-  const uint64_t offset = geometry.bytes.size();
-  geometry.bytes.resize(offset + size);
+  const uint64_t offset = aligned();
+  geometry.used = offset + size;
   std::memcpy(geometry.bytes.data() + offset, bytes.data(), bytes.size());
   return offset;
 }
 
 bool Renderer::State::Flush(std::string& error) {
   EndPass();
+  ++batches;
+  last_uniforms.vertex = last_uniforms.pixel = last_uniforms.shared = UINT64_MAX;
   if (!encoder) return true;
+  ScopedTimer timer(timing.submit_ms);
   // Arena writes are ordered before the command buffer that reads them.
-  if (!uniforms.bytes.empty())
-    queue.WriteBuffer(uniforms.buffer, 0, uniforms.bytes.data(), uniforms.bytes.size());
-  if (!geometry.bytes.empty())
-    queue.WriteBuffer(geometry.buffer, 0, geometry.bytes.data(), geometry.bytes.size());
-  uniforms.bytes.clear();
-  geometry.bytes.clear();
+  if (uniforms.used) queue.WriteBuffer(uniforms.buffer, 0, uniforms.bytes.data(), uniforms.used);
+  if (geometry.used) queue.WriteBuffer(geometry.buffer, 0, geometry.bytes.data(), geometry.used);
+  uniforms.used = 0;
+  geometry.used = 0;
   auto commands = encoder.Finish();
   encoder = nullptr;
   queue.Submit(1, &commands);
@@ -333,6 +470,7 @@ bool Renderer::State::Flush(std::string& error) {
 
 bool Renderer::State::BeginPass(const Targets& targets, std::string& error) {
   if (pass && pass_targets == targets) return true;
+  ++timing.passes;
   EndPass();
   if (!Begin(error)) return false;
   std::array<wgpu::RenderPassColorAttachment, kRenderTargetCount> colors{};
@@ -363,6 +501,7 @@ bool Renderer::State::BeginPass(const Targets& targets, std::string& error) {
   }
   pass = encoder.BeginRenderPass(&descriptor);
   pass_targets = targets;
+  pass_state = {};
   return true;
 }
 
@@ -384,6 +523,25 @@ wgpu::ShaderModule Renderer::State::Module(const ShaderRecord& record, bool late
   auto module = device.CreateShaderModule(&descriptor);
   modules.emplace(key, module);
   return module;
+}
+
+void Renderer::State::WarmModules() {
+  const double budget = REXCVAR_GET(webgpu_shader_warmup_ms);
+  if (budget <= 0 || !ready) return;
+  const double start = emscripten_get_now();
+  std::string error;
+  for (auto* queue : {&module_queue, &late_module_queue}) {
+    const bool late = queue == &late_module_queue;
+    while (!queue->empty() && emscripten_get_now() - start < budget) {
+      const ShaderRecord& record = *queue->front();
+      queue->pop_front();
+      const uint64_t key = record.hash * 4 + uint64_t(record.stage) * 2 + (late ? 1 : 0);
+      if (modules.contains(key)) continue;
+      Module(record, late, error);
+      ++timing.warmed_modules;
+    }
+  }
+  timing.warmup_ms += emscripten_get_now() - start;
 }
 
 wgpu::ShaderModule Renderer::State::UtilityModule(const char* name, const char* code) {
@@ -450,14 +608,20 @@ wgpu::RenderPipeline Renderer::State::UtilityPipeline(const std::string& name,
     entries[0].binding = 0;
     entries[0].visibility = wgpu::ShaderStage::Fragment;
     entries[0].texture.viewDimension = wgpu::TextureViewDimension::e2D;
-    entries[0].texture.sampleType = kind->source == 2 ? wgpu::TextureSampleType::Depth
-                                    : kind->source == 3 ? wgpu::TextureSampleType::Float
-                                                        : wgpu::TextureSampleType::UnfilterableFloat;
+    entries[0].texture.sampleType =
+        kind->source == 2 || kind->source == 4 ? wgpu::TextureSampleType::Depth
+        : kind->source == 3                    ? wgpu::TextureSampleType::Float
+                                               : wgpu::TextureSampleType::UnfilterableFloat;
     entries[1].binding = 1;
     entries[1].visibility = wgpu::ShaderStage::Fragment;
-    entries[1].sampler.type = wgpu::SamplerBindingType::Filtering;
+    if (kind->source == 4) {
+      entries[1].texture.viewDimension = wgpu::TextureViewDimension::e2D;
+      entries[1].texture.sampleType = wgpu::TextureSampleType::Uint;
+    } else {
+      entries[1].sampler.type = wgpu::SamplerBindingType::Filtering;
+    }
     wgpu::BindGroupLayoutDescriptor descriptor{};
-    descriptor.entryCount = kind->source == 3 ? 2 : 1;
+    descriptor.entryCount = kind->source >= 3 ? 2 : 1;
     descriptor.entries = entries.data();
     groups.push_back(device.CreateBindGroupLayout(&descriptor));
   }
@@ -481,10 +645,10 @@ wgpu::RenderPipeline Renderer::State::UtilityPipeline(const std::string& name,
     depth_state.format = depth;
     depth_state.depthWriteEnabled = wgpu::OptionalBool::True;
     depth_state.depthCompare = wgpu::CompareFunction::Always;
-    depth_state.stencilFront = depth_state.stencilBack = {wgpu::CompareFunction::Always,
-                                                          wgpu::StencilOperation::Keep,
-                                                          wgpu::StencilOperation::Keep,
-                                                          wgpu::StencilOperation::Keep};
+    depth_state.stencilFront = depth_state.stencilBack = {
+        wgpu::CompareFunction::Always, wgpu::StencilOperation::Keep, wgpu::StencilOperation::Keep,
+        kind->scene_coverage ? wgpu::StencilOperation::Replace : wgpu::StencilOperation::Keep};
+    depth_state.stencilReadMask = depth_state.stencilWriteMask = kind->scene_coverage ? 0xFF : 0;
     descriptor.depthStencil = &depth_state;
   }
   auto pipeline = device.CreateRenderPipeline(&descriptor);
@@ -497,14 +661,19 @@ bool Renderer::State::UtilityPass(const std::string& name, wgpu::TextureView tar
                                   wgpu::TextureFormat format, uint32_t width, uint32_t height,
                                   const std::array<int32_t, 4>& scissor, wgpu::TextureView source,
                                   std::span<const float> parameters, bool load_existing,
-                                  std::string& error) {
+                                  std::string& error, wgpu::TextureView stencil) {
   auto pipeline = UtilityPipeline(name, target_is_depth ? wgpu::TextureFormat::Undefined : format,
                                   target_is_depth ? format : wgpu::TextureFormat::Undefined, error);
   if (!pipeline) return false;
+  const bool scene_coverage = FindUtility(name)->scene_coverage;
   std::array<uint8_t, 64> params{};
   std::memcpy(params.data(), parameters.data(), std::min(params.size(), parameters.size_bytes()));
-  const uint64_t offset = PushUniforms(params, error);
-  if (offset == UINT64_MAX) return false;
+  uint64_t offset;
+  // Every binding is bound at this slot, so it must hold the largest.
+  uint8_t* slot = ReserveUniforms(
+      *std::max_element(kUniformSizes.begin(), kUniformSizes.end()), offset, error);
+  if (!slot) return false;
+  std::memcpy(slot, params.data(), params.size());
   EndPass();
   if (!Begin(error)) return false;
   wgpu::RenderPassColorAttachment color{};
@@ -519,6 +688,10 @@ bool Renderer::State::UtilityPass(const std::string& name, wgpu::TextureView tar
     if (stencil) {
       depth.stencilLoadOp = load_existing ? wgpu::LoadOp::Load : wgpu::LoadOp::Clear;
       depth.stencilStoreOp = wgpu::StoreOp::Store;
+      if (scene_coverage) {
+        depth.stencilLoadOp = wgpu::LoadOp::Clear;
+        depth.stencilClearValue = kForwardEmptySceneStencil;
+      }
     }
     descriptor.depthStencilAttachment = &depth;
   } else {
@@ -531,20 +704,26 @@ bool Renderer::State::UtilityPass(const std::string& name, wgpu::TextureView tar
   }
   auto encoder_pass = encoder.BeginRenderPass(&descriptor);
   encoder_pass.SetPipeline(pipeline);
-  const uint32_t dynamic_offset = uint32_t(offset);
-  encoder_pass.SetBindGroup(0, uniform_group, 1, &dynamic_offset);
+  // Utility shaders read binding 0 only; the others bind the same slot.
+  std::array<uint32_t, kUniformBindings> dynamic_offsets;
+  dynamic_offsets.fill(uint32_t(offset));
+  encoder_pass.SetBindGroup(0, uniform_group, dynamic_offsets.size(), dynamic_offsets.data());
   if (source) {
     std::array<wgpu::BindGroupEntry, 2> entries{};
     entries[0].binding = 0;
     entries[0].textureView = source;
     entries[1].binding = 1;
-    entries[1].sampler = linear_sampler;
+    if (stencil)
+      entries[1].textureView = stencil;
+    else
+      entries[1].sampler = linear_sampler;
     wgpu::BindGroupDescriptor group{};
     group.layout = pipeline.GetBindGroupLayout(1);
-    group.entryCount = name == "present" ? 2 : 1;
+    group.entryCount = name == "present" || stencil ? 2 : 1;
     group.entries = entries.data();
     encoder_pass.SetBindGroup(1, device.CreateBindGroup(&group));
   }
+  if (scene_coverage) encoder_pass.SetStencilReference(kForwardCoveredSceneStencil);
   encoder_pass.SetViewport(0, 0, float(width), float(height), 0, 1);
   const int32_t left = std::clamp(scissor[0], 0, int32_t(width));
   const int32_t top = std::clamp(scissor[1], 0, int32_t(height));
@@ -564,14 +743,20 @@ Renderer::Status Renderer::Execute(Work& work, std::string& error) {
       work.execute->Finish(ok);
     }
   };
+  // Every delta is applied, so the copies stay in step with the game's.
+  if (work.device.device) s.ApplyDeviceDelta(work.device);
   if (!s.ready) {
     error = "WebGPU device is not ready";
     finish_sync(false);
     return Status::kDone;
   }
   const auto type = work.type();
+  // Present reports and resets the stats itself, so it is timed there.
+  std::optional<ScopedTimer> timer;
+  if (type != CommandType::kPresent) timer.emplace(s.timing.execute_ms);
   if (uint32_t(type) < s.stats.commands.size()) ++s.stats.commands[uint32_t(type)];
-  s.trace = REXCVAR_GET(webgpu_trace_frame) && s.frame + 1 == REXCVAR_GET(webgpu_trace_frame);
+  s.trace = REXCVAR_GET(webgpu_trace_frame) &&
+            s.submitted_frame + 1 == REXCVAR_GET(webgpu_trace_frame);
   if (s.trace && type != CommandType::kDrawPrimitive && type != CommandType::kDrawIndexedPrimitive &&
       type != CommandType::kDrawPrimitiveUp)
     REXLOG_INFO("webgpu-trace: command type={}", uint32_t(type));
@@ -589,6 +774,8 @@ Renderer::Status Renderer::Execute(Work& work, std::string& error) {
       s.ClearResources();
       s.shaders.clear();
       s.declarations.clear();
+      s.input_layouts.clear();
+      s.devices.clear();
       return Status::kDone;
     case CommandType::kRegisterShader: {
       const auto c = work.As<RegisterShaderCommand>();
@@ -599,11 +786,14 @@ Renderer::Status Renderer::Execute(Work& work, std::string& error) {
         return Status::kDone;
       }
       s.shaders[c.shader] = record;
+      s.module_queue.push_back(record);
+      if (!record->late.empty()) s.late_module_queue.push_back(record);
       return Status::kDone;
     }
     case CommandType::kRegisterVertexDeclaration: {
       const auto c = work.As<RegisterVertexDeclarationCommand>();
       s.declarations[c.declaration].assign(c.elements, c.elements + c.element_count);
+      s.input_layouts.clear();  // They point into the declarations.
       return Status::kDone;
     }
     case CommandType::kSetPixelShader:
@@ -624,7 +814,7 @@ Renderer::Status Renderer::Execute(Work& work, std::string& error) {
       const uint32_t handle = work.As<ReleaseResourceCommand>().resource;
       s.ReleaseResource(handle);
       s.shaders.erase(handle);
-      s.declarations.erase(handle);
+      if (s.declarations.erase(handle)) s.input_layouts.clear();
       return Status::kDone;
     }
     case CommandType::kUpdateEnvironmentalData:
@@ -632,12 +822,18 @@ Renderer::Status Renderer::Execute(Work& work, std::string& error) {
       return Status::kDone;
     case CommandType::kDrawPrimitive:
     case CommandType::kDrawPrimitiveUp:
-    case CommandType::kDrawIndexedPrimitive:
-      if (!s.Draw(work, error)) {
+    case CommandType::kDrawIndexedPrimitive: {
+      ScopedTimer draw_timer(s.timing.draw_ms);
+      // A flush while a draw was set up submitted its geometry and uniforms
+      // with the previous batch; set it up again in the new one.
+      bool done = s.Draw(work, error);
+      if (!done && error.empty()) done = s.Draw(work, error, true);
+      if (!done) {
         ++s.skipped_draws;
         ++s.stats.failed;
       }
       return Status::kDone;
+    }
     case CommandType::kClear:
       s.Clear(work, error);
       return Status::kDone;
@@ -649,6 +845,20 @@ Renderer::Status Renderer::Execute(Work& work, std::string& error) {
       return Status::kDone;
     case CommandType::kPresent:
       return s.Present(work, error);
+    case CommandType::kRegisterVirtualResource: {
+      const auto c = work.As<RegisterVirtualResourceCommand>();
+      if (c.kind == VirtualResourceKind::kTexture && c.packed_depth_source)
+        s.packed_depth_aliases[c.resource] = c.packed_depth_source;
+      else
+        s.packed_depth_aliases.erase(c.resource);
+      return Status::kDone;
+    }
+    case CommandType::kRenderPhaseMarker:
+      if (s.trace) {
+        const auto c = work.As<RenderPhaseMarkerCommand>();
+        REXLOG_INFO("webgpu-trace: phase={} event={}", uint32_t(c.phase), uint32_t(c.event));
+      }
+      return Status::kDone;
     case CommandType::kTextureLock: {
       const auto status = s.Readback(work, error);
       if (status != Status::kPending) finish_sync(error.empty());

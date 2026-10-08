@@ -9,6 +9,7 @@
     html, body { margin: 0; height: 100%; background: #000; color: #ccc;
                  font: 13px/1.4 ui-monospace, SFMono-Regular, Menlo, monospace; }
     body { display: flex; flex-direction: column; }
+    #screen:fullscreen { width: 100vw; height: 100vh; }
     #screen { flex: 1; min-height: 0; position: relative; background: #000; }
     /* WebGPU draws into #liberty-gpu from a worker; SDL keeps #canvas (on
        top, transparent) for input. */
@@ -32,21 +33,109 @@
     // tools/web/serve.py and docs/WEB_BUILDING.md.
     const statusEl = document.getElementById('status');
     const logEl = document.getElementById('log');
+    // Log lines from the title's threads block until this page thread has
+    // handled them, so appending must stay cheap: queue them and update the
+    // panel (last MAX_LOG_LINES lines) once per animation frame.
+    const MAX_LOG_LINES = 2000;
+    let logLines = [], logPending = false;
     function append(line) {
-      logEl.textContent += line + '\n';
-      logEl.scrollTop = logEl.scrollHeight;
+      logLines.push(line);
+      if (logPending) return;
+      logPending = true;
+      requestAnimationFrame(() => {
+        logPending = false;
+        if (logLines.length > MAX_LOG_LINES) logLines = logLines.slice(-MAX_LOG_LINES);
+        logEl.textContent = logLines.join('\n');
+        logEl.scrollTop = logEl.scrollHeight;
+      });
     }
     if (!self.crossOriginIsolated) {
       statusEl.textContent =
         'This page is not cross-origin isolated, so WebAssembly threads are unavailable. ' +
         'Serve it with tools/web/serve.py.';
     }
+    // Development game-file loading: tools/web/serve.py exposes the installed
+    // game directory at /game/ (HTTP Range) with a manifest. Files are mounted
+    // lazily, so nothing is downloaded until the title reads it. The page thread
+    // owns Emscripten's filesystem (main() runs on a worker and proxies to it),
+    // and the title's reads block, so synchronous XHR is used here.
+    function mountGameFiles() {
+      const probe = new XMLHttpRequest();
+      probe.open('GET', 'game-manifest.json', false);
+      try { probe.send(); } catch (e) { return; }
+      if (probe.status !== 200) return;
+      const files = JSON.parse(probe.responseText);
+      const root = '/data/LibertyRecomp/game';
+      ENV.XDG_DATA_HOME = '/data';
+      const CHUNK = 4 << 20, MAX_CACHED = 96;
+      const cache = new Map();
+      const fetchChunk = (url, index, size) => {
+        const key = url + '#' + index;
+        let bytes = cache.get(key);
+        if (bytes) { cache.delete(key); cache.set(key, bytes); return bytes; }
+        const start = index * CHUNK, end = Math.min(size, start + CHUNK) - 1;
+        const xhr = new XMLHttpRequest();
+        xhr.open('GET', url, false);
+        xhr.setRequestHeader('Range', 'bytes=' + start + '-' + end);
+        xhr.overrideMimeType('text/plain; charset=x-user-defined');
+        xhr.send();
+        if (xhr.status !== 206 && xhr.status !== 200) throw new FS.ErrnoError(5);
+        const text = xhr.responseText;
+        bytes = new Uint8Array(text.length);
+        for (let i = 0; i < text.length; i++) bytes[i] = text.charCodeAt(i) & 0xff;
+        cache.set(key, bytes);
+        if (cache.size > MAX_CACHED) cache.delete(cache.keys().next().value);
+        return bytes;
+      };
+      for (const [path, size] of files) {
+        const slash = path.lastIndexOf('/');
+        const dir = root + (slash >= 0 ? '/' + path.slice(0, slash) : '');
+        FS.mkdirTree(dir);
+        const node = FS.createFile(dir, path.slice(slash + 1), null, true, false);
+        const url = 'game/' + path.split('/').map(encodeURIComponent).join('/');
+        node.usedBytes = size;
+        node.stream_ops = Object.assign({}, node.stream_ops, {
+          read(stream, buffer, offset, length, position) {
+            if (position >= size) return 0;
+            length = Math.min(length, size - position);
+            let done = 0;
+            while (done < length) {
+              const at = position + done, index = Math.floor(at / CHUNK);
+              const chunk = fetchChunk(url, index, size);
+              const from = at - index * CHUNK, n = Math.min(length - done, chunk.length - from);
+              buffer.set(chunk.subarray(from, from + n), offset + done);
+              done += n;
+            }
+            return done;
+          },
+          // The title maps files (default.xex, the disc images) rather than
+          // reading them; copy the mapped range in like MEMFS does.
+          mmap(stream, length, position) {
+            const ptr = mmapAlloc(length);
+            node.stream_ops.read(stream, HEAP8, ptr, length, position);
+            return { ptr, allocated: true };
+          },
+        });
+      }
+      append('Mounted ' + files.length + ' game files from the server');
+    }
+    // SDL asks the input canvas (#canvas) to go fullscreen, which would leave
+    // the WebGPU canvas underneath it hidden. Fullscreen the container that
+    // holds both instead.
+    (function () {
+      const screenEl = document.getElementById('screen');
+      const input = document.getElementById('canvas');
+      for (const name of ['requestFullscreen', 'webkitRequestFullscreen']) {
+        input[name] = (options) => (screenEl.requestFullscreen || screenEl.webkitRequestFullscreen).call(screenEl, options);
+      }
+    })();
     var Module = {
       canvas: document.getElementById('canvas'),
       arguments: new URLSearchParams(location.search).getAll('arg'),
       print: (text) => { console.log(text); append(text); },
       printErr: (text) => { console.error(text); append(text); },
       setStatus: (text) => { if (text) statusEl.textContent = text; },
+      preRun: [mountGameFiles],
       onRuntimeInitialized: () => { statusEl.textContent = 'Running'; },
       onAbort: (what) => { statusEl.textContent = 'Aborted: ' + what; },
     };

@@ -1,6 +1,7 @@
 # Web Port Handoff
 
-Status of the WebAssembly port on branch `claude/zen-goodall-jpl0op`.
+Status of the WebAssembly port on branch `webgpu-node-graphics` (branched from
+`main`; earlier work was on `claude/zen-goodall-jpl0op`).
 `WEB_BUILDING.md` is the user-facing guide (build, run, how each subsystem is
 mapped); this file is for whoever continues the work.
 
@@ -30,14 +31,196 @@ mapped); this file is for whoever continues the work.
   yet; SwiftShader and the game also share the same 4 CPU cores.
 - All 2062 title shader variants translate to WGSL (`tools/webgpu`) and pass
   Tint validation; the archive is checked in and embedded.
-- In headless Chromium the browser build still starts and stops at the install
-  check (no game files). The canvas hand-off to the render worker and surface
-  setup were verified with a standalone prototype; WebGPU canvas contents cannot
-  be screenshotted in this container, so the browser picture is unverified.
+- Without game files the browser build stops at the install check. With
+  `tools/web/serve.py` serving an installed game (`/game/` + manifest, mounted
+  lazily by `res/web/index.html`), it reaches gameplay (see below).
 - `rex-web-memory-test` (26 checks: alias folding, byte order, heaps, MMIO,
   returned-pointer aliases) passes under Node 24.
-- Next step candidates: **in-browser game-file loading** (needed to see the
-  renderer in a real browser), or renderer fidelity/performance. Ask the user.
+- **Real browser (Chrome on an M1 Mac, 2026-10-07).** With game files served by
+  `tools/web/serve.py` (installed from a disc image extracted to a folder; the
+  installer cannot map a 7.8 GB `.iso` under Node), the build reaches gameplay
+  in Chrome. An earlier run showed black gameplay at about 5 fps; it predated
+  the clock, hang, stencil-rebuild and downsample-resolve fixes below.
+  - *Rechecked with those fixes (before the per-draw work below):* the intro cutscenes render lit and correct
+    (ship's cabin, the docks meeting with the in-world credits) with no stalls
+    or GPU errors. Light scenes (400–700 draws) run at 40–59 fps; the heaviest
+    stretch (~6,000–6,600 draws) dropped to 3–6 fps, at ~20–32 µs of
+    render-thread time per draw, spread over inputs, bindings, uniforms and
+    encoding (pipeline compiles were near zero). Gameplay is confirmed: the
+    user played and drove around at about 3–10 fps.
+  - *Fixed: frozen canvas.* The picture stopped updating once a heavy scene
+    put the renderer behind the game, while rendering went on. A worker's
+    canvas shows a frame only when its current task ends, and the drain's
+    "yield" after a present re-proxied itself to the render thread, which
+    Emscripten runs in the same task while it executes that thread's mailbox
+    (`em_task_queue_execute`). With work always queued, the task never ended.
+    The drain now resumes from a `MessageChannel` message (a new task), with
+    game-thread wakes suppressed until then (`YieldToEventLoop` in
+    `graphics_system.cpp`). Found with the new `presents` perf line (below):
+    every present was shown with new content, yet the picture was frozen.
+  - The Claude-in-Chrome extension could not see the WebGPU canvas in its own
+    tab group (it stayed dark there while a normal tab rendered); use a tab
+    opened normally (`open -a "Google Chrome" <url>`) and a screen capture.
+- **Profiling.** `--webgpu_perf_report=true` turns on stage timing (off
+  otherwise: the clock reads cost ~10% of a draw) and logs every 5 s as
+  warnings: a `perf` line (fps, draws and render passes a frame, render-thread time per stage, new
+  pipelines with how many became ready or failed, their latency and the draws
+  that waited for them, shader modules warmed and still queued, new uniform
+  slots, redrawn draws, WebGPU calls per draw), a stall line (the longest
+  frame with the render thread's busy and pipeline time in it, GPU frame
+  latency, presents that waited for the GPU), a `presents` line (presents
+  shown on the canvas, those with new frontbuffer contents, those skipped: no
+  source, no canvas, no surface texture with its status; canvas size,
+  frontbuffer, GPU error count) and the game thread's `capture` line. Use it
+  with `--diagnostics=true
+  --diagnostics_categories=logging --log_level=warn`: other diagnostics print
+  a line per draw, and every line blocks the game thread until the page's
+  main thread handles it. In the browser that alone held gameplay below 1 fps.
+- **Per-draw performance session (2026-10-07, commits b08f89bb..e8e98c5f).**
+  Render-thread cost per draw fell from ~20 to ~10 µs in Node with Dawn on
+  Metal (heaviest intro stretch 4.5 → 9–11 fps; details and a benchmark table
+  under Known gaps › Performance). Changes: device-block deltas, per-binding
+  uniform reuse (the shader archive is now `LRWGSL03` with three uniform
+  bindings), cached input layouts, pooled vertex/index buffers, retry of a
+  draw interrupted by a flush, and at most two GPU frames in flight. The user
+  reports Chrome is clearly faster and gameplay briefly reached playable frame
+  rates, with stutter; the first run after the shader change stalled for
+  about a second at a time (Chrome recompiles every pipeline when the WGSL
+  changes), which fast-forwarded the opening cutscene. No Chrome perf numbers
+  were recorded yet.
+- **Asynchronous pipelines (2026-10-07, after e8e98c5f).** Title pipelines
+  are created with `CreateRenderPipelineAsync`; a draw whose pipeline is still
+  pending is skipped (`waiting` in the per-frame log, `draws a frame waited` in
+  the perf line), and a failed creation is logged and its draws fail.
+  `--webgpu_async_pipelines=false` restores synchronous creation; a traced
+  frame always creates them synchronously, so its trace is complete. That alone
+  left most of the stall: creating a *shader module* parses and validates its
+  WGSL synchronously (2.4 s over the intro's first 222 pipelines, up to 144 ms
+  for one module). So `kRegisterShader` now queues the shader, and after each
+  present `WarmModules` creates queued modules for up to
+  `--webgpu_shader_warmup_ms` (default 4; one large module can overrun it).
+  Alpha-test (late) variants are queued after the rest. The title registers
+  about 1,970 variants during the first loading screens, which are all done
+  within ~15 s, while those screens drop to ~36 fps. In the Node intro
+  benchmark the longest frame of any 5 s window fell from 490–860 ms to at most
+  ~170 ms, with pipeline time in it ≤ 10 ms; few draws wait (at most 7 a frame
+  in a window, while ~45 new pipelines arrive) and the frame dumps show no
+  visible gaps. Per-draw cost is unchanged. Not yet checked in Chrome, where the
+  same costs land in the GPU process instead of the render thread.
+- **Pass merging and per-draw overhead (2026-10-07, after d7069cff).** A V8
+  CPU profile of the render thread (`node --cpu-prof`; the build keeps wasm
+  function names) showed the "untimed" per-draw time was mostly render passes
+  and the timers themselves. The title toggles depth and color targets between
+  draws, and each change ended the pass (~13 µs) and reset every binding: the
+  intro ran 330–490 passes a frame. A draw now stays in the open pass when its
+  attachments are among the pass's, and a new pass also attaches the other
+  bound surfaces of the same size that already exist; a pipeline built for a
+  pass attachment the draw does not use writes nothing to it (an empty fragment
+  shader when the draw has no pixel shader). Passes fell to ~28 a frame, state
+  calls from 0.24 to 0.07 a draw. Stage timers (and the game thread's capture
+  timers) now run only with `--webgpu_perf_report`: each clock read is a call
+  out to JavaScript (~55 ns under Node) and they took ~10–15% of `Draw`. Fan,
+  quad and UP conversions reuse scratch buffers. Measured under Node with a
+  busy machine (a video call running), so only roughly: ~10–15% less
+  render-thread time a draw with the timers still on; frame dumps unchanged
+  and no GPU errors. Not checked in Chrome yet.
+  What remains a draw (Node profile): about half is calls into JavaScript;
+  the largest is the uniform `SetBindGroup` (~1 µs, one a draw because vertex
+  constants change on almost every draw), then the draw call (~0.9 µs). Removing
+  the bind-group call would mean selecting the uniform slots with
+  `firstInstance` and storage-buffer reads in every shader, plus a flat varying
+  to give the pixel shader the draw index; some vertex shaders already output
+  18 varyings, so that needs checking against `maxInterStageShaderVariables`.
+- **Chrome recheck (2026-10-07, after 4ca42b25).** Intro cutscenes: 28 passes
+  a frame, render thread ~6–7 µs a draw (was 20–32), no pipeline stalls (0 ms
+  pipelines, no draws waiting), longest frame 1–1.5× the average. Heavy
+  scenes (4,000–5,400 draws) run 13–18 fps and are GPU-bound: every present
+  waited for the GPU, GPU frame latency 40–80 ms. The game thread spends
+  ~40% of its time capturing draws (2.1 s per 5 s). Light scenes hold 60 fps.
+- **Audio in Chrome (2026-10-07).** SDL3's `CPtrToHeap32Index` divided an
+  EM_ASM pointer (a Number) by `4n`, so every audio callback threw and nothing
+  played. `res/web/sdl_wasm64.js` (pre-js) defines it first; SDL keeps an
+  existing definition, so the submodule is untouched. Audio now plays but
+  crackles and sometimes runs slow. SDL's web backend pulls 2048 samples
+  (~43 ms, 8 guest frames) per callback on the page's main thread; when the
+  queue is empty the driver plays silence, and the guest's audio clock only
+  advances on played frames. The driver now waits for `--audio_refill_frames`
+  (12 on the web, 0 elsewhere) after an underrun and logs underrun stats every
+  5 s (web only). Measured: ~940 frames are needed per 5 s; light scenes kept
+  up (queue 40–64 frames), but scenes of 600–760 draws played only 707–730 with
+  210–234 silent (18–19 underruns, queue never above 16–18), even at 60 fps.
+  So the title produces audio at ~75–80% of real time there; buffering cannot
+  fix that. Likely the abrupt cutscene cuts with sped-up animation the user saw
+  come from the cutscene clock following this audio clock (not verified). Next:
+  pace Node's silent fallback by a real-time clock (it sleeps a fixed 5.3 ms
+  after each frame, so it always runs slow and hides the shortfall), then
+  profile the audio threads (XMA decode via FFmpeg, the title's mixer, or CPU
+  contention with the game thread's capture).
+- Next step candidates, in suggested order: the audio shortfall above, the
+  `firstInstance` uniform selection, then a game-file picker. Ask the user.
+- **Node graphics session (Dawn on Metal, M1 Mac, 2026-10-07).**
+  - *Fixed: black loading screens.* Emscripten has no `CLOCK_MONOTONIC_RAW`;
+    `clock_getres`/`clock_gettime` failed and, with asserts compiled out, the
+    host clock was uninitialized memory. Guest frame deltas were ~8e8 s, so the
+    loading screens stayed behind their opaque fade quad (and the game's timers
+    were garbage everywhere). `src/core/clock_posix.cpp` now uses
+    `CLOCK_MONOTONIC` on Emscripten. This bug also affected the browser build,
+    which likely explains the missing loading artwork seen in Chrome.
+  - *Added:* present pacing (`--webgpu_frame_limit`, default 60) and a richer
+    frame trace (see Testing below).
+  - *Fixed: hang.* Node runs used to stop presenting after about 3.5 minutes.
+    The main game thread was stuck in `XamInputGetState` →
+    `MnkInputDriver::UpdateMouseCapture` → `CallInUIThreadSynchronous`, waiting
+    for a UI-thread wakeup that never ran. SDL3 was built without threads on
+    Emscripten (`SDL_THREADS_DISABLED`, its default there), so its mutexes did
+    nothing and game threads pushing wakeup events raced the UI thread on the
+    event queue. Relative mouse mode always fails on the web, so capture was
+    retried (one synchronous round trip plus an error line) on every input
+    poll, which made the race frequent. Fixes: `SDL_PTHREADS=ON` for Emscripten
+    (`thirdparty/CMakeLists.txt`), and a failed capture is not retried until
+    focus returns (`mnk_input_driver.cpp`). A 19-minute run reached gameplay
+    with no stall. The suspend/APC theory was wrong: no thread suspends happen.
+  - *Hang diagnostics.* `rex/thread/wait_trace.h` (web only) records what each
+    thread is blocked on (kernel waits, critical sections, delays, suspends,
+    render-queue and synchronous-command waits). The render-thread watchdog logs
+    the list as warnings after 15 s and 60 s without a present. For a thread
+    shown as "running (or blocked outside a traced wait)", get its wasm stack
+    from the live process: build with `LIBERTY_WEB_FUNCTION_NAMES=ON`, run Node
+    with `--inspect` (or `kill -USR1` it), then use the inspector's
+    `NodeWorker` domain to send `Debugger.pause` to each worker and read
+    `callFrames`.
+  - *Fixed: black deferred lighting.* After the G-buffer, the title hands the
+    scene depth to the forward depth surface with `kRebuildSceneCoverage`: stencil
+    must become 0x80 where the scene is empty and 0xFF where it is covered. The
+    WebGPU handoff only copied depth, so the full-screen lighting pass (stencil
+    `Equal 0x01`, mask 0x01) was rejected everywhere and lit surfaces stayed
+    black. `Handoff` (`passes.cpp`) now follows the Metal renderer: depth comes
+    from the resolved snapshot (`source_texture`), and a rebuild clears stencil
+    to 0x80 and writes 0xFF with a fixed-function stencil Replace where packed
+    depth is nonzero (no shader stencil export needed). The intro cutscenes now
+    render lit. The draw trace also logs stencil state, and handoffs are traced.
+  - *Fixed: hard white lamp shapes.* These were not coronas (the corona shader
+    62DFF2DBDC8ED5D6 adds soft glows correctly). The bloom/exposure chain
+    downsamples by resolving a 4x MSAA view (e.g. 512x384) of a 1x surface's
+    EDRAM (1024x768); the resolve picked the 1x surface and copied its top-left
+    quarter unscaled, so bloom held the frame's top-left quarter at 2x and lit
+    a ghost of each lamp at twice its screen position, over anything in front.
+    `Resolve` now maps the requested view's samples onto the owner surface and
+    averages them (`resolve_color`, as `gta4_native/resolve_convert_ps.glsl`).
+    Found with `--webgpu_trace_pixel`, which lists the draws that changed a texel.
+  - *Packed depth aliases:* `RegisterVirtualResource` with `packed_depth_source`
+    is honored; resolved depth is stored as `rg32float` (depth, stencil) and an
+    alias texture is rebuilt as A8R8G8B8 like
+    `gta4_native/packed_depth_alias_ps.glsl`. The title does take this path: the
+    full-screen lighting draw samples one (an RGBA8 GPU texture in slot 5 that no
+    resolve writes). Its contents have not been checked against Metal.
+  - *Not checked:* in the overhead shot of the ship's hold (around frame 6240)
+    large areas are black around the characters; probably just an unlit hold,
+    unverified. One texture (read by a full-screen pass whose output is never
+    resolved) is never produced; harmless so far.
+  - *Render-thread watchdog:* every 5 s it logs `render queue stalled` (and drains
+    the queue) when queued work stops moving, and dumps the wait trace after 15 s
+    and 60 s without a present.
 
 ## Key design decisions (and where they live)
 
@@ -51,10 +234,12 @@ mapped); this file is for whoever continues the work.
 | FPSCR | Per-thread virtual control word; wasm always rounds to nearest | `include/rex/platform/fpscr.h` |
 | Fibers | Thread fibers only; `Create`/`SwitchTo` fail loudly (GTA IV uses none) | `src/core/fiber_web.cpp` |
 | GPU | Statically linked WebGPU title-command renderer (no `dlopen` on web); created in `GTA4App::OnPreSetup`. `--gpu_plugin=none` = headless | `src/graphics/gta4_webgpu/`, `include/rex/graphics/gta4_webgpu.h`, `gta4-recomp/src/gta4_app.cpp` |
-| GPU threading | One render pthread owns the device and runs from the JS event loop (needed for `mapAsync` and canvas presentation), woken via `emscripten_proxy_async`. Game threads capture device block/buffers/textures at submit (`Capture` in `graphics_system.cpp`) | `gta4_webgpu/graphics_system.cpp`, `work.h` |
-| Shaders | Stock SPIR-V → GLSL (SPIRV-Cross) → rewrite BDA constants to one UBO (VS 0, PS 4096, shared 8192, spec word 8192+0x500) and bindless to fixed slots → glslang → spirv-opt → naga → WGSL. naga undoes the Vulkan y-flip itself | `tools/webgpu/spirv_to_wgsl.py`, `LibertyRecompLib/shader/webgpu_shader_archive.bin` |
+| GPU threading | One render pthread owns the device and runs from the JS event loop (needed for `mapAsync` and canvas presentation), woken via `emscripten_proxy_async`; at most two frames are in flight on the GPU (`TrackGpuFrame`); after each present it yields with a `MessageChannel` message, since a proxied wake can run in the same task and the canvas only updates when the task ends. Game threads capture device block/buffers/textures at submit (`Capture` in `graphics_system.cpp`) | `gta4_webgpu/graphics_system.cpp`, `work.h` |
+| Shaders | Stock SPIR-V → GLSL (SPIRV-Cross) → rewrite BDA constants to one UBO (VS 0, PS 4096, shared 8192, spec word 8192+0x500) and bindless to fixed slots → glslang → spirv-opt → naga → WGSL, then split the UBO into three group-0 bindings (VS, PS, shared + spec word 0x500), each with its own dynamic offset; dynamic register reads go through `xc_load`. naga undoes the Vulkan y-flip itself | `tools/webgpu/spirv_to_wgsl.py`, `tools/webgpu/split_uniforms.py`, `LibertyRecompLib/shader/webgpu_shader_archive.bin` |
+| Pipelines | Title pipelines by full state key, created with `CreateRenderPipelineAsync`; draws are skipped while pending (`--webgpu_async_pipelines`). Shader modules for registered shaders are made between frames (`WarmModules`, `--webgpu_shader_warmup_ms`), since module creation is synchronous. Utility-pass pipelines stay synchronous | `gta4_webgpu/draw.cpp` (`DrawPipeline`), `renderer.cpp` (`WarmModules`) |
 | Vertex data | Every attribute decoded to `float32x4` on the CPU per buffer generation (shaders read vec4 floats; WebGPU cannot feed integer formats to them) | `gta4_webgpu/vertex_decode.h`, `resources.cpp` |
-| Render targets | Single-sampled; resolved depth stored as `r32float`; resolves pick the latest surface at the same EDRAM placement | `gta4_webgpu/resources.cpp`, `passes.cpp` |
+| Render targets | Single-sampled; resolved depth stored as `rg32float` (depth, stencil), with packed A8R8G8B8 aliases rebuilt on demand; resolves pick the latest surface at the same EDRAM placement, and map samples when its MSAA layout differs from the resolved view (`resolve_color`) | `gta4_webgpu/resources.cpp`, `passes.cpp`, `renderer.cpp` |
+| Depth handoff | Depth from the resolved snapshot (`source_texture`); `kRebuildSceneCoverage` clears stencil to 0x80 and writes 0xFF via stencil Replace where packed depth is nonzero, as the Metal renderer | `gta4_webgpu/passes.cpp` (`Handoff`) |
 | Canvas | `<canvas id="liberty-gpu">` is transferred to the render worker as an OffscreenCanvas (pre-js `res/web/webgpu_canvas.js`); SDL's `#canvas` stays on top for input | `gta4_webgpu/canvas.cpp`, `res/web/index.html` |
 | Main loop | `-sPROXY_TO_PTHREAD`; COOP/COEP needed (`tools/web/serve.py`) | `gta4-recomp/CMakeLists.txt` |
 | Apple-only bridges, community MP | Report unavailable / not built on web | `gta4-recomp/src/web/web_platform_bridges.cpp` |
@@ -82,7 +267,13 @@ ninja -C out/web LibertyRecomp rex-web-memory-test
 - **zlib port:** the proxy blocks GitHub archive downloads. Clone
   `madler/zlib` at `v1.3.2`, unpack it into `$(em-config CACHE)/ports/zlib/zlib-1.3.2`,
   and write the port URL to `ports/zlib/.emscripten_url`.
-- **Node:** use emsdk's Node 24; the system Node 22 lacks Memory64.
+- **Node:** use emsdk's Node 24; the system Node 22 lacks Memory64. (On the
+  user's Mac, Homebrew Node 26 also works.)
+- **User's Mac:** emsdk is at `~/emsdk`; the Node test build is `out/web-node`
+  (`LIBERTY_WEB_NODERAWFS=ON`) and the browser build `out/web`; the game is
+  installed in `~/.local/share/LibertyRecomp/game`. Dawn's npm package lives in a
+  session scratchpad (`.../4f80a7c2-.../scratchpad/npm`); reinstall with
+  `npm install webgpu ws` if it is gone. A relink of `out/web-node` takes ~1.5 min.
 - **Timing:** a full rebuild is about 7 minutes (generated code); a relink alone is about 1.5–6 minutes.
 - **Submodule status:** the patched FFmpeg/libmspack submodules show as
   modified. That is expected; never commit them. This clone sets
@@ -123,43 +314,134 @@ VK_ICD_FILENAMES=/opt/pw-browsers/chromium-1194/chrome-linux/vk_swiftshader_icd.
 XDG_DATA_HOME=<data> node out/web/LibertyRecomp/LibertyRecomp.js --diagnostics=true \
   --webgpu_frame_dump_path=<dir>/f --webgpu_frame_dump_interval=120
 # frames are PAM images (header + raw RGBA; convert with a few lines of Python
-# to view them); --webgpu_trace_frame=N logs every command of frame N.
-# Gameplay starts after roughly 2500-4200 presented frames on SwiftShader.
+# to view them); --webgpu_trace_frame=N logs every command of frame N (with
+# --log_level=info): decoded vertex inputs, nonzero pixel constants, bound
+# textures, resolves and render-phase markers, and dumps that frame too.
+# N and dump names are the title's submitted frame numbers.
+# Gameplay starts after roughly 2500-4200 presented frames on SwiftShader. With
+# Dawn on Metal and 60 fps pacing the intro starts around frame 5000-6000.
 ```
+
+On the user's Mac (Dawn on Metal; no `VK_ICD_FILENAMES`), with the scratchpad
+Dawn package named under Rebuilding:
+
+```bash
+N=<scratchpad>/npm/node_modules
+NODE_PATH=$N LIBERTY_DAWN_NODE=$N/webgpu XDG_DATA_HOME=$HOME/.local/share \
+node out/web-node/LibertyRecomp/LibertyRecomp.js --diagnostics=true \
+  --diagnostics_categories=logging --log_level=info \
+  --webgpu_frame_dump_path=<dir>/f --webgpu_frame_dump_interval=120 \
+  --webgpu_trace_frame=6000 --webgpu_trace_pixel=565,150
+```
+
+- The outdoor intro (ship's deck, skyline, lamps) is around frames 5500-7400,
+  the indoor cutscenes from about 7600. Frame numbers drift by a shot or so
+  between runs, so compare runs by scene, not only by number.
+- `--webgpu_trace_pixel=X,Y` (with a traced frame) logs `webgpu-pixel:` lines:
+  each draw that changed that texel of its first color target, old -> new raw
+  texel bytes (the back buffer is RGBA16F: four little-endian halves).
+- `--webgpu_skip_pixel_shader=HASH,...` drops draws by pixel shader hash, to
+  see what an effect contributes (compare dumps with and without).
+- The draw trace logs each draw's stencil state
+  (`stencil=enable/func/ref/mask/writemask ops=fail,depthfail,pass`); resolves
+  log the requested/owner MSAA sample types, and handoffs their policy.
+- Shader hashes map to WGSL in the archive; the archive format is
+  `LRWGSL03` (zlib) with per-record hash, stage, variant and code, which a short
+  Python script can unpack to read a shader.
 
 ## Known gaps
 
 - Renderer gaps (all handled by the Metal renderer, which is the reference):
   MSAA, temporal AA/upscaling, SMAA/FXAA, modern post-processing (DoF, sun
   shafts, FusionFix tone LUT), vector fonts, virtual/reflection targets at a
-  different physical size, the forward-depth handoff's stencil rebuild (WebGPU
-  cannot export stencil), separate color/alpha blend constants, border colors,
+  different physical size, separate color/alpha blend constants, border colors,
   wireframe, readback of 3D/compressed GPU textures.
 - Write watches (page-protection faults) never fire; the renderer trusts the
   title's `ResourceUnlock` notifications plus a byte compare when a capture is
   marked dirty. A buffer the title writes without unlocking would go stale.
-- Performance is untuned: each draw compares/copies the 22 KB device block
-  (the Vulkan renderer sends dirty deltas instead), textures and vertex
-  conversions run on the render thread, and pipelines compile synchronously.
+- Performance: each uniform binding (vertex, pixel, shared constants) keeps
+  its slot while its inputs are unchanged; redundant pass state is skipped;
+  texture bind groups, samplers and vertex input layouts are cached; converted
+  vertex and index data share pooled buffers; draws send only the 128-byte
+  chunks of the device block that changed (the render thread keeps its own
+  copy); the hot byte compares and swaps use SIMD128 (Emscripten's libc does
+  them per byte). Measured in Chrome before the delta/reuse work: ~20–32 µs of
+  render-thread time per draw in the 2026-10-07 intro run (6,600 draws: inputs
+  36, bindings 25, uniforms 29, encode 39 ms a frame).
+  **Benchmark (Node + Dawn on Metal, M1, the 5.5-minute intro, `--webgpu_perf_report`):**
+
+  | Build | Heaviest stretch | fps there | µs per draw (encode / uniforms / inputs / bindings / submit) |
+  |---|---|---|---|
+  | Before (743d745b) | ~8,400 draws | 4.5–4.8 | ~20 (8.2 / 3.2 / 2.1 / 1.6 / 2.2) |
+  | Deltas + uniform reuse + input cache (b08f89bb) | ~6,500 draws | 9.0 | ~13.3 (6.8 / 1.6 / 1.0 / 0.8 / 1.8) |
+  | + pooled vertex/index buffers (ec1b0ee8) | ~6,200–8,800 draws | 8.1–11.2 | ~9.5–11.8 (3.9 / 1.5–2.2 / 0.9 / 0.8–1.5 / 1.3–1.7) |
+  | + split uniform bindings (20b5a24a) | ~6,600–8,800 draws | 9.3–10.9 (6.5 while compiling pipelines) | ~9.4–10.1 excluding compiles (4.0 / 0.4 / 0.8 / 0.9–1.5 / 1.4) |
+  | + two GPU frames in flight (e8e98c5f) | ~6,600–8,800 draws | 8.1–12.1 | unchanged |
+  | + async pipelines, shader warm-up | ~6,000–8,900 draws | 8.4–10.6 | ~9.7–11.6; longest frame ≤ 170 ms (was up to 860) |
+  | + pass merging, timers only with the flag | ~5,500–8,800 draws | 7–14 (noisy machine) | ~10–15% below the previous row in the same conditions; ~28 passes a frame (was 330–490) |
+
+  Light scenes (300–850 draws) hold the 60 fps cap throughout. Converted
+  vertex and index data now live in 32 MB pooled buffers (`BufferPool`): draws
+  bind a pool buffer from its start and select their data with
+  `firstIndex`/`baseVertex`, so vertex-buffer calls fell from ~1.0 to ~0.25 per
+  draw and index-buffer calls from ~0.9 to ~0 (the perf line reports calls per
+  draw). The title's constants are three uniform bindings (vertex, pixel,
+  shared), each reused while unchanged: a new vertex slot is 4 KB where the
+  combined slot was ~9.7 KB, and uniforms fell from ~2 to ~0.4 µs a draw. A
+  flush in the middle of a draw's setup (arena full) makes it set up again in
+  the new batch (`redrawn` in the perf line). What remains per draw: ~4 µs of
+  encode (mostly the uniform bind group, ~1 call a draw since vertex
+  constants change on most draws), ~1–2 µs of setup (fixed state,
+  shared constants, targets, pipeline key; render passes and the timers
+  themselves were most of what was untimed, see Where it stands) and ~1.4 µs of uploads (pixel
+  constants change on ~75% as many draws as vertex constants). Pipeline
+  compiles no longer stall the render thread (asynchronous creation and the
+  shader module warm-up, under Where it stands).
+  In Chrome (user report, 2026-10-07, after the split): faster, but the first
+  run stalled for about a second at a time, which fast-forwarded parts of the
+  opening cutscene and froze gameplay. A second run was much smoother and
+  briefly reached playable frame rates in gameplay, with stutter: Chrome
+  caches compiled shaders by their WGSL, so any change to the archive makes
+  the next run compile every pipeline again. Asynchronous pipeline creation
+  and the shader module warm-up are meant to remove that stutter; not yet
+  rechecked in Chrome.
+  At most two frames are in flight on the GPU (`TrackGpuFrame`): a present
+  waits for an earlier frame to finish, so the render thread cannot queue
+  frames behind slow GPU work. The perf report's second line gives the
+  window's longest frame (render-thread busy and pipeline time in it), GPU
+  frame latency (submit to completion, as seen by the render thread) and how
+  many presents waited for the GPU.
+- Chrome's audio crackles and runs slow in busier scenes (see Where it
+  stands › Audio in Chrome).
 - The shader archive is zlib (12 MB); zstd would be 4.7 MB but needs a wasm zstd.
 - The `0x90000000` view does not mirror `0x80000000` on the web.
 - Guest FP rounding and flush modes are recorded but not applied.
 - Guest DNS is reported as host-not-found and the local IP as loopback; there is
   no online play.
-- Thread suspend and APC wakes rely on `pthread_kill`, which is delivered when
-  the target worker services its mailbox.
+- Thread suspend and APC wakes rely on `pthread_kill`, which Emscripten runs
+  only when the target calls `nanosleep` or returns to its event loop. GTA IV
+  does not suspend threads, and alertable waits poll their APC queue, so
+  nothing depends on it today.
 - The `Too few processor cores` warning appears with 4 Node workers; it is harmless.
 
 ## Next steps (pick with the user)
 
-1. **In-browser game files.** A file or folder picker (File System Access API /
+1. **WebGPU renderer performance.** The renderer is done as a title-command
+   renderer (the same interface the desktop gta4-native and gta4-metal
+   renderers use, not Xenos emulation), and Chrome renders the intro correctly
+   (see above). Per-draw cost is down to ~10 µs (Node, Dawn on Metal; see
+   Known gaps › Performance), and pipelines are created asynchronously with
+   shader modules made ahead of use; draws share render passes (~28 a frame).
+   Next: recheck the stutter in Chrome and record `perf` lines for a heavy
+   cutscene and gameplay in the benchmark table, then the per-draw uniform
+   bind-group call (`firstInstance` selection, under Where it stands).
+   Later: close the fidelity gaps above.
+2. **In-browser game files.** A file or folder picker (File System Access API /
    OPFS), mounted so the existing `gta4::install::Install()` can read it;
    reuse the non-interactive install path in `GTA4App::OnFinalizePaths`. Files
-   are 7–8 GB, so stream them rather than preloading into MEMFS.
-2. **WebGPU renderer.** Done as a title-command renderer (the same interface
-   the desktop gta4-native and gta4-metal renderers use, not Xenos emulation).
-   Follow-ups: profile a gameplay frame first (split SwiftShader time vs
-   pipeline compiles vs texture decode), then compile pipelines and decode
-   textures off the render thread, send device-block dirty deltas, close the
-   fidelity gaps above, and check the picture in a real browser once files load.
-3. **Audio, input and page lifecycle** (SDL audio context unlock, pointer lock, fullscreen).
+   are 7–8 GB, so stream them rather than preloading into MEMFS. (Local runs
+   already stream an installed game from `serve.py`; the lazy mount in
+   `res/web/index.html` is a model for this.)
+3. **Audio, input and page lifecycle.** Audio plays but the title produces it
+   below real time in busier scenes (see Where it stands › Audio in Chrome);
+   then pointer lock and fullscreen.
