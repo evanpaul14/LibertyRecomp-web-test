@@ -12,8 +12,8 @@
 #include <rex/logging.h>
 
 REXCVAR_DEFINE_BOOL(webgpu_perf_report, false, "GPU/Diagnostics",
-                    "Web build: log renderer timing reports as warnings (shown with "
-                    "--log_level=warn)");
+                    "Web build: time the renderer's stages and log timing reports as "
+                    "warnings every 5 s (shown with --log_level=warn)");
 REXCVAR_DEFINE_DOUBLE(webgpu_shader_warmup_ms, 4.0, "GPU",
                       "Web build: render-thread time per frame spent creating shader modules "
                       "for registered shaders ahead of their first draw (0: create on first use)");
@@ -470,6 +470,7 @@ bool Renderer::State::Flush(std::string& error) {
 
 bool Renderer::State::BeginPass(const Targets& targets, std::string& error) {
   if (pass && pass_targets == targets) return true;
+  ++timing.passes;
   EndPass();
   if (!Begin(error)) return false;
   std::array<wgpu::RenderPassColorAttachment, kRenderTargetCount> colors{};

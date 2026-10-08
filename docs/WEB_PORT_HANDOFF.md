@@ -61,8 +61,9 @@ mapped); this file is for whoever continues the work.
   - The Claude-in-Chrome extension could not see the WebGPU canvas in its own
     tab group (it stayed dark there while a normal tab rendered); use a tab
     opened normally (`open -a "Google Chrome" <url>`) and a screen capture.
-- **Profiling.** `--webgpu_perf_report=true` logs every 5 s as warnings: a
-  `perf` line (fps, draws a frame, render-thread time per stage, new
+- **Profiling.** `--webgpu_perf_report=true` turns on stage timing (off
+  otherwise: the clock reads cost ~10% of a draw) and logs every 5 s as
+  warnings: a `perf` line (fps, draws and render passes a frame, render-thread time per stage, new
   pipelines with how many became ready or failed, their latency and the draws
   that waited for them, shader modules warmed and still queued, new uniform
   slots, redrawn draws, WebGPU calls per draw), a stall line (the longest
@@ -106,10 +107,33 @@ mapped); this file is for whoever continues the work.
   in a window, while ~45 new pipelines arrive) and the frame dumps show no
   visible gaps. Per-draw cost is unchanged. Not yet checked in Chrome, where the
   same costs land in the GPU process instead of the render thread.
+- **Pass merging and per-draw overhead (2026-10-07, after d7069cff).** A V8
+  CPU profile of the render thread (`node --cpu-prof`; the build keeps wasm
+  function names) showed the "untimed" per-draw time was mostly render passes
+  and the timers themselves. The title toggles depth and color targets between
+  draws, and each change ended the pass (~13 µs) and reset every binding: the
+  intro ran 330–490 passes a frame. A draw now stays in the open pass when its
+  attachments are among the pass's, and a new pass also attaches the other
+  bound surfaces of the same size that already exist; a pipeline built for a
+  pass attachment the draw does not use writes nothing to it (an empty fragment
+  shader when the draw has no pixel shader). Passes fell to ~28 a frame, state
+  calls from 0.24 to 0.07 a draw. Stage timers (and the game thread's capture
+  timers) now run only with `--webgpu_perf_report`: each clock read is a call
+  out to JavaScript (~55 ns under Node) and they took ~10–15% of `Draw`. Fan,
+  quad and UP conversions reuse scratch buffers. Measured under Node with a
+  busy machine (a video call running), so only roughly: ~10–15% less
+  render-thread time a draw with the timers still on; frame dumps unchanged
+  and no GPU errors. Not checked in Chrome yet.
+  What remains a draw (Node profile): about half is calls into JavaScript;
+  the largest is the uniform `SetBindGroup` (~1 µs, one a draw because vertex
+  constants change on almost every draw), then the draw call (~0.9 µs). Removing
+  the bind-group call would mean selecting the uniform slots with
+  `firstInstance` and storage-buffer reads in every shader, plus a flat varying
+  to give the pixel shader the draw index; some vertex shaders already output
+  18 varyings, so that needs checking against `maxInterStageShaderVariables`.
 - Next step candidates, in suggested order: recheck in Chrome and record perf
-  lines (first run after a build, then a cached run), the ~3 µs of untimed
-  per-draw setup and ~4 µs of encode (see Known gaps), then a game-file picker.
-  Ask the user.
+  lines (first run after a build, then a cached run), the `firstInstance`
+  uniform selection above, then a game-file picker. Ask the user.
 - **Node graphics session (Dawn on Metal, M1 Mac, 2026-10-07).**
   - *Fixed: black loading screens.* Emscripten has no `CLOCK_MONOTONIC_RAW`;
     `clock_getres`/`clock_gettime` failed and, with asserts compiled out, the
@@ -330,6 +354,7 @@ node out/web-node/LibertyRecomp/LibertyRecomp.js --diagnostics=true \
   | + split uniform bindings (20b5a24a) | ~6,600–8,800 draws | 9.3–10.9 (6.5 while compiling pipelines) | ~9.4–10.1 excluding compiles (4.0 / 0.4 / 0.8 / 0.9–1.5 / 1.4) |
   | + two GPU frames in flight (e8e98c5f) | ~6,600–8,800 draws | 8.1–12.1 | unchanged |
   | + async pipelines, shader warm-up | ~6,000–8,900 draws | 8.4–10.6 | ~9.7–11.6; longest frame ≤ 170 ms (was up to 860) |
+  | + pass merging, timers only with the flag | ~5,500–8,800 draws | 7–14 (noisy machine) | ~10–15% below the previous row in the same conditions; ~28 passes a frame (was 330–490) |
 
   Light scenes (300–850 draws) hold the 60 fps cap throughout. Converted
   vertex and index data now live in 32 MB pooled buffers (`BufferPool`): draws
@@ -342,8 +367,9 @@ node out/web-node/LibertyRecomp/LibertyRecomp.js --diagnostics=true \
   flush in the middle of a draw's setup (arena full) makes it set up again in
   the new batch (`redrawn` in the perf line). What remains per draw: ~4 µs of
   encode (mostly the uniform bind group, ~1 call a draw since vertex
-  constants change on most draws), ~3 µs of untimed setup (fixed state,
-  shared constants, targets, pipeline key) and ~1.4 µs of uploads (pixel
+  constants change on most draws), ~1–2 µs of setup (fixed state,
+  shared constants, targets, pipeline key; render passes and the timers
+  themselves were most of what was untimed, see Where it stands) and ~1.4 µs of uploads (pixel
   constants change on ~75% as many draws as vertex constants). Pipeline
   compiles no longer stall the render thread (asynchronous creation and the
   shader module warm-up, under Where it stands).
@@ -381,10 +407,10 @@ node out/web-node/LibertyRecomp/LibertyRecomp.js --diagnostics=true \
    renderers use, not Xenos emulation), and Chrome renders the intro correctly
    (see above). Per-draw cost is down to ~10 µs (Node, Dawn on Metal; see
    Known gaps › Performance), and pipelines are created asynchronously with
-   shader modules made ahead of use. Next: recheck the stutter in Chrome and
-   record `perf` lines for a heavy cutscene and gameplay in the benchmark
-   table, then the untimed per-draw setup (fixed state, shared constants,
-   targets, pipeline key) and the remaining uniform bind-group call.
+   shader modules made ahead of use; draws share render passes (~28 a frame).
+   Next: recheck the stutter in Chrome and record `perf` lines for a heavy
+   cutscene and gameplay in the benchmark table, then the per-draw uniform
+   bind-group call (`firstInstance` selection, under Where it stands).
    Later: close the fidelity gaps above.
 2. **In-browser game files.** A file or folder picker (File System Access API /
    OPFS), mounted so the existing `gta4::install::Install()` can read it;

@@ -367,49 +367,53 @@ Renderer::Status Renderer::State::Present(const Work& work, std::string& error) 
   if (now - timing.start_ms >= 5000.0) {
     const double frames = timing.frames, elapsed = now - timing.start_ms;
     const double draws = std::max(1u, timing.draws);
-    WEBGPU_PERF_LOG("gta4-webgpu: perf {:.1f} fps over {} frames; per frame: {:.0f} draws, "
-                    "render-thread {:.2f} ms (draws {:.2f}: pipelines {:.2f}, textures {:.2f}, "
-                    "geometry {:.2f}, inputs {:.2f}, bindings {:.2f}, uniforms {:.2f}, encode "
-                    "{:.2f}; submit {:.2f}); new pipelines={} (ready {}, failed {}, latency avg "
-                    "{:.0f} max {:.0f} ms, {:.0f} draws a frame waited; warmed {} shader modules, {:.2f} ms a "
-                    "frame, {} queued) textures={} ({} KB) "
-                    "buffers={} ({} "
-                    "KB) groups={}; new uniform slots: vertex {} pixel {} shared {}; redrawn {}; calls per draw: "
-                    "pipeline {:.2f}, group {:.2f}, vertex {:.2f}, index {:.2f}, state {:.2f}",
-                    frames * 1000.0 / elapsed, timing.frames, timing.draws / frames,
-                    timing.execute_ms / frames, timing.draw_ms / frames,
-                    timing.pipeline_ms / frames, timing.texture_ms / frames,
-                    timing.geometry_ms / frames, timing.inputs_ms / frames,
-                    timing.bind_ms / frames, timing.uniform_ms / frames,
-                    timing.encode_ms / frames, timing.submit_ms / frames, timing.new_pipelines,
-                    timing.pipelines_ready, timing.pipelines_failed,
-                    timing.pipelines_ready + timing.pipelines_failed
-                        ? timing.pipeline_latency_ms /
-                              (timing.pipelines_ready + timing.pipelines_failed)
-                        : 0.0,
-                    timing.pipeline_latency_max_ms, timing.waiting_draws / frames,
-                    timing.warmed_modules, timing.warmup_ms / frames,
-                    module_queue.size() + late_module_queue.size(),
-                    timing.new_textures, timing.texture_bytes / 1024, timing.new_buffers,
-                    timing.buffer_bytes / 1024, timing.new_groups, timing.vertex_slots,
-                    timing.pixel_slots, timing.shared_slots, timing.redrawn,
-                    timing.set_pipeline / draws, timing.set_group / draws,
-                    timing.set_vertex / draws, timing.set_index / draws, timing.set_state / draws);
-    WEBGPU_PERF_LOG("gta4-webgpu: presents shown={} new-content={} no-source={} no-canvas={} "
-                    "no-surface-texture={} (status {}); canvas {}x{}; frontbuffer {:08X} "
-                    "({}, {}x{}, serial {}); gpu errors {}",
-                    timing.shown, timing.new_content, timing.no_source, timing.no_canvas,
-                    timing.no_surface_texture, timing.surface_status, surface_width,
-                    surface_height, c.frontbuffer_texture,
-                    !source ? "none" : source->gpu_produced ? "gpu" : "cpu",
-                    source ? source->width : 0, source ? source->height : 0,
-                    source ? source->content_serial : 0, gpu_errors);
-    WEBGPU_PERF_LOG("gta4-webgpu: longest frame {:.0f} ms (render thread busy {:.0f}, pipelines "
-                    "{:.0f}); gpu frame latency avg {:.1f} max {:.0f} ms, {} presents waited "
-                    "for the gpu",
-                    timing.longest_ms, timing.longest_busy_ms, timing.longest_pipeline_ms,
-                    timing.gpu_frames ? timing.gpu_latency_ms / timing.gpu_frames : 0.0,
-                    timing.gpu_latency_max_ms, timing.gpu_waits);
+    // Stage times are only measured with the flag.
+    if (REXCVAR_GET(webgpu_perf_report)) {
+      WEBGPU_PERF_LOG("gta4-webgpu: perf {:.1f} fps over {} frames; per frame: {:.0f} draws in "
+                      "{:.1f} passes, render-thread {:.2f} ms (draws {:.2f}: pipelines {:.2f}, textures {:.2f}, "
+                      "geometry {:.2f}, inputs {:.2f}, bindings {:.2f}, uniforms {:.2f}, encode "
+                      "{:.2f}; submit {:.2f}); new pipelines={} (ready {}, failed {}, latency avg "
+                      "{:.0f} max {:.0f} ms, {:.0f} draws a frame waited; warmed {} shader modules, {:.2f} ms a "
+                      "frame, {} queued) textures={} ({} KB) "
+                      "buffers={} ({} "
+                      "KB) groups={}; new uniform slots: vertex {} pixel {} shared {}; redrawn {}; calls per draw: "
+                      "pipeline {:.2f}, group {:.2f}, vertex {:.2f}, index {:.2f}, state {:.2f}",
+                      frames * 1000.0 / elapsed, timing.frames, timing.draws / frames,
+                      timing.passes / frames,
+                      timing.execute_ms / frames, timing.draw_ms / frames,
+                      timing.pipeline_ms / frames, timing.texture_ms / frames,
+                      timing.geometry_ms / frames, timing.inputs_ms / frames,
+                      timing.bind_ms / frames, timing.uniform_ms / frames,
+                      timing.encode_ms / frames, timing.submit_ms / frames, timing.new_pipelines,
+                      timing.pipelines_ready, timing.pipelines_failed,
+                      timing.pipelines_ready + timing.pipelines_failed
+                          ? timing.pipeline_latency_ms /
+                                (timing.pipelines_ready + timing.pipelines_failed)
+                          : 0.0,
+                      timing.pipeline_latency_max_ms, timing.waiting_draws / frames,
+                      timing.warmed_modules, timing.warmup_ms / frames,
+                      module_queue.size() + late_module_queue.size(),
+                      timing.new_textures, timing.texture_bytes / 1024, timing.new_buffers,
+                      timing.buffer_bytes / 1024, timing.new_groups, timing.vertex_slots,
+                      timing.pixel_slots, timing.shared_slots, timing.redrawn,
+                      timing.set_pipeline / draws, timing.set_group / draws,
+                      timing.set_vertex / draws, timing.set_index / draws, timing.set_state / draws);
+      WEBGPU_PERF_LOG("gta4-webgpu: presents shown={} new-content={} no-source={} no-canvas={} "
+                      "no-surface-texture={} (status {}); canvas {}x{}; frontbuffer {:08X} "
+                      "({}, {}x{}, serial {}); gpu errors {}",
+                      timing.shown, timing.new_content, timing.no_source, timing.no_canvas,
+                      timing.no_surface_texture, timing.surface_status, surface_width,
+                      surface_height, c.frontbuffer_texture,
+                      !source ? "none" : source->gpu_produced ? "gpu" : "cpu",
+                      source ? source->width : 0, source ? source->height : 0,
+                      source ? source->content_serial : 0, gpu_errors);
+      WEBGPU_PERF_LOG("gta4-webgpu: longest frame {:.0f} ms (render thread busy {:.0f}, pipelines "
+                      "{:.0f}); gpu frame latency avg {:.1f} max {:.0f} ms, {} presents waited "
+                      "for the gpu",
+                      timing.longest_ms, timing.longest_busy_ms, timing.longest_pipeline_ms,
+                      timing.gpu_frames ? timing.gpu_latency_ms / timing.gpu_frames : 0.0,
+                      timing.gpu_latency_max_ms, timing.gpu_waits);
+    }
     timing = {};
     timing.start_ms = now;
   }

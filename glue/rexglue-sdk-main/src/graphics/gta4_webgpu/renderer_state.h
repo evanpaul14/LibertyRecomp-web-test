@@ -95,7 +95,17 @@ struct Targets {
     for (const auto& color : colors) if (color) return false;
     return !depth;
   }
+  // Whether `other`'s attachments are all attached here, in the same slots.
+  bool Holds(const Targets& other) const {
+    if (width != other.width || height != other.height) return false;
+    for (size_t i = 0; i < colors.size(); ++i)
+      if (other.colors[i] && other.colors[i] != colors[i]) return false;
+    return !other.depth || other.depth == depth;
+  }
 };
+// DrawPipeline's `used`: bits 0-3 for the color targets a draw writes, and
+// this one when it tests or writes depth or stencil.
+inline constexpr uint32_t kUsesDepth = 1u << 4;
 
 struct VertexBinding {
   wgpu::Buffer buffer;
@@ -229,7 +239,8 @@ struct Renderer::State {
   Pipeline* DrawPipeline(const Targets& targets, const gta4_native::core::FixedFunctionState& fixed,
                          const ShaderRecord& vertex, const ShaderRecord* pixel, bool late,
                          uint32_t specialization, uint32_t topology, uint32_t strip_format,
-                         const InputLayout& inputs, uint32_t requested_colors, std::string& error);
+                         const InputLayout& inputs, uint32_t requested_colors, uint32_t used,
+                         std::string& error);
   const InputLayout* Inputs(const ShaderRecord& vertex, uint32_t declaration,
                             const std::vector<gta4_native::VertexElement>& elements, bool up,
                             uint32_t bound_streams, std::string& error);
@@ -339,6 +350,8 @@ struct Renderer::State {
   Words pipeline_key, buffer_key, group_key;
   std::vector<wgpu::BindGroupEntry> group_entries;
   std::vector<VertexBinding> vertex_bindings;
+  std::vector<uint32_t> index_scratch;  // Converted fan, quad and restart indices.
+  std::vector<float> up_scratch, up_expanded;  // Decoded DrawPrimitiveUp vertices.
 
   // Title state carried by commands.
   // Guest device blocks by address, kept current from each draw's delta.
@@ -397,7 +410,7 @@ struct Renderer::State {
   struct Timing {
     double execute_ms = 0, pipeline_ms = 0, texture_ms = 0, geometry_ms = 0, submit_ms = 0;
     double encode_ms = 0, uniform_ms = 0, inputs_ms = 0, bind_ms = 0, draw_ms = 0;
-    uint32_t frames = 0, draws = 0, new_pipelines = 0, new_textures = 0, new_buffers = 0;
+    uint32_t frames = 0, draws = 0, passes = 0, new_pipelines = 0, new_textures = 0, new_buffers = 0;
     uint32_t new_groups = 0;
     // Asynchronous pipeline creation: draws skipped while their pipeline was
     // pending, creations finished and failed, and their latency (request to
@@ -447,21 +460,22 @@ struct Renderer::State {
   uint64_t texture_failures = 0;
 };
 
-// Performance reports go to the info log, or to the warning log with
-// --webgpu_perf_report so they show without the diagnostic flood.
-#define WEBGPU_PERF_LOG(...)                                \
-  do {                                                      \
-    if (REXCVAR_GET(webgpu_perf_report))                    \
-      REXLOG_WARN(__VA_ARGS__);                             \
-    else                                                    \
-      REXLOG_INFO(__VA_ARGS__);                             \
-  } while (0)
+// Performance reports (only with --webgpu_perf_report) go to the warning log,
+// so they show without the diagnostic flood.
+#define WEBGPU_PERF_LOG(...) REXLOG_WARN(__VA_ARGS__)
 
-// Adds the scope's wall time (ms) to `total`.
+// The clock for stage timing, or 0 without --webgpu_perf_report: each read
+// is a call out to JavaScript, and a draw's stage timers took about a tenth
+// of its render-thread time.
+inline double PerfNow() { return REXCVAR_GET(webgpu_perf_report) ? emscripten_get_now() : 0.0; }
+
+// Adds the scope's wall time (ms) to `total`, with --webgpu_perf_report.
 class ScopedTimer {
  public:
-  explicit ScopedTimer(double& total) : total_(total), start_(emscripten_get_now()) {}
-  ~ScopedTimer() { total_ += emscripten_get_now() - start_; }
+  explicit ScopedTimer(double& total) : total_(total), start_(PerfNow()) {}
+  ~ScopedTimer() {
+    if (start_) total_ += emscripten_get_now() - start_;
+  }
   ScopedTimer(const ScopedTimer&) = delete;
   ScopedTimer& operator=(const ScopedTimer&) = delete;
 

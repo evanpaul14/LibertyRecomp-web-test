@@ -103,7 +103,7 @@ std::span<const uint8_t> Bytes(const T& value) {
 Pipeline* Renderer::State::DrawPipeline(
     const Targets& targets, const FixedState& fixed, const ShaderRecord& vertex,
     const ShaderRecord* pixel, bool late, uint32_t specialization, uint32_t topology,
-    uint32_t strip_format, const InputLayout& inputs, uint32_t requested_colors,
+    uint32_t strip_format, const InputLayout& inputs, uint32_t requested_colors, uint32_t used,
     std::string& error) {
   (void)specialization;
   const uint32_t texture_mask = vertex.texture_mask | (pixel ? pixel->texture_mask : 0);
@@ -116,12 +116,13 @@ Pipeline* Renderer::State::DrawPipeline(
   for (uint32_t i = 0; i < kRenderTargetCount; ++i) {
     const auto& color = targets.colors[i];
     key.push_back(color ? uint32_t(color->format) : 0u);
-    key.push_back(color ? fixed.blend_controls[i] : 0u);
+    key.push_back(color && (used & (1u << i)) ? fixed.blend_controls[i] : 0u);
   }
   key.push_back(fixed.color_write_mask);
   key.push_back(requested_colors);
+  key.push_back(used);
   key.push_back(targets.depth ? uint32_t(targets.depth->format) : 0u);
-  if (targets.depth) {
+  if (used & kUsesDepth) {
     for (uint32_t value :
          {fixed.depth_enable, fixed.depth_function, fixed.depth_write_enable, fixed.stencil_enable,
           fixed.stencil_function, fixed.stencil_fail, fixed.stencil_depth_fail, fixed.stencil_pass,
@@ -180,7 +181,17 @@ Pipeline* Renderer::State::DrawPipeline(
       cull.front_face_clockwise ? wgpu::FrontFace::CW : wgpu::FrontFace::CCW;
 
   wgpu::DepthStencilState depth{};
-  if (targets.depth) {
+  if (targets.depth && !(used & kUsesDepth)) {
+    // Attached for the pass's other draws; this one leaves it alone.
+    depth.format = targets.depth->format;
+    depth.depthWriteEnabled = wgpu::OptionalBool::False;
+    depth.depthCompare = wgpu::CompareFunction::Always;
+    depth.stencilFront = depth.stencilBack = {
+        wgpu::CompareFunction::Always, wgpu::StencilOperation::Keep,
+        wgpu::StencilOperation::Keep, wgpu::StencilOperation::Keep};
+    depth.stencilReadMask = depth.stencilWriteMask = 0;
+    descriptor.depthStencil = &depth;
+  } else if (targets.depth) {
     depth.format = targets.depth->format;
     depth.depthWriteEnabled = fixed.depth_enable && fixed.depth_write_enable
                                   ? wgpu::OptionalBool::True
@@ -220,7 +231,7 @@ Pipeline* Renderer::State::DrawPipeline(
     if (!surface) continue;
     color_count = i + 1;
     colors[i].format = surface->format;
-    const uint32_t write = (pixel && (requested_colors & (1u << i)))
+    const uint32_t write = (pixel && (used & (1u << i)))
                                ? NativeColorWriteMaskForTarget(fixed.color_write_mask, i)
                                : 0;
     colors[i].writeMask = wgpu::ColorWriteMask(write);
@@ -246,8 +257,10 @@ Pipeline* Renderer::State::DrawPipeline(
     colors[i].blend = &state;
   }
   wgpu::FragmentState fragment{};
-  if (pixel) {
-    fragment.module = pixel_module;
+  if (pixel || color_count) {
+    // Without a pixel shader, the pass's color attachments still need
+    // (unwritten) targets.
+    fragment.module = pixel ? pixel_module : UtilityModule("empty_fragment", "@fragment fn main() {}\n");
     fragment.entryPoint = "main";
     fragment.targetCount = color_count;
     fragment.targets = colors.data();
@@ -473,6 +486,40 @@ bool Renderer::State::Draw(const Work& work, std::string& error, bool retry) {
     ++stats.no_targets;
     return true;
   }
+  uint32_t used = targets.depth ? kUsesDepth : 0u;
+  for (uint32_t i = 0; i < kRenderTargetCount; ++i)
+    if (targets.colors[i]) used |= 1u << i;
+  // The pass's attachments: those of the open pass when they hold this
+  // draw's, so that toggling depth or a color target does not end it (each
+  // new pass also has every binding set again); otherwise this draw's plus
+  // the other bound surfaces of the same size, for the draws that follow.
+  // A copy: a flush during the setup below ends the pass.
+  Targets attachments;
+  if (pass && pass_targets.Holds(targets)) {
+    attachments = pass_targets;
+  } else {
+    attachments = targets;
+    // Only surfaces that exist already and match their binding: making or
+    // replacing one is left to a draw that uses it.
+    const auto add = [&](std::shared_ptr<SurfaceResource>& slot,
+                         const SurfaceDescriptor& descriptor, bool depth) {
+      if (slot || !descriptor.handle) return;
+      const auto found = surfaces.find(descriptor.handle);
+      if (found == surfaces.end()) return;
+      const auto& surface = found->second;
+      if (surface->depth != depth || surface->width != targets.width ||
+          surface->height != targets.height || descriptor.width != surface->width ||
+          descriptor.height != surface->height ||
+          surface->format != SurfaceFormat(descriptor.format, depth, depth_format))
+        return;
+      for (const auto& other : attachments.colors)
+        if (other == surface) return;
+      slot = surface;
+    };
+    for (uint32_t i = 0; i < kRenderTargetCount; ++i)
+      add(attachments.colors[i], work.colors[i], false);
+    add(attachments.depth, work.depth, true);
+  }
 
   std::array<float, 6> viewport{};
   for (size_t i = 0; i < viewport.size(); ++i) {
@@ -551,7 +598,8 @@ bool Renderer::State::Draw(const Work& work, std::string& error, bool retry) {
       return uint32_t(bytes[(size_t(first) + i) * 2]) << 8 | bytes[(size_t(first) + i) * 2 + 1];
     };
     const auto is_restart = [&](uint32_t value) { return indexed && restart && value == restart_value; };
-    std::vector<uint32_t> converted;
+    auto& converted = index_scratch;
+    converted.clear();
     if (type == 5) {
       VisitNativeTriangleFan(count, read, is_restart, [&](uint32_t a, uint32_t b, uint32_t c) {
         converted.insert(converted.end(), {a, b, c});
@@ -602,7 +650,8 @@ bool Renderer::State::Draw(const Work& work, std::string& error, bool retry) {
         return false;
       }
       const size_t components = input.elements.size() * 4;
-      std::vector<float> decoded(size_t(vertex_count) * components);
+      auto& decoded = up_scratch;
+      decoded.assign(size_t(vertex_count) * components, 0.0f);
       for (uint32_t v = 0; v < vertex_count; ++v) {
         for (size_t i = 0; i < input.elements.size(); ++i) {
           const auto* element = input.elements[i];
@@ -628,7 +677,8 @@ bool Renderer::State::Draw(const Work& work, std::string& error, bool retry) {
                                     uint32_t(position - vertex.attributes.begin()));
           if (at != input.locations.end()) position_index = size_t(at - input.locations.begin());
         }
-        std::vector<float> expanded(decoded.size() * 2);
+        auto& expanded = up_expanded;
+        expanded.assign(decoded.size() * 2, 0.0f);
         for (uint32_t r = 0; r < vertex_count / 3; ++r) {
           const float* corner[3] = {decoded.data() + (r * 3) * components,
                                     decoded.data() + (r * 3 + 1) * components,
@@ -655,7 +705,7 @@ bool Renderer::State::Draw(const Work& work, std::string& error, bool retry) {
             std::memcpy(out + k * components, order[k], components * sizeof(float));
           for (size_t k = 0; k < components; ++k) out[5 * components + k] = b[k] - a[k] + c[k];
         }
-        decoded = std::move(expanded);
+        decoded.swap(expanded);
       }
       binding.offset = PushGeometry({reinterpret_cast<const uint8_t*>(decoded.data()),
                                      decoded.size() * sizeof(float)},
@@ -692,8 +742,8 @@ bool Renderer::State::Draw(const Work& work, std::string& error, bool retry) {
   if (up && type == 8) count *= 2;
   inputs_timer.reset();
 
-  auto* pipeline = DrawPipeline(targets, fixed, vertex, pixel, late, specialization,
-                                uint32_t(topology), strip_format, *inputs, requested_colors,
+  auto* pipeline = DrawPipeline(attachments, fixed, vertex, pixel, late, specialization,
+                                uint32_t(topology), strip_format, *inputs, requested_colors, used,
                                 error);
   if (!pipeline) return false;
   if (!pipeline->pipeline) {
@@ -934,7 +984,7 @@ bool Renderer::State::Draw(const Work& work, std::string& error, bool retry) {
     else ++timing.redrawn;
     return false;
   }
-  if (!BeginPass(targets, error)) return false;
+  if (!BeginPass(attachments, error)) return false;
   // Every pass call crosses from wasm into the browser's WebGPU, so state that
   // the previous draw in this pass already set is skipped.
   ScopedTimer encode_timer(timing.encode_ms);

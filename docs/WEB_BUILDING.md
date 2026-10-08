@@ -150,9 +150,10 @@ named by the title's frame number. `--webgpu_trace_frame=N` logs every title
 command of that frame (with each draw's decoded vertex inputs, nonzero pixel
 constants and bound textures) and always dumps it; trace lines are info-level, so
 add `--log_level=info`. Every 60 frames the renderer logs its draw, clear and
-resolve counts. `--webgpu_perf_report=true` logs timing every 5 s as warnings:
-fps, render-thread time per stage, WebGPU calls per draw, the longest frame and
-GPU frame latency.
+resolve counts. `--webgpu_perf_report=true` times the renderer's stages and logs
+every 5 s as warnings: fps, draws and render passes a frame, render-thread
+time per stage, WebGPU calls per draw, the longest frame and GPU frame latency.
+Without it no stage timing runs (each clock read is a call out to JavaScript).
 `--webgpu_frame_limit` caps presents per second (default 60, 0 = unlimited).
 Title pipelines are created asynchronously, and a draw is skipped until its
 pipeline is ready (`--webgpu_async_pipelines=false` creates them synchronously;

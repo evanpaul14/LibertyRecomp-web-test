@@ -255,7 +255,7 @@ bool Gta4WebGpuGraphicsSystem::CaptureDevice(Work& work, uint32_t device, std::s
     error = "Unmapped guest device state";
     return false;
   }
-  const double start = emscripten_get_now();
+  const double start = PerfNow();
   ++snapshots_;
   // The block changes on almost every draw, but usually only in a few
   // chunks; send those (all of them the first time).
@@ -273,7 +273,7 @@ bool Gta4WebGpuGraphicsSystem::CaptureDevice(Work& work, uint32_t device, std::s
                              bytes + offset + kDeviceChunkBytes);
   }
   snapshot_bytes_ += work.device.bytes.size();
-  snapshot_ms_ += emscripten_get_now() - start;
+  if (start) snapshot_ms_ += emscripten_get_now() - start;
   return ReadTargets(work, device, error);
 }
 
@@ -303,12 +303,13 @@ std::shared_ptr<const BufferCapture> Gta4WebGpuGraphicsSystem::CaptureBuffer(
     error = "Invalid guest buffer metadata";
     return {};
   }
-  const double start = emscripten_get_now();
   struct Elapsed {
     double& total;
     double start;
-    ~Elapsed() { total += emscripten_get_now() - start; }
-  } elapsed{buffer_capture_ms_, start};
+    ~Elapsed() {
+      if (start) total += emscripten_get_now() - start;
+    }
+  } elapsed{buffer_capture_ms_, PerfNow()};
   auto found = buffers_.find(handle);
   if (found != buffers_.end() && !metadata->guest_locked && !dirty_.contains(handle) &&
       found->second->address == metadata->guest_address &&
@@ -350,8 +351,10 @@ std::shared_ptr<const TextureCapture> Gta4WebGpuGraphicsSystem::CaptureTexture(
   struct Elapsed {
     double& total;
     double start;
-    ~Elapsed() { total += emscripten_get_now() - start; }
-  } elapsed{texture_capture_ms_, emscripten_get_now()};
+    ~Elapsed() {
+      if (start) total += emscripten_get_now() - start;
+    }
+  } elapsed{texture_capture_ms_, PerfNow()};
   TextureInfo info{};
   if (!TextureInfo::Prepare(fetch, &info) || info.mip_min_level > info.mip_max_level ||
       info.mip_max_level >= xenos::kTextureMaxMips) {
@@ -760,11 +763,11 @@ bool Gta4WebGpuGraphicsSystem::SubmitTitleCommand(uint32_t title_id, uint32_t ab
   // Queued under the capture lock: device deltas must reach the render
   // thread in the order they were taken.
   std::lock_guard lock(capture_mutex_);
-  const double start = emscripten_get_now();
+  const double start = PerfNow();
   const bool captured = Capture(command, size, *work, error);
-  const double now = emscripten_get_now();
-  capture_ms_ += now - start;
-  if (present) {
+  if (start) capture_ms_ += emscripten_get_now() - start;
+  if (present && REXCVAR_GET(webgpu_perf_report)) {
+    const double now = emscripten_get_now();
     if (!report_start_ms_) report_start_ms_ = now;
     if (now - report_start_ms_ >= 5000.0) {
       double blocked;
