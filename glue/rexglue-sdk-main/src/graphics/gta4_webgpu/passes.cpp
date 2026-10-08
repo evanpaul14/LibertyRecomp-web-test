@@ -358,6 +358,11 @@ Renderer::Status Renderer::State::Present(const Work& work, std::string& error) 
   ++timing.frames;
   timing.draws += stats.draws;
   const double now = emscripten_get_now();
+  if (last_present_ms && now - last_present_ms > timing.longest_ms) {
+    timing.longest_ms = now - last_present_ms;
+    timing.longest_busy_ms = timing.execute_ms - last_execute_ms;
+    timing.longest_pipeline_ms = timing.pipeline_ms - last_pipeline_ms;
+  }
   if (!timing.start_ms) timing.start_ms = now;
   if (now - timing.start_ms >= 5000.0) {
     const double frames = timing.frames, elapsed = now - timing.start_ms;
@@ -388,9 +393,18 @@ Renderer::Status Renderer::State::Present(const Work& work, std::string& error) 
                     !source ? "none" : source->gpu_produced ? "gpu" : "cpu",
                     source ? source->width : 0, source ? source->height : 0,
                     source ? source->content_serial : 0, gpu_errors);
+    WEBGPU_PERF_LOG("gta4-webgpu: longest frame {:.0f} ms (render thread busy {:.0f}, pipelines "
+                    "{:.0f}); gpu frame latency avg {:.1f} max {:.0f} ms, {} presents waited "
+                    "for the gpu",
+                    timing.longest_ms, timing.longest_busy_ms, timing.longest_pipeline_ms,
+                    timing.gpu_frames ? timing.gpu_latency_ms / timing.gpu_frames : 0.0,
+                    timing.gpu_latency_max_ms, timing.gpu_waits);
     timing = {};
     timing.start_ms = now;
   }
+  last_present_ms = now;
+  last_execute_ms = timing.execute_ms;
+  last_pipeline_ms = timing.pipeline_ms;
   stats = {};
   frame_draws = 0;
   submitted_frame = c.submitted_frame;
@@ -410,7 +424,7 @@ Renderer::Status Renderer::State::Present(const Work& work, std::string& error) 
     acknowledge();
     BeginFrame();
     if (!source && error.empty()) error = "Title frontbuffer is not a ready color image";
-    return Status::kYield;
+    return TrackGpuFrame();
   }
 
   // Render the frontbuffer at its presentation size, then read it back.
@@ -468,6 +482,32 @@ Renderer::Status Renderer::State::Present(const Work& work, std::string& error) 
         buffer.Unmap();
         if (resume) resume();
       });
+  return Status::kPending;
+}
+
+Renderer::Status Renderer::State::TrackGpuFrame() {
+  // Nothing else stops this thread from running ahead of the GPU: frames
+  // would queue up behind slow GPU work (such as shader compiles) and the
+  // canvas would skip from the oldest to the newest.
+  constexpr uint32_t kMaximumGpuFrames = 2;
+  const double submitted = emscripten_get_now();
+  ++gpu_frames_pending;
+  queue.OnSubmittedWorkDone(
+      wgpu::CallbackMode::AllowSpontaneous,
+      [this, submitted](wgpu::QueueWorkDoneStatus, wgpu::StringView) {
+        const double latency = emscripten_get_now() - submitted;
+        timing.gpu_latency_ms += latency;
+        timing.gpu_latency_max_ms = std::max(timing.gpu_latency_max_ms, latency);
+        ++timing.gpu_frames;
+        --gpu_frames_pending;
+        if (gpu_waiting && gpu_frames_pending < kMaximumGpuFrames) {
+          gpu_waiting = false;
+          if (resume) resume();
+        }
+      });
+  if (gpu_frames_pending < kMaximumGpuFrames) return Status::kYield;
+  gpu_waiting = true;
+  ++timing.gpu_waits;
   return Status::kPending;
 }
 

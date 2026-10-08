@@ -234,6 +234,9 @@ struct Renderer::State {
   bool Handoff(const Work& work, std::string& error);
   Status Present(const Work& work, std::string& error);
   void PresentToCanvas(const TextureResource& source, std::string& error);
+  // Follows the frame just submitted on the GPU; kPending while too many
+  // frames are unfinished there.
+  Status TrackGpuFrame();
   Status Readback(const Work& work, std::string& error);
 
   memory::Memory* memory;
@@ -361,6 +364,12 @@ struct Renderer::State {
 
   uint64_t frame = 0;
   uint64_t batches = 0;  // Flushes so far.
+  // Frames submitted but not finished on the GPU, and whether a present is
+  // waiting for one to finish.
+  uint32_t gpu_frames_pending = 0;
+  bool gpu_waiting = false;
+  // At the last present, for the longest-frame report.
+  double last_present_ms = 0, last_execute_ms = 0, last_pipeline_ms = 0;
   uint32_t submitted_frame = 0;  // The title's number of the last presented frame.
   uint64_t content_serial = 0;
   uint64_t draws = 0, frame_draws = 0, skipped_draws = 0;
@@ -388,6 +397,13 @@ struct Renderer::State {
     uint32_t shown = 0, no_source = 0, no_canvas = 0, no_surface_texture = 0, new_content = 0;
     uint32_t surface_status = 0;  // wgpu::SurfaceGetCurrentTextureStatus of the last failure.
     double start_ms = 0;
+    // The longest frame: wall time between presents, and the render thread's
+    // busy time and pipeline creation time in it.
+    double longest_ms = 0, longest_busy_ms = 0, longest_pipeline_ms = 0;
+    // GPU frame latency (submit to completion), and presents that waited for
+    // the GPU to finish an earlier frame.
+    double gpu_latency_ms = 0, gpu_latency_max_ms = 0;
+    uint32_t gpu_frames = 0, gpu_waits = 0;
   } timing;
   // The frontbuffer last shown, to tell a frozen picture from a frozen source.
   const TextureResource* presented_source = nullptr;

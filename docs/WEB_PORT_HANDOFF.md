@@ -306,6 +306,19 @@ node out/web-node/LibertyRecomp/LibertyRecomp.js --diagnostics=true \
   constants change on ~75% as many draws as vertex constants), and
   synchronous pipeline compiles (native Dawn, about 140 ms per pipeline on
   Metal; they dominate the windows that hit them).
+  In Chrome (user report, 2026-10-07, after the split): faster, but the first
+  run stalled for about a second at a time, which fast-forwarded parts of the
+  opening cutscene and froze gameplay. A second run was much smoother and
+  briefly reached playable frame rates in gameplay, with stutter: Chrome
+  caches compiled shaders by their WGSL, so any change to the archive makes
+  the next run compile every pipeline again. Asynchronous pipeline creation
+  is the fix for the remaining stutter.
+  At most two frames are in flight on the GPU (`TrackGpuFrame`): a present
+  waits for an earlier frame to finish, so the render thread cannot queue
+  frames behind slow GPU work. The perf report's second line gives the
+  window's longest frame (render-thread busy and pipeline time in it), GPU
+  frame latency (submit to completion, as seen by the render thread) and how
+  many presents waited for the GPU.
 - Chrome's audio fails: SDL3's audio callback throws `Cannot mix BigInt and
   other types` in `CPtrToHeap32Index` (a wasm64 bug in SDL's JavaScript).
 - The shader archive is zlib (12 MB); zstd would be 4.7 MB but needs a wasm zstd.
