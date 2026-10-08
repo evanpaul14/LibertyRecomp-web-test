@@ -272,17 +272,30 @@ node out/web-node/LibertyRecomp/LibertyRecomp.js --diagnostics=true \
 - Write watches (page-protection faults) never fire; the renderer trusts the
   title's `ResourceUnlock` notifications plus a byte compare when a capture is
   marked dirty. A buffer the title writes without unlocking would go stale.
-- Performance: identical uniform blocks share a slot within a batch, redundant
-  pass state is skipped, texture bind groups and samplers are cached across
-  frames, and the hot byte compares and swaps use SIMD128 (Emscripten's libc
-  does them per byte). Measured in Chrome: ~13 µs of render-thread time per
-  draw in an earlier gameplay run (uniforms ~2, encoding ~3, the rest per-draw
-  setup), but ~20–32 µs in the 2026-10-07 intro run, rising with draw count
-  (6,600 draws: inputs 36, bindings 25, uniforms 29, encode 39 ms a frame).
-  The game thread spends ~30–35% of its time capturing. Still open: device-block
-  dirty deltas instead of 22 KB copies, fewer per-draw allocations, and
-  asynchronous pipeline compiles (native Dawn compiles synchronously, about
-  140 ms per pipeline on Metal).
+- Performance: identical uniform blocks share a slot within a batch, and a
+  draw whose constants and shared state did not change reuses the previous
+  slot outright; redundant pass state is skipped; texture bind groups,
+  samplers and vertex input layouts are cached; draws send only the 128-byte
+  chunks of the device block that changed (the render thread keeps its own
+  copy); the hot byte compares and swaps use SIMD128 (Emscripten's libc does
+  them per byte). Measured in Chrome before the delta/reuse work: ~20–32 µs of
+  render-thread time per draw in the 2026-10-07 intro run (6,600 draws: inputs
+  36, bindings 25, uniforms 29, encode 39 ms a frame).
+  **Benchmark (Node + Dawn on Metal, M1, the 5.5-minute intro, `--webgpu_perf_report`):**
+
+  | Build | Heaviest stretch | fps there | µs per draw (encode / uniforms / inputs / bindings / submit) |
+  |---|---|---|---|
+  | Before (743d745b) | ~8,400 draws | 4.5–4.8 | ~20 (8.2 / 3.2 / 2.1 / 1.6 / 2.2) |
+  | Deltas + uniform reuse + input cache | ~6,500 draws | 9.0 | ~13.3 (6.8 / 1.6 / 1.0 / 0.8 / 1.8) |
+
+  Light scenes (300–850 draws) hold the 60 fps cap in both. Encode is now about
+  half of each draw, at ~1.6 µs per WebGPU call; draws make ~1 vertex-buffer,
+  ~0.9 index-buffer and ~0.9 bind-group call each (the perf line reports calls
+  per draw). Still open: pooled vertex/index buffers addressed by
+  `baseVertex`/`firstIndex`, ~9.7 KB of uniforms uploaded per new slot (a
+  split per-stage layout needs regenerated shaders), and asynchronous pipeline
+  compiles (native Dawn compiles synchronously, about 140 ms per pipeline on
+  Metal).
 - Chrome's audio fails: SDL3's audio callback throws `Cannot mix BigInt and
   other types` in `CPtrToHeap32Index` (a wasm64 bug in SDL's JavaScript).
 - The shader archive is zlib (12 MB); zstd would be 4.7 MB but needs a wasm zstd.

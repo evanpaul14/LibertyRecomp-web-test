@@ -70,7 +70,8 @@ struct TextureResource {
 struct Arena {
   wgpu::Buffer buffer;
   uint64_t capacity = 0;
-  std::vector<uint8_t> bytes;
+  uint64_t used = 0;
+  std::vector<uint8_t> bytes;  // `capacity` bytes; only the first `used` are this batch's.
 };
 
 struct Pipeline {
@@ -98,6 +99,22 @@ struct VertexBinding {
   uint64_t size = 0;
 };
 
+// How a vertex shader's inputs are fed for one declaration and set of bound
+// streams: a buffer per guest stream with every attribute decoded to float4,
+// then a zero buffer for attributes the declaration lacks.
+struct InputLayout {
+  struct Stream {
+    uint32_t stream = 0;
+    std::vector<uint32_t> locations;
+    std::vector<const gta4_native::VertexElement*> elements;  // Into `declarations`.
+  };
+  std::vector<Stream> streams;
+  bool defaults = false;
+  std::vector<wgpu::VertexBufferLayout> layouts;  // Attribute pointers unset.
+  std::vector<std::vector<wgpu::VertexAttribute>> attributes;
+  Words key;  // Its part of a pipeline key.
+};
+
 struct Renderer::State {
   State(memory::Memory* memory, const ShaderArchive* archive)
       : memory(memory), archive(archive) {}
@@ -109,6 +126,11 @@ struct Renderer::State {
   bool Flush(std::string& error);
   bool BeginPass(const Targets& targets, std::string& error);
   uint64_t PushUniforms(std::span<const uint8_t> bytes, std::string& error);
+  // A new uniform slot to fill in place, then CommitUniforms with the bytes
+  // written; it returns the offset to bind (an equal earlier slot's, if any).
+  uint8_t* ReserveUniforms(uint64_t& offset, std::string& error);
+  uint64_t CommitUniforms(uint64_t offset, size_t size);
+  void ApplyDeviceDelta(const DeviceDelta& delta);
   uint64_t PushGeometry(std::span<const uint8_t> bytes, std::string& error);
   wgpu::ShaderModule Module(const ShaderRecord& record, bool late, std::string& error);
   wgpu::ShaderModule UtilityModule(const char* name, const char* code);
@@ -158,9 +180,10 @@ struct Renderer::State {
   Pipeline* DrawPipeline(const Targets& targets, const gta4_native::core::FixedFunctionState& fixed,
                          const ShaderRecord& vertex, const ShaderRecord* pixel, bool late,
                          uint32_t specialization, uint32_t topology, uint32_t strip_format,
-                         const std::vector<wgpu::VertexBufferLayout>& layouts,
-                         const std::vector<std::vector<wgpu::VertexAttribute>>& attributes,
-                         uint32_t requested_colors, std::string& error);
+                         const InputLayout& inputs, uint32_t requested_colors, std::string& error);
+  const InputLayout* Inputs(const ShaderRecord& vertex, uint32_t declaration,
+                            const std::vector<gta4_native::VertexElement>& elements, bool up,
+                            uint32_t bound_streams, std::string& error);
 
   // --- passes.cpp ---
   bool Resolve(const Work& work, std::string& error);
@@ -217,6 +240,16 @@ struct Renderer::State {
     size_t size = 0;
   };
   std::unordered_map<uint64_t, UniformSlot> uniform_slots;
+  // The last draw's uniforms. A draw with the same inputs, and no constant
+  // change on its device since, binds the same slot.
+  struct LastUniforms {
+    uint64_t offset = UINT64_MAX;  // None in this batch.
+    uint32_t device = 0;
+    uint64_t constants_serial = 0;
+    bool pixel = false;
+    uint32_t specialization = 0;
+    gta4_native::core::SharedConstants shared{};
+  } last_uniforms;
   wgpu::BindGroupLayout uniform_layout;
   wgpu::BindGroup uniform_group;  // Recreated when the uniform arena grows.
   wgpu::Buffer zero_vertices;
@@ -240,8 +273,24 @@ struct Renderer::State {
     }
   };
   std::unordered_map<FetchKey, wgpu::Sampler, FetchKeyHash> fetch_samplers;
+  // Input layouts by vertex shader record, declaration handle and bound
+  // streams (bit 31: a DrawPrimitiveUp draw). Cleared when declarations change.
+  using InputKey = std::array<uint32_t, 4>;
+  struct InputKeyHash {
+    size_t operator()(const InputKey& key) const {
+      return size_t(XXH3_64bits(key.data(), sizeof(key)));
+    }
+  };
+  std::unordered_map<InputKey, InputLayout, InputKeyHash> input_layouts;
+  // Per-draw scratch, kept to reuse its storage.
+  Words pipeline_key, buffer_key, group_key;
+  std::vector<wgpu::BindGroupEntry> group_entries;
+  std::vector<VertexBinding> vertex_bindings;
 
   // Title state carried by commands.
+  // Guest device blocks by address, kept current from each draw's delta.
+  std::unordered_map<uint32_t, std::vector<uint8_t>> devices;
+  uint64_t constants_serial = 0;  // Bumped when a delta changes shader constants.
   std::unordered_map<uint32_t, const ShaderRecord*> shaders;
   std::unordered_map<uint32_t, std::vector<gta4_native::VertexElement>> declarations;
   struct Stream {
@@ -282,9 +331,12 @@ struct Renderer::State {
   // Render-thread CPU time (ms) and work done since the last timing report.
   struct Timing {
     double execute_ms = 0, pipeline_ms = 0, texture_ms = 0, geometry_ms = 0, submit_ms = 0;
-    double encode_ms = 0, uniform_ms = 0, inputs_ms = 0, bind_ms = 0;
+    double encode_ms = 0, uniform_ms = 0, inputs_ms = 0, bind_ms = 0, draw_ms = 0;
     uint32_t frames = 0, draws = 0, new_pipelines = 0, new_textures = 0, new_buffers = 0;
-    uint32_t new_groups = 0, uniform_slots = 0, uniform_reused = 0;
+    uint32_t new_groups = 0, uniform_slots = 0, uniform_reused = 0, uniform_repeated = 0;
+    // Render pass calls: pipelines, bind groups, vertex and index buffers,
+    // fixed state (viewport, scissor, stencil reference, blend constant).
+    uint32_t set_pipeline = 0, set_group = 0, set_vertex = 0, set_index = 0, set_state = 0;
     uint64_t texture_bytes = 0, buffer_bytes = 0;
     // Presents: shown on the canvas, skipped (no source, no canvas, no
     // surface texture), and how many showed a frontbuffer with new contents.

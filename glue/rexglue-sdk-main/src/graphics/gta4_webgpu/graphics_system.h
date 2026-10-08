@@ -63,7 +63,8 @@ class Gta4WebGpuGraphicsSystem final : public system::IGraphicsSystem {
   // Producer side, under capture_mutex_.
   bool Capture(const void* command, size_t size, Work& work, std::string& error);
   bool CaptureDraw(Work& work, uint32_t device, bool indexed, std::string& error);
-  bool SnapshotDevice(Work& work, uint32_t device, std::string& error);
+  bool CaptureDevice(Work& work, uint32_t device, std::string& error);
+  bool ReadTargets(Work& work, uint32_t device, std::string& error);
   std::shared_ptr<const BufferCapture> CaptureBuffer(uint32_t handle, std::string& error);
   std::shared_ptr<const TextureCapture> CaptureTexture(uint32_t handle,
                                                        const xenos::xe_gpu_texture_fetch_t& fetch,
@@ -102,11 +103,11 @@ class Gta4WebGpuGraphicsSystem final : public system::IGraphicsSystem {
   // Submitting-thread time (ms) since the last report, under capture_mutex_
   // except blocked_ms_ (under queue_mutex_).
   double capture_ms_ = 0, snapshot_ms_ = 0, buffer_capture_ms_ = 0, texture_capture_ms_ = 0, report_start_ms_ = 0;
-  uint64_t captured_bytes_ = 0, snapshots_ = 0, snapshot_copies_ = 0;
+  uint64_t captured_bytes_ = 0, snapshots_ = 0, snapshot_bytes_ = 0;
   double blocked_ms_ = 0;
   double next_present_ms_ = 0;  // Earliest time of the next present (presenting thread).
-  std::shared_ptr<std::vector<uint8_t>> last_device_;
-  uint32_t last_device_address_ = 0;
+  // Each device block as last sent to the render thread, by guest address.
+  std::unordered_map<uint32_t, std::vector<uint8_t>> sent_devices_;
 
   std::mutex queue_mutex_;
   std::condition_variable queue_space_;

@@ -53,10 +53,21 @@ struct ExecuteSlot {
   }
 };
 
+// The guest device block is sent to the render thread as the chunks that
+// changed since the previous draw on that device; it keeps its own copy.
+inline constexpr uint32_t kDeviceChunkBytes = 128;
+inline constexpr uint32_t kDeviceChunkCount = gta4_native::kGuestDeviceSize / kDeviceChunkBytes;
+static_assert(gta4_native::kGuestDeviceSize % kDeviceChunkBytes == 0);
+
+struct DeviceDelta {
+  uint32_t device = 0;  // Guest address of the device; 0 when the command has none.
+  std::array<uint32_t, (kDeviceChunkCount + 31) / 32> chunks{};  // Changed chunks.
+  std::vector<uint8_t> bytes;  // Their contents, in chunk order.
+};
+
 struct Work {
   std::vector<std::byte> command;
-  // Device block (kGuestDeviceSize bytes) for draws, clears and resolves.
-  std::shared_ptr<const std::vector<uint8_t>> device;
+  DeviceDelta device;  // Draws only.
   std::array<gta4_native::SurfaceDescriptor, gta4_native::kRenderTargetCount> colors{};
   gta4_native::SurfaceDescriptor depth{};
   std::array<std::shared_ptr<const BufferCapture>, gta4_native::kVertexStreamCount> streams{};

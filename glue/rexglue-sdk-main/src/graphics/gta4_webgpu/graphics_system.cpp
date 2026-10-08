@@ -249,7 +249,7 @@ SurfaceDescriptor Gta4WebGpuGraphicsSystem::ReadSurface(uint32_t handle) const {
   return out;
 }
 
-bool Gta4WebGpuGraphicsSystem::SnapshotDevice(Work& work, uint32_t device, std::string& error) {
+bool Gta4WebGpuGraphicsSystem::CaptureDevice(Work& work, uint32_t device, std::string& error) {
   const uint8_t* bytes = GuestVirtual(device, kGuestDeviceSize);
   if (!bytes) {
     error = "Unmapped guest device state";
@@ -257,19 +257,31 @@ bool Gta4WebGpuGraphicsSystem::SnapshotDevice(Work& work, uint32_t device, std::
   }
   const double start = emscripten_get_now();
   ++snapshots_;
-  // Reuse the previous snapshot while the device block is unchanged; the
-  // render thread only reads it.
-  if (last_device_ && last_device_address_ == device &&
-      BytesEqual(last_device_->data(), bytes, kGuestDeviceSize)) {
-    work.device = last_device_;
-  } else {
-    last_device_ = std::make_shared<std::vector<uint8_t>>(bytes, bytes + kGuestDeviceSize);
-    last_device_address_ = device;
-    work.device = last_device_;
-    ++snapshot_copies_;
+  // The block changes on almost every draw, but usually only in a few
+  // chunks; send those (all of them the first time).
+  auto& sent = sent_devices_[device];
+  const bool full = sent.empty();
+  if (full) sent.resize(kGuestDeviceSize);
+  work.device.device = device;
+  for (uint32_t chunk = 0; chunk < kDeviceChunkCount; ++chunk) {
+    const size_t offset = size_t(chunk) * kDeviceChunkBytes;
+    if (!full && BytesEqual(sent.data() + offset, bytes + offset, kDeviceChunkBytes)) continue;
+    std::memcpy(sent.data() + offset, bytes + offset, kDeviceChunkBytes);
+    work.device.chunks[chunk / 32] |= 1u << (chunk % 32);
+    work.device.bytes.insert(work.device.bytes.end(), bytes + offset,
+                             bytes + offset + kDeviceChunkBytes);
   }
+  snapshot_bytes_ += work.device.bytes.size();
   snapshot_ms_ += emscripten_get_now() - start;
-  const uint8_t* state = work.device->data();
+  return ReadTargets(work, device, error);
+}
+
+bool Gta4WebGpuGraphicsSystem::ReadTargets(Work& work, uint32_t device, std::string& error) {
+  const uint8_t* state = GuestVirtual(device, kGuestDeviceSize);
+  if (!state) {
+    error = "Unmapped guest device state";
+    return false;
+  }
   for (uint32_t i = 0; i < kRenderTargetCount; ++i)
     work.colors[i] = ReadSurface(LoadBig32(state + kDeviceColorTargets + i * 4));
   work.depth = ReadSurface(LoadBig32(state + kDeviceDepthTarget));
@@ -385,8 +397,8 @@ std::shared_ptr<const TextureCapture> Gta4WebGpuGraphicsSystem::CaptureTexture(
 
 bool Gta4WebGpuGraphicsSystem::CaptureDraw(Work& work, uint32_t device, bool indexed,
                                            std::string& error) {
-  if (!SnapshotDevice(work, device, error)) return false;
-  const uint8_t* state = work.device->data();
+  if (!CaptureDevice(work, device, error)) return false;
+  const uint8_t* state = sent_devices_[device].data();
   const auto& bindings = devices_[device];
   const auto declaration = declarations_.find(bindings.declaration);
   if (declaration != declarations_.end()) {
@@ -457,7 +469,7 @@ bool Gta4WebGpuGraphicsSystem::Capture(const void* command, size_t size, Work& w
     case CommandType::kDeviceCreated: {
       const auto c = Read<DeviceCommand>(command);
       if (c.mode != 2) devices_[c.device] = {};
-      last_device_.reset();
+      sent_devices_.clear();
       return true;
     }
     case CommandType::kDeviceDestroyed:
@@ -468,7 +480,7 @@ bool Gta4WebGpuGraphicsSystem::Capture(const void* command, size_t size, Work& w
       gpu_textures_.clear();
       shaders_.clear();
       declarations_.clear();
-      last_device_.reset();
+      sent_devices_.clear();
       return true;
     case CommandType::kRegisterShader: {
       const auto c = Read<RegisterShaderCommand>(command);
@@ -558,7 +570,7 @@ bool Gta4WebGpuGraphicsSystem::Capture(const void* command, size_t size, Work& w
       return CaptureDraw(work, c.device, false, error);
     }
     case CommandType::kClear:
-      return SnapshotDevice(work, Read<ClearCommand>(command).device, error);
+      return ReadTargets(work, Read<ClearCommand>(command).device, error);
     case CommandType::kResolve: {
       const auto c = Read<ResolveCommand>(command);
       if (!c.source.handle || !c.destination_texture) {
@@ -568,7 +580,7 @@ bool Gta4WebGpuGraphicsSystem::Capture(const void* command, size_t size, Work& w
       gpu_textures_.insert(c.destination_texture);
       textures_.erase(c.destination_texture);
       dirty_.erase(c.destination_texture);
-      if (c.device && !SnapshotDevice(work, c.device, error)) error.clear();
+      if (c.device && !ReadTargets(work, c.device, error)) error.clear();
       return true;
     }
     case CommandType::kPresent: {
@@ -740,45 +752,47 @@ bool Gta4WebGpuGraphicsSystem::SubmitTitleCommand(uint32_t title_id, uint32_t ab
   }
   const auto header = Read<CommandHeader>(command);
   if (header.type == CommandType::kTemporalUpdate) return true;  // No temporal AA here.
+  const bool present = header.type == CommandType::kPresent;
+  if (present) PacePresent();
   auto work = std::make_unique<Work>();
   std::string error;
-  bool captured;
-  {
-    std::lock_guard lock(capture_mutex_);
-    const double start = emscripten_get_now();
-    captured = Capture(command, size, *work, error);
-    const double now = emscripten_get_now();
-    capture_ms_ += now - start;
-    if (header.type == CommandType::kPresent) {
-      if (!report_start_ms_) report_start_ms_ = now;
-      if (now - report_start_ms_ >= 5000.0) {
-        double blocked;
-        {
-          std::lock_guard queue_lock(queue_mutex_);
-          blocked = blocked_ms_;
-          blocked_ms_ = 0;
-        }
-        WEBGPU_PERF_LOG("gta4-webgpu: capture over {:.0f} ms: {:.0f} ms capturing (device {:.0f} "
-                    "for {} snapshots, {} copied; buffers {:.0f}, textures {:.0f}; {} KB "
-                    "copied), {:.0f} ms waiting on the render thread",
-                    now - report_start_ms_, capture_ms_, snapshot_ms_, snapshots_,
-                    snapshot_copies_, buffer_capture_ms_, texture_capture_ms_,
-                    captured_bytes_ / 1024, blocked);
-        capture_ms_ = snapshot_ms_ = buffer_capture_ms_ = texture_capture_ms_ = 0;
-        captured_bytes_ = snapshots_ = snapshot_copies_ = 0;
-        report_start_ms_ = now;
+  // Queued under the capture lock: device deltas must reach the render
+  // thread in the order they were taken.
+  std::lock_guard lock(capture_mutex_);
+  const double start = emscripten_get_now();
+  const bool captured = Capture(command, size, *work, error);
+  const double now = emscripten_get_now();
+  capture_ms_ += now - start;
+  if (present) {
+    if (!report_start_ms_) report_start_ms_ = now;
+    if (now - report_start_ms_ >= 5000.0) {
+      double blocked;
+      {
+        std::lock_guard queue_lock(queue_mutex_);
+        blocked = blocked_ms_;
+        blocked_ms_ = 0;
       }
+      WEBGPU_PERF_LOG("gta4-webgpu: capture over {:.0f} ms: {:.0f} ms capturing (device {:.0f} "
+                      "for {} draws, {} KB sent; buffers {:.0f}, textures {:.0f}; {} KB "
+                      "copied), {:.0f} ms waiting on the render thread",
+                      now - report_start_ms_, capture_ms_, snapshot_ms_, snapshots_,
+                      snapshot_bytes_ / 1024, buffer_capture_ms_, texture_capture_ms_,
+                      captured_bytes_ / 1024, blocked);
+      capture_ms_ = snapshot_ms_ = buffer_capture_ms_ = texture_capture_ms_ = 0;
+      captured_bytes_ = snapshots_ = snapshot_bytes_ = 0;
+      report_start_ms_ = now;
     }
   }
   if (!captured) {
+    // The render thread never sees this delta; send the next one in full.
+    if (work->device.device) sent_devices_.erase(work->device.device);
     ++failures_;
     if (failures_ <= 64 || failures_ % 4096 == 0)
       REXLOG_ERROR("gta4-webgpu: capture rejected type={} count={} reason={}",
                    uint32_t(header.type), failures_, error);
     return false;
   }
-  if (header.type == CommandType::kPresent) PacePresent();
-  Enqueue(std::move(work), header.type == CommandType::kPresent);
+  Enqueue(std::move(work), present);
   return true;
 }
 

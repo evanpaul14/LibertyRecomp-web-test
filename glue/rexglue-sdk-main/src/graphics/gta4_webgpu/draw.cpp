@@ -37,6 +37,8 @@ constexpr uint32_t kDeviceFetchConstants = 0x480;
 constexpr uint32_t kDeviceVertexConstants = 0x780;
 constexpr uint32_t kDevicePixelConstants = 0x1780;
 constexpr uint32_t kPixelConstantBytes = 0xE00;
+static_assert(kUniformPixelOffset + kPixelConstantBytes <= kUniformSharedOffset);
+static_assert(kUniformSharedOffset + sizeof(core::SharedConstants) <= kUniformSpecializationOffset);
 
 wgpu::CompareFunction Compare(uint32_t value) {
   static constexpr wgpu::CompareFunction kValues[] = {
@@ -96,15 +98,13 @@ std::span<const uint8_t> Bytes(const T& value) {
 Pipeline* Renderer::State::DrawPipeline(
     const Targets& targets, const FixedState& fixed, const ShaderRecord& vertex,
     const ShaderRecord* pixel, bool late, uint32_t specialization, uint32_t topology,
-    uint32_t strip_format, const std::vector<wgpu::VertexBufferLayout>& layouts,
-    const std::vector<std::vector<wgpu::VertexAttribute>>& attributes, uint32_t requested_colors,
+    uint32_t strip_format, const InputLayout& inputs, uint32_t requested_colors,
     std::string& error) {
   (void)specialization;
   const uint32_t texture_mask = vertex.texture_mask | (pixel ? pixel->texture_mask : 0);
   const uint32_t cube_mask = vertex.cube_mask | (pixel ? pixel->cube_mask : 0);
   const uint32_t sampler_mask = vertex.sampler_mask | (pixel ? pixel->sampler_mask : 0);
-  Words key;
-  key.reserve(96);
+  Words& key = pipeline_key;
   key = {uint32_t(vertex.hash), uint32_t(vertex.hash >> 32),
             pixel ? uint32_t(pixel->hash) : 0u, pixel ? uint32_t(pixel->hash >> 32) : 0u,
             late, topology, strip_format, texture_mask, cube_mask, sampler_mask};
@@ -128,14 +128,7 @@ Pipeline* Renderer::State::DrawPipeline(
       key.push_back(value);
   }
   key.push_back(fixed.cull_mode);
-  for (size_t i = 0; i < layouts.size(); ++i) {
-    key.push_back(uint32_t(layouts[i].arrayStride));
-    for (const auto& attribute : attributes[i]) {
-      key.push_back(attribute.shaderLocation);
-      key.push_back(uint32_t(attribute.offset));
-    }
-    key.push_back(0xFFFFFFFFu);
-  }
+  key.insert(key.end(), inputs.key.begin(), inputs.key.end());
   if (auto found = pipelines.find(key); found != pipelines.end()) return &found->second;
   ScopedTimer timer(timing.pipeline_ms);
   ++timing.new_pipelines;
@@ -158,10 +151,10 @@ Pipeline* Renderer::State::DrawPipeline(
   layout.bindGroupLayoutCount = groups.size();
   layout.bindGroupLayouts = groups.data();
 
-  std::vector<wgpu::VertexBufferLayout> buffers = layouts;
+  std::vector<wgpu::VertexBufferLayout> buffers = inputs.layouts;
   for (size_t i = 0; i < buffers.size(); ++i) {
-    buffers[i].attributeCount = attributes[i].size();
-    buffers[i].attributes = attributes[i].data();
+    buffers[i].attributeCount = inputs.attributes[i].size();
+    buffers[i].attributes = inputs.attributes[i].data();
   }
   wgpu::RenderPipelineDescriptor descriptor{};
   const std::string label = fmt::format("title {:016X}/{:016X}", vertex.hash,
@@ -260,7 +253,77 @@ Pipeline* Renderer::State::DrawPipeline(
     pipelines.clear();
     pass_state.pipeline = nullptr;  // A new pipeline could reuse the handle.
   }
-  return &pipelines.emplace(std::move(key), std::move(result)).first->second;
+  return &pipelines.emplace(key, std::move(result)).first->second;
+}
+
+const InputLayout* Renderer::State::Inputs(const ShaderRecord& vertex, uint32_t declaration,
+                                           const std::vector<VertexElement>& elements, bool up,
+                                           uint32_t bound_streams, std::string& error) {
+  const uint64_t record = reinterpret_cast<uintptr_t>(&vertex);
+  const InputKey input_key{uint32_t(record), uint32_t(record >> 32), declaration,
+                           up ? 0x80000000u : bound_streams};
+  if (auto found = input_layouts.find(input_key); found != input_layouts.end())
+    return &found->second;
+  InputLayout layout;
+  std::vector<uint32_t> defaults;
+  for (uint32_t location = 0; location < vertex.attributes.size(); ++location) {
+    const uint32_t semantic = vertex.attributes[location];
+    const VertexElement* match = nullptr;
+    for (const auto& element : elements) {
+      if (core::ConvertVertexUsageToLocation(element.usage, element.usage_index) != semantic)
+        continue;
+      if (up ? element.stream == 0 : (bound_streams & (1u << element.stream)) != 0) {
+        match = &element;
+        break;
+      }
+    }
+    if (!match) {
+      defaults.push_back(location);
+      continue;
+    }
+    auto group = std::find_if(layout.streams.begin(), layout.streams.end(),
+                              [&](const auto& item) { return item.stream == match->stream; });
+    if (group == layout.streams.end()) {
+      layout.streams.push_back({match->stream, {}, {}});
+      group = std::prev(layout.streams.end());
+    }
+    group->locations.push_back(location);
+    group->elements.push_back(match);
+  }
+  if (layout.streams.size() + (defaults.empty() ? 0 : 1) > limits.maxVertexBuffers) {
+    error = "Draw uses more vertex streams than WebGPU allows";
+    return nullptr;
+  }
+  for (const auto& input : layout.streams) {
+    wgpu::VertexBufferLayout buffer{};
+    buffer.arrayStride = input.elements.size() * 16;
+    buffer.stepMode = wgpu::VertexStepMode::Vertex;
+    layout.layouts.push_back(buffer);
+    std::vector<wgpu::VertexAttribute> list;
+    for (size_t i = 0; i < input.locations.size(); ++i)
+      list.push_back({nullptr, wgpu::VertexFormat::Float32x4, uint64_t(i * 16), input.locations[i]});
+    layout.attributes.push_back(std::move(list));
+  }
+  if (!defaults.empty()) {
+    layout.defaults = true;
+    wgpu::VertexBufferLayout buffer{};
+    buffer.arrayStride = 0;
+    buffer.stepMode = wgpu::VertexStepMode::Vertex;
+    layout.layouts.push_back(buffer);
+    std::vector<wgpu::VertexAttribute> list;
+    for (uint32_t location : defaults)
+      list.push_back({nullptr, wgpu::VertexFormat::Float32x4, 0, location});
+    layout.attributes.push_back(std::move(list));
+  }
+  for (size_t i = 0; i < layout.layouts.size(); ++i) {
+    layout.key.push_back(uint32_t(layout.layouts[i].arrayStride));
+    for (const auto& attribute : layout.attributes[i]) {
+      layout.key.push_back(attribute.shaderLocation);
+      layout.key.push_back(uint32_t(attribute.offset));
+    }
+    layout.key.push_back(0xFFFFFFFFu);
+  }
+  return &input_layouts.emplace(input_key, std::move(layout)).first->second;
 }
 
 bool Renderer::State::Draw(const Work& work, std::string& error) {
@@ -297,11 +360,12 @@ bool Renderer::State::Draw(const Work& work, std::string& error) {
   }
   if (!count) return true;
   const uint32_t vertex_count = count;  // Before fan/quad index conversion.
-  if (count > 16u * 1024u * 1024u || !work.device) {
+  const auto device_found = devices.find(work.device.device);
+  if (count > 16u * 1024u * 1024u || device_found == devices.end()) {
     error = "Draw range exceeds its bound or has no device state";
     return false;
   }
-  const std::span<const uint8_t> guest(*work.device);
+  const std::span<const uint8_t> guest(device_found->second);
   const auto fixed = core::DecodeFixedState(guest);
 
   const auto vertex_found = shaders.find(vertex_shader);
@@ -475,48 +539,17 @@ bool Renderer::State::Draw(const Work& work, std::string& error) {
                        : uint32_t(wgpu::IndexFormat::Undefined);
 
   // Vertex inputs: one float4 per shader attribute, grouped by guest stream.
-  struct StreamInputs {
-    uint32_t stream = 0;
-    std::vector<uint32_t> locations;
-    std::vector<const VertexElement*> elements;
-  };
   std::optional<ScopedTimer> inputs_timer(std::in_place, timing.inputs_ms);
-  std::vector<StreamInputs> inputs;
-  inputs.reserve(4);
-  std::vector<uint32_t> defaults;
-  for (uint32_t location = 0; location < vertex.attributes.size(); ++location) {
-    const uint32_t semantic = vertex.attributes[location];
-    const VertexElement* match = nullptr;
-    for (const auto& element : elements) {
-      if (core::ConvertVertexUsageToLocation(element.usage, element.usage_index) != semantic)
-        continue;
-      if (up ? element.stream == 0
-             : (work.streams[element.stream] && streams[element.stream].stride)) {
-        match = &element;
-        break;
-      }
-    }
-    if (!match) {
-      defaults.push_back(location);
-      continue;
-    }
-    auto group = std::find_if(inputs.begin(), inputs.end(),
-                              [&](const auto& item) { return item.stream == match->stream; });
-    if (group == inputs.end()) {
-      inputs.push_back({match->stream, {}, {}});
-      group = std::prev(inputs.end());
-    }
-    group->locations.push_back(location);
-    group->elements.push_back(match);
+  uint32_t bound_streams = 0;
+  if (!up) {
+    for (uint32_t i = 0; i < kVertexStreamCount; ++i)
+      if (work.streams[i] && streams[i].stride) bound_streams |= 1u << i;
   }
-  if (inputs.size() + (defaults.empty() ? 0 : 1) > limits.maxVertexBuffers) {
-    error = "Draw uses more vertex streams than WebGPU allows";
-    return false;
-  }
-  std::vector<VertexBinding> bindings;
-  std::vector<wgpu::VertexBufferLayout> layouts;
-  std::vector<std::vector<wgpu::VertexAttribute>> attributes;
-  for (const auto& input : inputs) {
+  const InputLayout* inputs = Inputs(vertex, declaration, elements, up, bound_streams, error);
+  if (!inputs) return false;
+  auto& bindings = vertex_bindings;
+  bindings.clear();
+  for (const auto& input : inputs->streams) {
     VertexBinding binding;
     if (up) {
       if (!up_stride || uint64_t(up_stride) * vertex_count > work.up_vertices.size()) {
@@ -592,32 +625,14 @@ bool Renderer::State::Draw(const Work& work, std::string& error) {
       if (!binding.buffer) return false;
     }
     bindings.push_back(binding);
-    wgpu::VertexBufferLayout layout{};
-    layout.arrayStride = input.elements.size() * 16;
-    layout.stepMode = wgpu::VertexStepMode::Vertex;
-    layouts.push_back(layout);
-    std::vector<wgpu::VertexAttribute> list;
-    for (size_t i = 0; i < input.locations.size(); ++i)
-      list.push_back({nullptr, wgpu::VertexFormat::Float32x4, uint64_t(i * 16), input.locations[i]});
-    attributes.push_back(std::move(list));
   }
-  if (!defaults.empty()) {
-    bindings.push_back({zero_vertices, 0, 64});
-    wgpu::VertexBufferLayout layout{};
-    layout.arrayStride = 0;
-    layout.stepMode = wgpu::VertexStepMode::Vertex;
-    layouts.push_back(layout);
-    std::vector<wgpu::VertexAttribute> list;
-    for (uint32_t location : defaults)
-      list.push_back({nullptr, wgpu::VertexFormat::Float32x4, 0, location});
-    attributes.push_back(std::move(list));
-  }
+  if (inputs->defaults) bindings.push_back({zero_vertices, 0, 64});
   if (up && type == 8) count *= 2;
   inputs_timer.reset();
 
   auto* pipeline = DrawPipeline(targets, fixed, vertex, pixel, late, specialization,
-                                uint32_t(topology), strip_format, layouts, attributes,
-                                requested_colors, error);
+                                uint32_t(topology), strip_format, *inputs, requested_colors,
+                                error);
   if (!pipeline) return false;
 
   // Shared constants, then textures.
@@ -625,16 +640,15 @@ bool Renderer::State::Draw(const Work& work, std::string& error) {
   wgpu::BindGroup texture_group;
   std::optional<ScopedTimer> bind_timer(std::in_place, timing.bind_ms);
   if (pipeline->textures) {
-    Words group_key;
-    group_key.reserve(2 + kTextureStageCount * 4);
+    group_key.clear();
     const auto key_pointer = [&](const void* pointer) {
       const uint64_t value = reinterpret_cast<uintptr_t>(pointer);
       group_key.push_back(uint32_t(value));
       group_key.push_back(uint32_t(value >> 32));
     };
     key_pointer(pipeline->textures.Get());
-    std::vector<wgpu::BindGroupEntry> entries;
-    entries.reserve(kTextureStageCount * 2);
+    auto& entries = group_entries;
+    entries.clear();
     for (uint32_t slot = 0; slot < kTextureStageCount; ++slot) {
       const uint32_t bit = 1u << slot;
       if (!((pipeline->texture_mask | pipeline->sampler_mask) & bit)) continue;
@@ -713,7 +727,7 @@ bool Renderer::State::Draw(const Work& work, std::string& error) {
       texture_group = device.CreateBindGroup(&descriptor);
       // The cached group holds its views and samplers, so the pointers in
       // its key cannot be reused by other objects while it lives.
-      texture_groups.emplace(std::move(group_key), std::make_pair(texture_group, frame));
+      texture_groups.emplace(group_key, std::make_pair(texture_group, frame));
       ++timing.new_groups;
     }
   }
@@ -750,29 +764,51 @@ bool Renderer::State::Draw(const Work& work, std::string& error) {
   shared.projection_scale[1] = environment.projection_matrix[5];
 
   std::optional<ScopedTimer> uniform_timer(std::in_place, timing.uniform_ms);
-  std::array<uint8_t, kUniformSpecializationOffset + 4> uniform{};
-  CopySwap32(uniform.data() + kUniformVertexOffset, guest.data() + kDeviceVertexConstants, 0x1000);
-  if (pixel)
-    CopySwap32(uniform.data() + kUniformPixelOffset, guest.data() + kDevicePixelConstants,
-               kPixelConstantBytes);
-  std::memcpy(uniform.data() + kUniformSharedOffset, &shared, sizeof(shared));
-  std::memcpy(uniform.data() + kUniformSpecializationOffset, &specialization, 4);
-  const uint64_t uniform_offset = PushUniforms(uniform, error);
+  uint64_t uniform_offset;
+  auto& last = last_uniforms;
+  if (last.offset != UINT64_MAX && last.device == work.device.device &&
+      last.constants_serial == constants_serial && last.pixel == (pixel != nullptr) &&
+      last.specialization == specialization && BytesEqual(&last.shared, &shared, sizeof(shared))) {
+    uniform_offset = last.offset;
+    ++timing.uniform_repeated;
+  } else {
+    uint8_t* slot = ReserveUniforms(uniform_offset, error);
+    if (!slot) return false;
+    CopySwap32(slot + kUniformVertexOffset, guest.data() + kDeviceVertexConstants, 0x1000);
+    if (pixel)
+      CopySwap32(slot + kUniformPixelOffset, guest.data() + kDevicePixelConstants,
+                 kPixelConstantBytes);
+    else  // Unread, but zero so that equal draws share a slot.
+      std::memset(slot + kUniformPixelOffset, 0, kPixelConstantBytes);
+    std::memset(slot + kUniformPixelOffset + kPixelConstantBytes, 0,
+                kUniformSharedOffset - kUniformPixelOffset - kPixelConstantBytes);
+    std::memcpy(slot + kUniformSharedOffset, &shared, sizeof(shared));
+    std::memset(slot + kUniformSharedOffset + sizeof(shared), 0,
+                kUniformSpecializationOffset - kUniformSharedOffset - sizeof(shared));
+    std::memcpy(slot + kUniformSpecializationOffset, &specialization, 4);
+    uniform_offset = CommitUniforms(uniform_offset, kUniformSpecializationOffset + 4);
+    last.offset = uniform_offset;
+    last.device = work.device.device;
+    last.constants_serial = constants_serial;
+    last.pixel = pixel != nullptr;
+    last.specialization = specialization;
+    last.shared = shared;
+  }
   uniform_timer.reset();
-  if (uniform_offset == UINT64_MAX) return false;
+  const uint8_t* uniform = uniforms.bytes.data() + uniform_offset;
 
   if (trace) {
     float position[4] = {};
-    if (!inputs.empty() && !up && work.streams[inputs[0].stream])
-      DecodeVertexElement(inputs[0].elements[0]->type,
-                          work.streams[inputs[0].stream]->bytes.data() +
-                              streams[inputs[0].stream].offset + inputs[0].elements[0]->offset,
+    if (!inputs->streams.empty() && !up && work.streams[inputs->streams[0].stream])
+      DecodeVertexElement(inputs->streams[0].elements[0]->type,
+                          work.streams[inputs->streams[0].stream]->bytes.data() +
+                              streams[inputs->streams[0].stream].offset + inputs->streams[0].elements[0]->offset,
                           position);
     float c0[4];
-    std::memcpy(c0, uniform.data() + 208 * 16, sizeof(c0));
-    if (up && !work.up_vertices.empty() && !inputs.empty())
-      DecodeVertexElement(inputs[0].elements[0]->type,
-                          work.up_vertices.data() + inputs[0].elements[0]->offset, position);
+    std::memcpy(c0, uniform + 208 * 16, sizeof(c0));
+    if (up && !work.up_vertices.empty() && !inputs->streams.empty())
+      DecodeVertexElement(inputs->streams[0].elements[0]->type,
+                          work.up_vertices.data() + inputs->streams[0].elements[0]->offset, position);
     REXLOG_INFO("webgpu-trace: draw vs={:016X} ps={:016X} type={} count={} indexed={} up={} "
                 "color0={:08X}/{}x{} depth={:08X} viewport={},{},{},{},{},{} scissor={},{},{},{} "
                 "writes={:X} blend0={:08X} depth-test={}/{} stencil={}/{}/{:02X}/{:02X}/{:02X} "
@@ -791,7 +827,7 @@ bool Renderer::State::Draw(const Work& work, std::string& error) {
                 c0[1], c0[2], c0[3], pipeline->texture_mask);
     // The first vertex's decoded inputs, and the nonzero pixel constants.
     std::string detail;
-    for (const auto& input : inputs) {
+    for (const auto& input : inputs->streams) {
       const uint8_t* base =
           up ? work.up_vertices.data()
              : work.streams[input.stream] ? work.streams[input.stream]->bytes.data() +
@@ -811,7 +847,7 @@ bool Renderer::State::Draw(const Work& work, std::string& error) {
     if (pixel) {
       for (uint32_t i = 0; i < kPixelConstantBytes / 16; ++i) {
         float value[4];
-        std::memcpy(value, uniform.data() + kUniformPixelOffset + i * 16, sizeof(value));
+        std::memcpy(value, uniform + kUniformPixelOffset + i * 16, sizeof(value));
         if (value[0] || value[1] || value[2] || value[3])
           detail += fmt::format(" c{}={},{},{},{}", i, value[0], value[1], value[2], value[3]);
       }
@@ -826,15 +862,18 @@ bool Renderer::State::Draw(const Work& work, std::string& error) {
   if (bound.pipeline != pipeline->pipeline.Get()) {
     pass.SetPipeline(pipeline->pipeline);
     bound.pipeline = pipeline->pipeline.Get();
+    ++timing.set_pipeline;
   }
   const uint32_t dynamic_offset = uint32_t(uniform_offset);
   if (!bound.uniforms_set || bound.uniform_offset != dynamic_offset) {
     pass.SetBindGroup(0, uniform_group, 1, &dynamic_offset);
+    ++timing.set_group;
     bound.uniforms_set = true;
     bound.uniform_offset = dynamic_offset;
   }
   if (texture_group && bound.textures != texture_group.Get()) {
     pass.SetBindGroup(1, texture_group);
+    ++timing.set_group;
     bound.textures = texture_group.Get();
   }
   for (uint32_t i = 0; i < bindings.size(); ++i) {
@@ -843,6 +882,7 @@ bool Renderer::State::Draw(const Work& work, std::string& error) {
         slot.size == bindings[i].size)
       continue;
     pass.SetVertexBuffer(i, bindings[i].buffer, bindings[i].offset, bindings[i].size);
+    ++timing.set_vertex;
     slot = {bindings[i].buffer.Get(), bindings[i].offset, bindings[i].size};
   }
   const std::array<float, 6> viewport_state{viewport[0], viewport[1], viewport[2], viewport[3],
@@ -853,6 +893,7 @@ bool Renderer::State::Draw(const Work& work, std::string& error) {
                      viewport_state[4], viewport_state[5]);
     bound.viewport = viewport_state;
     bound.viewport_set = true;
+    ++timing.set_state;
   }
   const std::array<uint32_t, 4> scissor{uint32_t(left), uint32_t(top), uint32_t(right - left),
                                         uint32_t(bottom - top)};
@@ -860,11 +901,13 @@ bool Renderer::State::Draw(const Work& work, std::string& error) {
     pass.SetScissorRect(scissor[0], scissor[1], scissor[2], scissor[3]);
     bound.scissor = scissor;
     bound.scissor_set = true;
+    ++timing.set_state;
   }
   if (!bound.stencil_set || bound.stencil_reference != fixed.stencil_reference) {
     pass.SetStencilReference(fixed.stencil_reference);
     bound.stencil_reference = fixed.stencil_reference;
     bound.stencil_set = true;
+    ++timing.set_state;
   }
   const std::array<float, 4> blend_state{fixed.blend_constants[0], fixed.blend_constants[1],
                                          fixed.blend_constants[2], fixed.blend_constants[3]};
@@ -873,6 +916,7 @@ bool Renderer::State::Draw(const Work& work, std::string& error) {
     pass.SetBlendConstant(&blend);
     bound.blend = blend_state;
     bound.blend_set = true;
+    ++timing.set_state;
   }
   if (indexed) {
     // Bind the whole index buffer and select the range with firstIndex, so
@@ -881,6 +925,7 @@ bool Renderer::State::Draw(const Work& work, std::string& error) {
     const auto format = index32 ? wgpu::IndexFormat::Uint32 : wgpu::IndexFormat::Uint16;
     if (bound.index_buffer != index_buffer.Get() || bound.index_format != format) {
       pass.SetIndexBuffer(index_buffer, format, 0, wgpu::kWholeSize);
+      ++timing.set_index;
       bound.index_buffer = index_buffer.Get();
       bound.index_format = format;
     }

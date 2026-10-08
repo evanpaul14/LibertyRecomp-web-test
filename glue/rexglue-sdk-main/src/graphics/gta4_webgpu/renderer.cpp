@@ -359,26 +359,28 @@ void Renderer::State::EndPass() {
 }
 
 uint64_t Renderer::State::PushUniforms(std::span<const uint8_t> bytes, std::string& error) {
-  // One kUniformStride slot per draw. Bindings span kUniformBlockSize from the
-  // slot start, so the buffer keeps that much headroom past the last slot.
   if (bytes.size() > kUniformStride) {
     error = "Uniform block exceeds its slot";
     return UINT64_MAX;
   }
-  // Identical constants share a slot within the batch (the rest of a slot is
-  // zero, so equal bytes of equal size mean equal bindings).
-  const uint64_t hash = XXH3_64bits(bytes.data(), bytes.size());
-  if (auto found = uniform_slots.find(hash); found != uniform_slots.end() &&
-      found->second.size == bytes.size() &&
-      BytesEqual(uniforms.bytes.data() + found->second.offset, bytes.data(), bytes.size())) {
-    ++timing.uniform_reused;
-    return found->second.offset;
-  }
-  if (uniforms.bytes.size() + kUniformStride + kUniformBlockSize > uniforms.capacity) {
-    if (!uniforms.bytes.empty() && !Flush(error)) return UINT64_MAX;
-    if (!Begin(error)) return UINT64_MAX;
+  uint64_t offset;
+  uint8_t* slot = ReserveUniforms(offset, error);
+  if (!slot) return UINT64_MAX;
+  std::memcpy(slot, bytes.data(), bytes.size());
+  return CommitUniforms(offset, bytes.size());
+}
+
+uint8_t* Renderer::State::ReserveUniforms(uint64_t& offset, std::string& error) {
+  // One kUniformStride slot per draw. Bindings span kUniformBlockSize from the
+  // slot start, so the buffer keeps that much headroom past the last slot.
+  // Shaders read only what the caller writes, so stale bytes past it from an
+  // earlier batch are harmless.
+  if (uniforms.used + kUniformStride + kUniformBlockSize > uniforms.capacity) {
+    if (uniforms.used && !Flush(error)) return nullptr;
+    if (!Begin(error)) return nullptr;
     if (kUniformStride + kUniformBlockSize > uniforms.capacity) {
       uniforms.capacity = kInitialUniformArena;
+      uniforms.bytes.assign(uniforms.capacity, 0);
       wgpu::BufferDescriptor descriptor{};
       descriptor.size = uniforms.capacity;
       descriptor.usage = wgpu::BufferUsage::Uniform | wgpu::BufferUsage::CopyDst;
@@ -394,12 +396,40 @@ uint64_t Renderer::State::PushUniforms(std::span<const uint8_t> bytes, std::stri
       uniform_group = device.CreateBindGroup(&group);
     }
   }
-  const uint64_t offset = uniforms.bytes.size();
-  uniforms.bytes.resize(offset + kUniformStride);
-  std::memcpy(uniforms.bytes.data() + offset, bytes.data(), bytes.size());
-  uniform_slots[hash] = {offset, bytes.size()};
+  offset = uniforms.used;
+  return uniforms.bytes.data() + offset;
+}
+
+uint64_t Renderer::State::CommitUniforms(uint64_t offset, size_t size) {
+  // Identical constants share a slot within the batch: the reserved slot is
+  // dropped again.
+  const uint8_t* bytes = uniforms.bytes.data() + offset;
+  const uint64_t hash = XXH3_64bits(bytes, size);
+  if (auto found = uniform_slots.find(hash); found != uniform_slots.end() &&
+      found->second.size == size &&
+      BytesEqual(uniforms.bytes.data() + found->second.offset, bytes, size)) {
+    ++timing.uniform_reused;
+    return found->second.offset;
+  }
+  uniforms.used = offset + kUniformStride;
+  uniform_slots[hash] = {offset, size};
   ++timing.uniform_slots;
   return offset;
+}
+
+void Renderer::State::ApplyDeviceDelta(const DeviceDelta& delta) {
+  auto& block = devices[delta.device];
+  if (block.empty()) block.resize(kGuestDeviceSize);
+  // Chunks holding vertex or pixel constants.
+  constexpr uint32_t kFirstConstantChunk = 0x780 / kDeviceChunkBytes;
+  constexpr uint32_t kLastConstantChunk = (0x1780 + 0xE00 - 1) / kDeviceChunkBytes;
+  const uint8_t* source = delta.bytes.data();
+  for (uint32_t chunk = 0; chunk < kDeviceChunkCount; ++chunk) {
+    if (!(delta.chunks[chunk / 32] & (1u << (chunk % 32)))) continue;
+    std::memcpy(block.data() + size_t(chunk) * kDeviceChunkBytes, source, kDeviceChunkBytes);
+    source += kDeviceChunkBytes;
+    if (chunk >= kFirstConstantChunk && chunk <= kLastConstantChunk) ++constants_serial;
+  }
 }
 
 uint64_t Renderer::State::PushGeometry(std::span<const uint8_t> bytes, std::string& error) {
@@ -408,11 +438,12 @@ uint64_t Renderer::State::PushGeometry(std::span<const uint8_t> bytes, std::stri
     error = "Per-draw geometry exceeds its bound";
     return UINT64_MAX;
   }
-  if (geometry.bytes.size() + size > geometry.capacity) {
-    if (!geometry.bytes.empty() && !Flush(error)) return UINT64_MAX;
+  if (geometry.used + size > geometry.capacity) {
+    if (geometry.used && !Flush(error)) return UINT64_MAX;
     if (!Begin(error)) return UINT64_MAX;
     if (size > geometry.capacity) {
       geometry.capacity = std::max<uint64_t>(kInitialGeometryArena, size * 2);
+      geometry.bytes.assign(geometry.capacity, 0);
       wgpu::BufferDescriptor descriptor{};
       descriptor.size = geometry.capacity;
       descriptor.usage = wgpu::BufferUsage::Vertex | wgpu::BufferUsage::Index |
@@ -420,8 +451,8 @@ uint64_t Renderer::State::PushGeometry(std::span<const uint8_t> bytes, std::stri
       geometry.buffer = device.CreateBuffer(&descriptor);
     }
   }
-  const uint64_t offset = geometry.bytes.size();
-  geometry.bytes.resize(offset + size);
+  const uint64_t offset = geometry.used;
+  geometry.used += size;
   std::memcpy(geometry.bytes.data() + offset, bytes.data(), bytes.size());
   return offset;
 }
@@ -429,15 +460,14 @@ uint64_t Renderer::State::PushGeometry(std::span<const uint8_t> bytes, std::stri
 bool Renderer::State::Flush(std::string& error) {
   EndPass();
   uniform_slots.clear();
+  last_uniforms.offset = UINT64_MAX;
   if (!encoder) return true;
   ScopedTimer timer(timing.submit_ms);
   // Arena writes are ordered before the command buffer that reads them.
-  if (!uniforms.bytes.empty())
-    queue.WriteBuffer(uniforms.buffer, 0, uniforms.bytes.data(), uniforms.bytes.size());
-  if (!geometry.bytes.empty())
-    queue.WriteBuffer(geometry.buffer, 0, geometry.bytes.data(), geometry.bytes.size());
-  uniforms.bytes.clear();
-  geometry.bytes.clear();
+  if (uniforms.used) queue.WriteBuffer(uniforms.buffer, 0, uniforms.bytes.data(), uniforms.used);
+  if (geometry.used) queue.WriteBuffer(geometry.buffer, 0, geometry.bytes.data(), geometry.used);
+  uniforms.used = 0;
+  geometry.used = 0;
   auto commands = encoder.Finish();
   encoder = nullptr;
   queue.Submit(1, &commands);
@@ -694,6 +724,8 @@ Renderer::Status Renderer::Execute(Work& work, std::string& error) {
       work.execute->Finish(ok);
     }
   };
+  // Every delta is applied, so the copies stay in step with the game's.
+  if (work.device.device) s.ApplyDeviceDelta(work.device);
   if (!s.ready) {
     error = "WebGPU device is not ready";
     finish_sync(false);
@@ -723,6 +755,8 @@ Renderer::Status Renderer::Execute(Work& work, std::string& error) {
       s.ClearResources();
       s.shaders.clear();
       s.declarations.clear();
+      s.input_layouts.clear();
+      s.devices.clear();
       return Status::kDone;
     case CommandType::kRegisterShader: {
       const auto c = work.As<RegisterShaderCommand>();
@@ -738,6 +772,7 @@ Renderer::Status Renderer::Execute(Work& work, std::string& error) {
     case CommandType::kRegisterVertexDeclaration: {
       const auto c = work.As<RegisterVertexDeclarationCommand>();
       s.declarations[c.declaration].assign(c.elements, c.elements + c.element_count);
+      s.input_layouts.clear();  // They point into the declarations.
       return Status::kDone;
     }
     case CommandType::kSetPixelShader:
@@ -758,7 +793,7 @@ Renderer::Status Renderer::Execute(Work& work, std::string& error) {
       const uint32_t handle = work.As<ReleaseResourceCommand>().resource;
       s.ReleaseResource(handle);
       s.shaders.erase(handle);
-      s.declarations.erase(handle);
+      if (s.declarations.erase(handle)) s.input_layouts.clear();
       return Status::kDone;
     }
     case CommandType::kUpdateEnvironmentalData:
@@ -766,12 +801,14 @@ Renderer::Status Renderer::Execute(Work& work, std::string& error) {
       return Status::kDone;
     case CommandType::kDrawPrimitive:
     case CommandType::kDrawPrimitiveUp:
-    case CommandType::kDrawIndexedPrimitive:
+    case CommandType::kDrawIndexedPrimitive: {
+      ScopedTimer draw_timer(s.timing.draw_ms);
       if (!s.Draw(work, error)) {
         ++s.skipped_draws;
         ++s.stats.failed;
       }
       return Status::kDone;
+    }
     case CommandType::kClear:
       s.Clear(work, error);
       return Status::kDone;

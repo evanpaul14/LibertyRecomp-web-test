@@ -361,17 +361,24 @@ Renderer::Status Renderer::State::Present(const Work& work, std::string& error) 
   if (!timing.start_ms) timing.start_ms = now;
   if (now - timing.start_ms >= 5000.0) {
     const double frames = timing.frames, elapsed = now - timing.start_ms;
+    const double draws = std::max(1u, timing.draws);
     WEBGPU_PERF_LOG("gta4-webgpu: perf {:.1f} fps over {} frames; per frame: {:.0f} draws, "
-                "render-thread {:.2f} ms (pipelines {:.2f}, textures {:.2f}, geometry {:.2f}, "
-                "inputs {:.2f}, bindings {:.2f}, uniforms {:.2f}, encode {:.2f}, submit {:.2f}); new pipelines={} textures={} ({} KB) buffers={} ({} KB) "
-                "groups={}; uniform slots={} reused={}",
-                frames * 1000.0 / elapsed, timing.frames, timing.draws / frames,
-                timing.execute_ms / frames, timing.pipeline_ms / frames,
-                timing.texture_ms / frames, timing.geometry_ms / frames,
-                timing.inputs_ms / frames, timing.bind_ms / frames, timing.uniform_ms / frames,
-                timing.encode_ms / frames, timing.submit_ms / frames, timing.new_pipelines, timing.new_textures,
-                timing.texture_bytes / 1024, timing.new_buffers, timing.buffer_bytes / 1024,
-                timing.new_groups, timing.uniform_slots, timing.uniform_reused);
+                    "render-thread {:.2f} ms (draws {:.2f}: pipelines {:.2f}, textures {:.2f}, "
+                    "geometry {:.2f}, inputs {:.2f}, bindings {:.2f}, uniforms {:.2f}, encode "
+                    "{:.2f}; submit {:.2f}); new pipelines={} textures={} ({} KB) buffers={} ({} "
+                    "KB) groups={}; uniform slots={} reused={} repeated={}; calls per draw: "
+                    "pipeline {:.2f}, group {:.2f}, vertex {:.2f}, index {:.2f}, state {:.2f}",
+                    frames * 1000.0 / elapsed, timing.frames, timing.draws / frames,
+                    timing.execute_ms / frames, timing.draw_ms / frames,
+                    timing.pipeline_ms / frames, timing.texture_ms / frames,
+                    timing.geometry_ms / frames, timing.inputs_ms / frames,
+                    timing.bind_ms / frames, timing.uniform_ms / frames,
+                    timing.encode_ms / frames, timing.submit_ms / frames, timing.new_pipelines,
+                    timing.new_textures, timing.texture_bytes / 1024, timing.new_buffers,
+                    timing.buffer_bytes / 1024, timing.new_groups, timing.uniform_slots,
+                    timing.uniform_reused, timing.uniform_repeated,
+                    timing.set_pipeline / draws, timing.set_group / draws,
+                    timing.set_vertex / draws, timing.set_index / draws, timing.set_state / draws);
     WEBGPU_PERF_LOG("gta4-webgpu: presents shown={} new-content={} no-source={} no-canvas={} "
                     "no-surface-texture={} (status {}); canvas {}x{}; frontbuffer {:08X} "
                     "({}, {}x{}, serial {}); gpu errors {}",

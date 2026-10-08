@@ -384,7 +384,8 @@ wgpu::Buffer Renderer::State::VertexBuffer(const BufferCapture& capture, uint32_
     error = "Vertex buffer range or type mismatch";
     return nullptr;
   }
-  Words key{uint32_t(capture.generation), uint32_t(capture.generation >> 32), offset, stride};
+  Words& key = buffer_key;
+  key = {uint32_t(capture.generation), uint32_t(capture.generation >> 32), offset, stride};
   for (const auto* element : elements) {
     key.push_back(element->offset);
     key.push_back(element->type);
