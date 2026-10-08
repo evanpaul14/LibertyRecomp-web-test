@@ -19,6 +19,7 @@ The runtime is powered by a fork of the [ReXGlue SDK](https://github.com/rexglue
 - [Installation](#installation)
 - [Mod Support](#mod-support)
 - [Building](#building)
+- [Web Build (Experimental)](#web-build-experimental)
 - [Documentation](#documentation)
 
 ## Project Status
@@ -32,6 +33,7 @@ This project is in **early development**. Current progress:
 - [x] Shader extraction pipeline (RAGE FXC → Xbox 360 → platform-native)
 - [x] Platform-specific install directory support
 - [x] FusionFix-compatible mod overlay system
+- [x] WebAssembly (wasm64) build with a WebGPU renderer, playable in Chrome (experimental)
 
 ### In Progress
 - [ ] RAGE engine structure reverse engineering
@@ -123,11 +125,23 @@ python3 tools/setup_repo.py
 See [Building Liberty Recompiled](docs/BUILDING.md) for build presets, CMake 4 support,
 prerequisites, and recovery from incomplete/manual dependency downloads.
 
+## Web Build (Experimental)
+
+Liberty Recompiled also builds to **64-bit WebAssembly** (Memory64, pthreads) and renders with **WebGPU**. In Chrome on an M1 Mac it reaches gameplay, with frame rates from about 3 to 59 fps depending on the scene. Audio plays in Chrome.
+
+- Requires Chrome/Edge 133+ (WebGPU, Memory64, threads), or Node.js 24+ with Dawn.
+- No game files are included. The page runs the game from a local install served by `tools/web/serve.py`; it can't load files from the browser yet.
+- Firefox and Safari are not supported yet.
+
+See [Web Build Guide](/docs/WEB_BUILDING.md) for build and run instructions and [Web Port Handoff](/docs/WEB_PORT_HANDOFF.md) for current status and next steps.
+
 ## Documentation
 
 | Document | Description |
 |----------|-------------|
 | [Building Guide](/docs/BUILDING.md) | Build instructions for all platforms |
+| [Web Build Guide](/docs/WEB_BUILDING.md) | WebAssembly / WebGPU build and run instructions |
+| [Web Port Handoff](/docs/WEB_PORT_HANDOFF.md) | Web port status and next steps |
 | [Dumping Guide](/docs/DUMPING-en.md) | How to extract game files from Xbox 360 |
 | [Mod Support](/docs/MOD_SUPPORT.md) | FusionFix-compatible mod loading |
 | [Installation Architecture](/docs/INSTALLATION_ARCHITECTURE.md) | Platform paths and install flow |
