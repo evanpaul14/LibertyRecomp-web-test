@@ -67,12 +67,51 @@
       const files = JSON.parse(probe.responseText);
       const root = '/data/LibertyRecomp/game';
       ENV.XDG_DATA_HOME = '/data';
-      const CHUNK = 4 << 20, MAX_CACHED = 96;
+      const CHUNK = 4 << 20;
+      // ?preload=1 / ?preload=0 override the hostname check, e.g. for an SSH
+      // tunnel, where the browser sees localhost but the data crosses a network.
+      const forced = new URLSearchParams(location.search).get('preload');
+      const REMOTE = forced === '1' ? true : forced === '0' ? false
+        : !['localhost', '127.0.0.1', '[::1]'].includes(location.hostname);
+      // Remote visitors preload PRELOAD_BYTES before the game starts; the cache
+      // has to hold all of it, with headroom for read-ahead.
+      const PRELOAD_BYTES = 500 << 20, MAX_CACHED = REMOTE ? PRELOAD_BYTES / CHUNK + 32 : 128;
+      // Reads block the title, so over a slow link every uncached chunk stalls
+      // the game (and its clocks) for a full round trip. After each read, fetch
+      // the next chunks asynchronously so later reads hit the cache.
+      // Local reads are fast enough that this would only add load, so it is
+      // skipped on loopback.
+      const READ_AHEAD = REMOTE ? 3 : 0, MAX_PENDING = 4;
       const cache = new Map();
+      const pending = new Set();
+      const remember = (key, bytes) => {
+        cache.set(key, bytes);
+        if (cache.size > MAX_CACHED) cache.delete(cache.keys().next().value);
+      };
+      const prefetchChunk = (url, index, size) => {
+        const key = url + '#' + index;
+        if (index * CHUNK >= size || cache.has(key) || pending.has(key) || pending.size >= MAX_PENDING) return;
+        pending.add(key);
+        const start = index * CHUNK, end = Math.min(size, start + CHUNK) - 1;
+        fetch(url, { headers: { Range: 'bytes=' + start + '-' + end } })
+          .then((r) => (r.status === 206 || r.status === 200) ? r.arrayBuffer() : null)
+          .then((buf) => { if (buf && !cache.has(key)) remember(key, new Uint8Array(buf)); })
+          .catch(() => {})
+          .finally(() => pending.delete(key));
+      };
       const fetchChunk = (url, index, size) => {
         const key = url + '#' + index;
         let bytes = cache.get(key);
-        if (bytes) { cache.delete(key); cache.set(key, bytes); return bytes; }
+        if (bytes) {
+          cache.delete(key); cache.set(key, bytes);
+        } else {
+          bytes = readChunk(url, index, size);
+        }
+        for (let ahead = 1; ahead <= READ_AHEAD; ahead++) prefetchChunk(url, index + ahead, size);
+        return bytes;
+      };
+      const readChunk = (url, index, size) => {
+        const key = url + '#' + index;
         const start = index * CHUNK, end = Math.min(size, start + CHUNK) - 1;
         const xhr = new XMLHttpRequest();
         xhr.open('GET', url, false);
@@ -83,8 +122,7 @@
         const text = xhr.responseText;
         bytes = new Uint8Array(text.length);
         for (let i = 0; i < text.length; i++) bytes[i] = text.charCodeAt(i) & 0xff;
-        cache.set(key, bytes);
-        if (cache.size > MAX_CACHED) cache.delete(cache.keys().next().value);
+        remember(key, bytes);
         return bytes;
       };
       for (const [path, size] of files) {
@@ -116,6 +154,53 @@
             return { ptr, allocated: true };
           },
         });
+      }
+      // Remote devices download the first PRELOAD_BYTES before the game starts
+      // (run dependency holds main() back): the files the opening reads first,
+      // then the rest in manifest order. Local access skips this.
+      if (REMOTE) {
+        const sizes = new Map(files);
+        const urlOf = (path) => 'game/' + path.split('/').map(encodeURIComponent).join('/');
+        const first = ['xbox360.rpf', 'common.rpf', 'xbox360/anim/anim.img', 'xbox360/audio/sfx/speech.rpf',
+                       'xbox360/models/cdimages/componentpeds.img', 'xbox360/data/cdimages/navmeshes.img']
+          .filter((p) => sizes.has(p));
+        const queue = [];
+        for (const path of first) for (let i = 0; i < 8 && i * CHUNK < sizes.get(path); i++) queue.push([path, i]);
+        for (const path of first.concat(files.map((f) => f[0]).filter((p) => !first.includes(p))))
+          for (let i = 0; i * CHUNK < sizes.get(path); i++) queue.push([path, i]);
+        const total = Math.min(PRELOAD_BYTES, queue.length * CHUNK);
+        let loaded = 0, next = 0, active = 0;
+        const seen = new Set();
+        addRunDependency('preload-game');
+        const finish = () => { statusEl.textContent = 'Starting…'; removeRunDependency('preload-game'); };
+        const pump = () => {
+          while (active < 6 && loaded < PRELOAD_BYTES && next < queue.length) {
+            const [path, index] = queue[next++];
+            const key = path + '#' + index;
+            if (seen.has(key)) continue;
+            seen.add(key);
+            const url = urlOf(path), size = sizes.get(path);
+            const start = index * CHUNK, end = Math.min(size, start + CHUNK) - 1;
+            active++;
+            fetch(url, { headers: { Range: 'bytes=' + start + '-' + end } })
+              .then((r) => (r.status === 206 || r.status === 200) ? r.arrayBuffer() : null)
+              .then((buf) => {
+                if (!buf) return;
+                if (!cache.has(url + '#' + index)) remember(url + '#' + index, new Uint8Array(buf));
+                loaded += buf.byteLength;
+              })
+              .catch(() => {})
+              .finally(() => {
+                active--;
+                statusEl.textContent = 'Preloading game files… ' + Math.min(100, Math.floor(loaded * 100 / total)) +
+                  '% (' + (Math.min(loaded, total) / 1048576 | 0) + ' / ' + (total / 1048576 | 0) + ' MB)';
+                if ((loaded >= PRELOAD_BYTES || next >= queue.length) && active === 0) finish(); else pump();
+              });
+          }
+          if (active === 0 && (loaded >= PRELOAD_BYTES || next >= queue.length)) finish();
+        };
+        statusEl.textContent = 'Preloading game files… 0%';
+        pump();
       }
       append('Mounted ' + files.length + ' game files from the server');
     }
