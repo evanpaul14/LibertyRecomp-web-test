@@ -366,7 +366,7 @@ Renderer::Status Renderer::State::Present(const Work& work, std::string& error) 
                     "render-thread {:.2f} ms (draws {:.2f}: pipelines {:.2f}, textures {:.2f}, "
                     "geometry {:.2f}, inputs {:.2f}, bindings {:.2f}, uniforms {:.2f}, encode "
                     "{:.2f}; submit {:.2f}); new pipelines={} textures={} ({} KB) buffers={} ({} "
-                    "KB) groups={}; uniform slots={} reused={} repeated={}; calls per draw: "
+                    "KB) groups={}; new uniform slots: vertex {} pixel {} shared {}; redrawn {}; calls per draw: "
                     "pipeline {:.2f}, group {:.2f}, vertex {:.2f}, index {:.2f}, state {:.2f}",
                     frames * 1000.0 / elapsed, timing.frames, timing.draws / frames,
                     timing.execute_ms / frames, timing.draw_ms / frames,
@@ -375,8 +375,8 @@ Renderer::Status Renderer::State::Present(const Work& work, std::string& error) 
                     timing.bind_ms / frames, timing.uniform_ms / frames,
                     timing.encode_ms / frames, timing.submit_ms / frames, timing.new_pipelines,
                     timing.new_textures, timing.texture_bytes / 1024, timing.new_buffers,
-                    timing.buffer_bytes / 1024, timing.new_groups, timing.uniform_slots,
-                    timing.uniform_reused, timing.uniform_repeated,
+                    timing.buffer_bytes / 1024, timing.new_groups, timing.vertex_slots,
+                    timing.pixel_slots, timing.shared_slots, timing.redrawn,
                     timing.set_pipeline / draws, timing.set_group / draws,
                     timing.set_vertex / draws, timing.set_index / draws, timing.set_state / draws);
     WEBGPU_PERF_LOG("gta4-webgpu: presents shown={} new-content={} no-source={} no-canvas={} "

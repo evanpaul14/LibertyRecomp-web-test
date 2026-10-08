@@ -29,12 +29,15 @@ struct ShaderRecord {
   std::string_view late;  // Alpha-test/alpha-to-mask variant; may be empty.
 };
 
-inline constexpr uint32_t kUniformVertexOffset = 0;
-inline constexpr uint32_t kUniformPixelOffset = 4096;
-inline constexpr uint32_t kUniformSharedOffset = 8192;
-inline constexpr uint32_t kUniformSpecializationOffset = kUniformSharedOffset + 0x500;
-// The WGSL block is array<vec4<u32>, 768>.
-inline constexpr uint32_t kUniformBlockSize = 3 * 4096;
+// Group 0 holds the title's constants as three uniform bindings, each with
+// its own dynamic offset: vertex constants (256 registers), pixel constants
+// (256 registers, of which the title sets 224) and the shared constants with
+// the specialization word in their last register.
+inline constexpr uint32_t kUniformVertexBytes = 4096;
+inline constexpr uint32_t kUniformPixelBytes = 4096;
+inline constexpr uint32_t kUniformSharedBytes = 81 * 16;
+inline constexpr uint32_t kUniformSpecializationOffset = 0x500;  // In the shared binding.
+inline constexpr uint32_t kUniformBindings = 3;
 inline constexpr uint32_t kSamplerBindingBase = 32;
 
 class ShaderArchive {

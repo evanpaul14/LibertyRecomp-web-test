@@ -37,8 +37,10 @@ constexpr uint32_t kDeviceFetchConstants = 0x480;
 constexpr uint32_t kDeviceVertexConstants = 0x780;
 constexpr uint32_t kDevicePixelConstants = 0x1780;
 constexpr uint32_t kPixelConstantBytes = 0xE00;
-static_assert(kUniformPixelOffset + kPixelConstantBytes <= kUniformSharedOffset);
-static_assert(kUniformSharedOffset + sizeof(core::SharedConstants) <= kUniformSpecializationOffset);
+static_assert(kPixelConstantBytes <= kUniformPixelBytes);
+static_assert(sizeof(core::SharedConstants) <= kUniformSpecializationOffset);
+static_assert(kUniformSpecializationOffset + 4 <= kUniformSharedBytes);
+static_assert(kUniformSharedBytes <= 1536);
 
 wgpu::CompareFunction Compare(uint32_t value) {
   static constexpr wgpu::CompareFunction kValues[] = {
@@ -326,7 +328,8 @@ const InputLayout* Renderer::State::Inputs(const ShaderRecord& vertex, uint32_t 
   return &input_layouts.emplace(input_key, std::move(layout)).first->second;
 }
 
-bool Renderer::State::Draw(const Work& work, std::string& error) {
+bool Renderer::State::Draw(const Work& work, std::string& error, bool retry) {
+  const uint64_t batch = batches;
   uint32_t type = 0, first = 0, count = 0, up_stride = 0, restart_value = 0;
   int32_t base_vertex = 0;
   bool indexed = false, restart = false, up = false;
@@ -459,6 +462,11 @@ bool Renderer::State::Draw(const Work& work, std::string& error) {
     ++stats.empty_scissor;
     return true;
   }
+
+  // Room for this draw's uniform slots first: a flush between pushing its
+  // geometry (below) and choosing its slots would submit them with the old
+  // batch, and flushing later forgets slots it already chose.
+  if (!UniformSpace(kUniformVertexBytes + kUniformPixelBytes + 1536, error)) return false;
 
   // Topology and index conversion (fans, quads and restart strips become
   // 32-bit lists or strips, as in the Metal renderer).
@@ -781,39 +789,43 @@ bool Renderer::State::Draw(const Work& work, std::string& error) {
   shared.projection_scale[0] = environment.projection_matrix[0];
   shared.projection_scale[1] = environment.projection_matrix[5];
 
+  // Each part of the constants keeps its slot while its inputs are unchanged.
   std::optional<ScopedTimer> uniform_timer(std::in_place, timing.uniform_ms);
-  uint64_t uniform_offset;
   auto& last = last_uniforms;
-  if (last.offset != UINT64_MAX && last.device == work.device.device &&
-      last.constants_serial == constants_serial && last.pixel == (pixel != nullptr) &&
-      last.specialization == specialization && BytesEqual(&last.shared, &shared, sizeof(shared))) {
-    uniform_offset = last.offset;
-    ++timing.uniform_repeated;
-  } else {
-    uint8_t* slot = ReserveUniforms(uniform_offset, error);
-    if (!slot) return false;
-    CopySwap32(slot + kUniformVertexOffset, guest.data() + kDeviceVertexConstants, 0x1000);
-    if (pixel)
-      CopySwap32(slot + kUniformPixelOffset, guest.data() + kDevicePixelConstants,
-                 kPixelConstantBytes);
-    else  // Unread, but zero so that equal draws share a slot.
-      std::memset(slot + kUniformPixelOffset, 0, kPixelConstantBytes);
-    std::memset(slot + kUniformPixelOffset + kPixelConstantBytes, 0,
-                kUniformSharedOffset - kUniformPixelOffset - kPixelConstantBytes);
-    std::memcpy(slot + kUniformSharedOffset, &shared, sizeof(shared));
-    std::memset(slot + kUniformSharedOffset + sizeof(shared), 0,
-                kUniformSpecializationOffset - kUniformSharedOffset - sizeof(shared));
-    std::memcpy(slot + kUniformSpecializationOffset, &specialization, 4);
-    uniform_offset = CommitUniforms(uniform_offset, kUniformSpecializationOffset + 4);
-    last.offset = uniform_offset;
+  if (last.device != work.device.device) {
+    last.vertex = last.pixel = UINT64_MAX;
     last.device = work.device.device;
-    last.constants_serial = constants_serial;
-    last.pixel = pixel != nullptr;
-    last.specialization = specialization;
-    last.shared = shared;
   }
+  if (last.vertex == UINT64_MAX || last.vertex_serial != vertex_constants_serial) {
+    uint8_t* slot = ReserveUniforms(kUniformVertexBytes, last.vertex, error);
+    if (!slot) return false;
+    CopySwap32(slot, guest.data() + kDeviceVertexConstants, kUniformVertexBytes);
+    last.vertex_serial = vertex_constants_serial;
+    ++timing.vertex_slots;
+  }
+  if (pixel && (last.pixel == UINT64_MAX || last.pixel_serial != pixel_constants_serial)) {
+    uint8_t* slot = ReserveUniforms(kUniformPixelBytes, last.pixel, error);
+    if (!slot) return false;
+    CopySwap32(slot, guest.data() + kDevicePixelConstants, kPixelConstantBytes);
+    std::memset(slot + kPixelConstantBytes, 0, kUniformPixelBytes - kPixelConstantBytes);
+    last.pixel_serial = pixel_constants_serial;
+    ++timing.pixel_slots;
+  }
+  if (last.shared == UINT64_MAX || last.specialization != specialization ||
+      !BytesEqual(&last.constants, &shared, sizeof(shared))) {
+    uint8_t* slot = ReserveUniforms(kUniformSharedBytes, last.shared, error);
+    if (!slot) return false;
+    std::memcpy(slot, &shared, sizeof(shared));
+    std::memset(slot + sizeof(shared), 0, kUniformSharedBytes - sizeof(shared));
+    std::memcpy(slot + kUniformSpecializationOffset, &specialization, 4);
+    last.specialization = specialization;
+    last.constants = shared;
+    ++timing.shared_slots;
+  }
+  // Without a pixel shader the pixel binding is unread; any slot will do.
+  const std::array<uint32_t, kUniformBindings> uniform_offsets{
+      uint32_t(last.vertex), uint32_t(pixel ? last.pixel : last.vertex), uint32_t(last.shared)};
   uniform_timer.reset();
-  const uint8_t* uniform = uniforms.bytes.data() + uniform_offset;
 
   if (trace) {
     float position[4] = {};
@@ -823,7 +835,7 @@ bool Renderer::State::Draw(const Work& work, std::string& error) {
                               streams[inputs->streams[0].stream].offset + inputs->streams[0].elements[0]->offset,
                           position);
     float c0[4];
-    std::memcpy(c0, uniform + 208 * 16, sizeof(c0));
+    std::memcpy(c0, uniforms.bytes.data() + last_uniforms.vertex + 208 * 16, sizeof(c0));
     if (up && !work.up_vertices.empty() && !inputs->streams.empty())
       DecodeVertexElement(inputs->streams[0].elements[0]->type,
                           work.up_vertices.data() + inputs->streams[0].elements[0]->offset, position);
@@ -865,12 +877,17 @@ bool Renderer::State::Draw(const Work& work, std::string& error) {
     if (pixel) {
       for (uint32_t i = 0; i < kPixelConstantBytes / 16; ++i) {
         float value[4];
-        std::memcpy(value, uniform + kUniformPixelOffset + i * 16, sizeof(value));
+        std::memcpy(value, uniforms.bytes.data() + last_uniforms.pixel + i * 16, sizeof(value));
         if (value[0] || value[1] || value[2] || value[3])
           detail += fmt::format(" c{}={},{},{},{}", i, value[0], value[1], value[2], value[3]);
       }
     }
     REXLOG_INFO("webgpu-trace: inputs{}", detail);
+  }
+  if (batches != batch) {
+    if (retry) error = "Draw setup flushed its batch twice";
+    else ++timing.redrawn;
+    return false;
   }
   if (!BeginPass(targets, error)) return false;
   // Every pass call crosses from wasm into the browser's WebGPU, so state that
@@ -882,12 +899,11 @@ bool Renderer::State::Draw(const Work& work, std::string& error) {
     bound.pipeline = pipeline->pipeline.Get();
     ++timing.set_pipeline;
   }
-  const uint32_t dynamic_offset = uint32_t(uniform_offset);
-  if (!bound.uniforms_set || bound.uniform_offset != dynamic_offset) {
-    pass.SetBindGroup(0, uniform_group, 1, &dynamic_offset);
+  if (!bound.uniforms_set || bound.uniform_offsets != uniform_offsets) {
+    pass.SetBindGroup(0, uniform_group, uniform_offsets.size(), uniform_offsets.data());
     ++timing.set_group;
     bound.uniforms_set = true;
-    bound.uniform_offset = dynamic_offset;
+    bound.uniform_offsets = uniform_offsets;
   }
   if (texture_group && bound.textures != texture_group.Get()) {
     pass.SetBindGroup(1, texture_group);

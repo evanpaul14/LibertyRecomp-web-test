@@ -149,7 +149,7 @@ mapped); this file is for whoever continues the work.
 | Fibers | Thread fibers only; `Create`/`SwitchTo` fail loudly (GTA IV uses none) | `src/core/fiber_web.cpp` |
 | GPU | Statically linked WebGPU title-command renderer (no `dlopen` on web); created in `GTA4App::OnPreSetup`. `--gpu_plugin=none` = headless | `src/graphics/gta4_webgpu/`, `include/rex/graphics/gta4_webgpu.h`, `gta4-recomp/src/gta4_app.cpp` |
 | GPU threading | One render pthread owns the device and runs from the JS event loop (needed for `mapAsync` and canvas presentation), woken via `emscripten_proxy_async`; after each present it yields with a `MessageChannel` message, since a proxied wake can run in the same task and the canvas only updates when the task ends. Game threads capture device block/buffers/textures at submit (`Capture` in `graphics_system.cpp`) | `gta4_webgpu/graphics_system.cpp`, `work.h` |
-| Shaders | Stock SPIR-V → GLSL (SPIRV-Cross) → rewrite BDA constants to one UBO (VS 0, PS 4096, shared 8192, spec word 8192+0x500) and bindless to fixed slots → glslang → spirv-opt → naga → WGSL. naga undoes the Vulkan y-flip itself | `tools/webgpu/spirv_to_wgsl.py`, `LibertyRecompLib/shader/webgpu_shader_archive.bin` |
+| Shaders | Stock SPIR-V → GLSL (SPIRV-Cross) → rewrite BDA constants to one UBO (VS 0, PS 4096, shared 8192, spec word 8192+0x500) and bindless to fixed slots → glslang → spirv-opt → naga → WGSL, then split the UBO into three group-0 bindings (VS, PS, shared + spec word 0x500), each with its own dynamic offset; dynamic register reads go through `xc_load`. naga undoes the Vulkan y-flip itself | `tools/webgpu/spirv_to_wgsl.py`, `tools/webgpu/split_uniforms.py`, `LibertyRecompLib/shader/webgpu_shader_archive.bin` |
 | Vertex data | Every attribute decoded to `float32x4` on the CPU per buffer generation (shaders read vec4 floats; WebGPU cannot feed integer formats to them) | `gta4_webgpu/vertex_decode.h`, `resources.cpp` |
 | Render targets | Single-sampled; resolved depth stored as `rg32float` (depth, stencil), with packed A8R8G8B8 aliases rebuilt on demand; resolves pick the latest surface at the same EDRAM placement, and map samples when its MSAA layout differs from the resolved view (`resolve_color`) | `gta4_webgpu/resources.cpp`, `passes.cpp`, `renderer.cpp` |
 | Depth handoff | Depth from the resolved snapshot (`source_texture`); `kRebuildSceneCoverage` clears stencil to 0x80 and writes 0xFF via stencil Replace where packed depth is nonzero, as the Metal renderer | `gta4_webgpu/passes.cpp` (`Handoff`) |
@@ -259,7 +259,7 @@ node out/web-node/LibertyRecomp/LibertyRecomp.js --diagnostics=true \
   (`stencil=enable/func/ref/mask/writemask ops=fail,depthfail,pass`); resolves
   log the requested/owner MSAA sample types, and handoffs their policy.
 - Shader hashes map to WGSL in the archive; the archive format is
-  `LRWGSL02` (zlib) with per-record hash, stage, variant and code, which a short
+  `LRWGSL03` (zlib) with per-record hash, stage, variant and code, which a short
   Python script can unpack to read a shader.
 
 ## Known gaps
@@ -287,18 +287,25 @@ node out/web-node/LibertyRecomp/LibertyRecomp.js --diagnostics=true \
   |---|---|---|---|
   | Before (743d745b) | ~8,400 draws | 4.5–4.8 | ~20 (8.2 / 3.2 / 2.1 / 1.6 / 2.2) |
   | Deltas + uniform reuse + input cache (b08f89bb) | ~6,500 draws | 9.0 | ~13.3 (6.8 / 1.6 / 1.0 / 0.8 / 1.8) |
-  | + pooled vertex/index buffers | ~6,200–8,800 draws | 8.1–11.2 | ~9.5–11.8 (3.9 / 1.5–2.2 / 0.9 / 0.8–1.5 / 1.3–1.7) |
+  | + pooled vertex/index buffers (ec1b0ee8) | ~6,200–8,800 draws | 8.1–11.2 | ~9.5–11.8 (3.9 / 1.5–2.2 / 0.9 / 0.8–1.5 / 1.3–1.7) |
+  | + split uniform bindings | ~6,600–8,800 draws | 9.3–10.9 (6.5 while compiling pipelines) | ~9.4–10.1 excluding compiles (4.0 / 0.4 / 0.8 / 0.9–1.5 / 1.4) |
 
   Light scenes (300–850 draws) hold the 60 fps cap throughout. Converted
   vertex and index data now live in 32 MB pooled buffers (`BufferPool`): draws
   bind a pool buffer from its start and select their data with
   `firstIndex`/`baseVertex`, so vertex-buffer calls fell from ~1.0 to ~0.25 per
   draw and index-buffer calls from ~0.9 to ~0 (the perf line reports calls per
-  draw). What remains per draw is mostly the uniform bind group (~1 call, each
-  new slot at its own dynamic offset), building new ~9.7 KB uniform slots and
-  uploading them (a split per-stage layout needs regenerated shaders), and
-  asynchronous pipeline compiles are still open (native Dawn compiles
-  synchronously, about 140 ms per pipeline on Metal).
+  draw). The title's constants are three uniform bindings (vertex, pixel,
+  shared), each reused while unchanged: a new vertex slot is 4 KB where the
+  combined slot was ~9.7 KB, and uniforms fell from ~2 to ~0.4 µs a draw. A
+  flush in the middle of a draw's setup (arena full) makes it set up again in
+  the new batch (`redrawn` in the perf line). What remains per draw: ~4 µs of
+  encode (mostly the uniform bind group, ~1 call a draw since vertex
+  constants change on most draws), ~3 µs of untimed setup (fixed state,
+  shared constants, targets, pipeline key), ~1.4 µs of uploads (pixel
+  constants change on ~75% as many draws as vertex constants), and
+  synchronous pipeline compiles (native Dawn, about 140 ms per pipeline on
+  Metal; they dominate the windows that hit them).
 - Chrome's audio fails: SDL3's audio callback throws `Cannot mix BigInt and
   other types` in `CPtrToHeap32Index` (a wasm64 bug in SDL's JavaScript).
 - The shader archive is zlib (12 MB); zstd would be 4.7 MB but needs a wasm zstd.

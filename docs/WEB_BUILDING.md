@@ -82,7 +82,10 @@ merges the three constant blocks into one uniform buffer (vertex constants at by
 0, pixel constants at 4096, shared constants at 8192), resolves each bindless index
 to a fixed texture slot (`@group(1) @binding(slot)`, its sampler at `32 + slot`),
 turns the pipeline specialization constant into a uniform word, removes switch
-fall-through, and then runs `spirv-opt` and naga. All 2062 shader variants
+fall-through, and then runs `spirv-opt` and naga. Finally `split_uniforms.py`
+splits the uniform buffer into three bindings of group 0 (vertex constants,
+pixel constants, shared constants), each with its own dynamic offset, so the
+renderer can reuse each one while it is unchanged. All 2062 shader variants
 translate and pass Tint's validation in Dawn.
 
 ## Run

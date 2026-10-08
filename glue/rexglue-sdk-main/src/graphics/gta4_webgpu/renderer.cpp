@@ -21,7 +21,8 @@ namespace rex::graphics::gta4_webgpu {
 namespace {
 using namespace gta4_native;
 
-constexpr uint64_t kUniformStride = 9728;  // Bytes used per draw, 256-aligned.
+constexpr std::array<uint64_t, kUniformBindings> kUniformSizes{
+    kUniformVertexBytes, kUniformPixelBytes, kUniformSharedBytes};
 constexpr uint64_t kInitialUniformArena = 16u * 1024u * 1024u;
 constexpr uint64_t kInitialGeometryArena = 8u * 1024u * 1024u;
 constexpr uint64_t kMaximumArena = 256u * 1024u * 1024u;
@@ -291,15 +292,17 @@ void Renderer::Initialize(std::function<void(bool, const std::string&)> done) {
 }
 
 void Renderer::State::InitializeDevice() {
-  wgpu::BindGroupLayoutEntry uniform{};
-  uniform.binding = 0;
-  uniform.visibility = wgpu::ShaderStage::Vertex | wgpu::ShaderStage::Fragment;
-  uniform.buffer.type = wgpu::BufferBindingType::Uniform;
-  uniform.buffer.hasDynamicOffset = true;
-  uniform.buffer.minBindingSize = kUniformBlockSize;
+  std::array<wgpu::BindGroupLayoutEntry, kUniformBindings> uniform{};
+  for (uint32_t i = 0; i < kUniformBindings; ++i) {
+    uniform[i].binding = i;
+    uniform[i].visibility = wgpu::ShaderStage::Vertex | wgpu::ShaderStage::Fragment;
+    uniform[i].buffer.type = wgpu::BufferBindingType::Uniform;
+    uniform[i].buffer.hasDynamicOffset = true;
+    uniform[i].buffer.minBindingSize = kUniformSizes[i];
+  }
   wgpu::BindGroupLayoutDescriptor layout{};
-  layout.entryCount = 1;
-  layout.entries = &uniform;
+  layout.entryCount = uniform.size();
+  layout.entries = uniform.data();
   uniform_layout = device.CreateBindGroupLayout(&layout);
 
   constexpr uint64_t kPoolPage = 32u * 1024u * 1024u;
@@ -363,77 +366,57 @@ void Renderer::State::EndPass() {
   pass_state = {};
 }
 
-uint64_t Renderer::State::PushUniforms(std::span<const uint8_t> bytes, std::string& error) {
-  if (bytes.size() > kUniformStride) {
-    error = "Uniform block exceeds its slot";
-    return UINT64_MAX;
-  }
-  uint64_t offset;
-  uint8_t* slot = ReserveUniforms(offset, error);
-  if (!slot) return UINT64_MAX;
-  std::memcpy(slot, bytes.data(), bytes.size());
-  return CommitUniforms(offset, bytes.size());
+uint8_t* Renderer::State::ReserveUniforms(uint64_t size, uint64_t& offset, std::string& error) {
+  size = (size + 255) & ~uint64_t(255);
+  if (!UniformSpace(size, error)) return nullptr;
+  offset = uniforms.used;
+  uniforms.used += size;
+  return uniforms.bytes.data() + offset;
 }
 
-uint8_t* Renderer::State::ReserveUniforms(uint64_t& offset, std::string& error) {
-  // One kUniformStride slot per draw. Bindings span kUniformBlockSize from the
-  // slot start, so the buffer keeps that much headroom past the last slot.
-  // Shaders read only what the caller writes, so stale bytes past it from an
-  // earlier batch are harmless.
-  if (uniforms.used + kUniformStride + kUniformBlockSize > uniforms.capacity) {
-    if (uniforms.used && !Flush(error)) return nullptr;
-    if (!Begin(error)) return nullptr;
-    if (kUniformStride + kUniformBlockSize > uniforms.capacity) {
+bool Renderer::State::UniformSpace(uint64_t size, std::string& error) {
+  if (uniforms.used + size > uniforms.capacity) {
+    if (uniforms.used && !Flush(error)) return false;
+    if (!Begin(error)) return false;
+    if (size > uniforms.capacity) {
       uniforms.capacity = kInitialUniformArena;
       uniforms.bytes.assign(uniforms.capacity, 0);
       wgpu::BufferDescriptor descriptor{};
       descriptor.size = uniforms.capacity;
       descriptor.usage = wgpu::BufferUsage::Uniform | wgpu::BufferUsage::CopyDst;
       uniforms.buffer = device.CreateBuffer(&descriptor);
-      wgpu::BindGroupEntry entry{};
-      entry.binding = 0;
-      entry.buffer = uniforms.buffer;
-      entry.size = kUniformBlockSize;
+      std::array<wgpu::BindGroupEntry, kUniformBindings> entries{};
+      for (uint32_t i = 0; i < kUniformBindings; ++i) {
+        entries[i].binding = i;
+        entries[i].buffer = uniforms.buffer;
+        entries[i].size = kUniformSizes[i];
+      }
       wgpu::BindGroupDescriptor group{};
       group.layout = uniform_layout;
-      group.entryCount = 1;
-      group.entries = &entry;
+      group.entryCount = entries.size();
+      group.entries = entries.data();
       uniform_group = device.CreateBindGroup(&group);
     }
   }
-  offset = uniforms.used;
-  return uniforms.bytes.data() + offset;
-}
-
-uint64_t Renderer::State::CommitUniforms(uint64_t offset, size_t size) {
-  // Identical constants share a slot within the batch: the reserved slot is
-  // dropped again.
-  const uint8_t* bytes = uniforms.bytes.data() + offset;
-  const uint64_t hash = XXH3_64bits(bytes, size);
-  if (auto found = uniform_slots.find(hash); found != uniform_slots.end() &&
-      found->second.size == size &&
-      BytesEqual(uniforms.bytes.data() + found->second.offset, bytes, size)) {
-    ++timing.uniform_reused;
-    return found->second.offset;
-  }
-  uniforms.used = offset + kUniformStride;
-  uniform_slots[hash] = {offset, size};
-  ++timing.uniform_slots;
-  return offset;
+  return true;
 }
 
 void Renderer::State::ApplyDeviceDelta(const DeviceDelta& delta) {
   auto& block = devices[delta.device];
   if (block.empty()) block.resize(kGuestDeviceSize);
-  // Chunks holding vertex or pixel constants.
-  constexpr uint32_t kFirstConstantChunk = 0x780 / kDeviceChunkBytes;
-  constexpr uint32_t kLastConstantChunk = (0x1780 + 0xE00 - 1) / kDeviceChunkBytes;
+  // Chunks holding vertex and pixel constants.
+  constexpr uint32_t kFirstVertexChunk = 0x780 / kDeviceChunkBytes;
+  constexpr uint32_t kFirstPixelChunk = 0x1780 / kDeviceChunkBytes;
+  constexpr uint32_t kEndPixelChunk = (0x1780 + 0xE00) / kDeviceChunkBytes;
+  static_assert(0x780 % kDeviceChunkBytes == 0 && 0x1780 % kDeviceChunkBytes == 0 &&
+                (0x1780 + 0xE00) % kDeviceChunkBytes == 0);
   const uint8_t* source = delta.bytes.data();
   for (uint32_t chunk = 0; chunk < kDeviceChunkCount; ++chunk) {
     if (!(delta.chunks[chunk / 32] & (1u << (chunk % 32)))) continue;
     std::memcpy(block.data() + size_t(chunk) * kDeviceChunkBytes, source, kDeviceChunkBytes);
     source += kDeviceChunkBytes;
-    if (chunk >= kFirstConstantChunk && chunk <= kLastConstantChunk) ++constants_serial;
+    if (chunk >= kFirstVertexChunk && chunk < kFirstPixelChunk) ++vertex_constants_serial;
+    if (chunk >= kFirstPixelChunk && chunk < kEndPixelChunk) ++pixel_constants_serial;
   }
 }
 
@@ -466,8 +449,8 @@ uint64_t Renderer::State::PushGeometry(std::span<const uint8_t> bytes, std::stri
 
 bool Renderer::State::Flush(std::string& error) {
   EndPass();
-  uniform_slots.clear();
-  last_uniforms.offset = UINT64_MAX;
+  ++batches;
+  last_uniforms.vertex = last_uniforms.pixel = last_uniforms.shared = UINT64_MAX;
   if (!encoder) return true;
   ScopedTimer timer(timing.submit_ms);
   // Arena writes are ordered before the command buffer that reads them.
@@ -662,8 +645,12 @@ bool Renderer::State::UtilityPass(const std::string& name, wgpu::TextureView tar
   const bool scene_coverage = FindUtility(name)->scene_coverage;
   std::array<uint8_t, 64> params{};
   std::memcpy(params.data(), parameters.data(), std::min(params.size(), parameters.size_bytes()));
-  const uint64_t offset = PushUniforms(params, error);
-  if (offset == UINT64_MAX) return false;
+  uint64_t offset;
+  // Every binding is bound at this slot, so it must hold the largest.
+  uint8_t* slot = ReserveUniforms(
+      *std::max_element(kUniformSizes.begin(), kUniformSizes.end()), offset, error);
+  if (!slot) return false;
+  std::memcpy(slot, params.data(), params.size());
   EndPass();
   if (!Begin(error)) return false;
   wgpu::RenderPassColorAttachment color{};
@@ -694,8 +681,10 @@ bool Renderer::State::UtilityPass(const std::string& name, wgpu::TextureView tar
   }
   auto encoder_pass = encoder.BeginRenderPass(&descriptor);
   encoder_pass.SetPipeline(pipeline);
-  const uint32_t dynamic_offset = uint32_t(offset);
-  encoder_pass.SetBindGroup(0, uniform_group, 1, &dynamic_offset);
+  // Utility shaders read binding 0 only; the others bind the same slot.
+  std::array<uint32_t, kUniformBindings> dynamic_offsets;
+  dynamic_offsets.fill(uint32_t(offset));
+  encoder_pass.SetBindGroup(0, uniform_group, dynamic_offsets.size(), dynamic_offsets.data());
   if (source) {
     std::array<wgpu::BindGroupEntry, 2> entries{};
     entries[0].binding = 0;
@@ -810,7 +799,11 @@ Renderer::Status Renderer::Execute(Work& work, std::string& error) {
     case CommandType::kDrawPrimitiveUp:
     case CommandType::kDrawIndexedPrimitive: {
       ScopedTimer draw_timer(s.timing.draw_ms);
-      if (!s.Draw(work, error)) {
+      // A flush while a draw was set up submitted its geometry and uniforms
+      // with the previous batch; set it up again in the new one.
+      bool done = s.Draw(work, error);
+      if (!done && error.empty()) done = s.Draw(work, error, true);
+      if (!done) {
         ++s.skipped_draws;
         ++s.stats.failed;
       }

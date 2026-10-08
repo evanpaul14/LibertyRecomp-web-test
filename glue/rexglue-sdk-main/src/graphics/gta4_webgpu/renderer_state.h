@@ -160,11 +160,12 @@ struct Renderer::State {
   void EndPass();
   bool Flush(std::string& error);
   bool BeginPass(const Targets& targets, std::string& error);
-  uint64_t PushUniforms(std::span<const uint8_t> bytes, std::string& error);
-  // A new uniform slot to fill in place, then CommitUniforms with the bytes
-  // written; it returns the offset to bind (an equal earlier slot's, if any).
-  uint8_t* ReserveUniforms(uint64_t& offset, std::string& error);
-  uint64_t CommitUniforms(uint64_t offset, size_t size);
+  // A new uniform slot of at least `size` bytes (256-aligned) to fill in
+  // place; null on failure.
+  uint8_t* ReserveUniforms(uint64_t size, uint64_t& offset, std::string& error);
+  // Makes room for `size` more bytes of uniforms, flushing the batch (and so
+  // forgetting its slots) when there is none.
+  bool UniformSpace(uint64_t size, std::string& error);
   void ApplyDeviceDelta(const DeviceDelta& delta);
   // `alignment` (a multiple of 16) need not be a power of two.
   uint64_t PushGeometry(std::span<const uint8_t> bytes, std::string& error,
@@ -212,7 +213,9 @@ struct Renderer::State {
   void BeginFrame();
 
   // --- draw.cpp ---
-  bool Draw(const Work& work, std::string& error);
+  // False on error, or when a flush interrupted the draw's setup (`error`
+  // stays empty then, and the draw can be retried in the new batch).
+  bool Draw(const Work& work, std::string& error, bool retry = false);
   bool Clear(const Work& work, std::string& error);
   bool ClearSurface(const std::shared_ptr<SurfaceResource>& surface, uint32_t aspects,
                     const gta4_native::ResolveRectangle& rectangle,
@@ -258,7 +261,7 @@ struct Renderer::State {
   struct PassState {
     WGPURenderPipeline pipeline = nullptr;
     bool uniforms_set = false;
-    uint32_t uniform_offset = 0;
+    std::array<uint32_t, kUniformBindings> uniform_offsets{};
     WGPUBindGroup textures = nullptr;
     struct VertexSlot {
       WGPUBuffer buffer = nullptr;
@@ -274,22 +277,15 @@ struct Renderer::State {
     wgpu::IndexFormat index_format = wgpu::IndexFormat::Undefined;
   } pass_state;
   Arena uniforms, geometry;
-  // Uniform slots already in this batch, by content hash (draws often repeat
-  // the same constants).
-  struct UniformSlot {
-    uint64_t offset = 0;
-    size_t size = 0;
-  };
-  std::unordered_map<uint64_t, UniformSlot> uniform_slots;
-  // The last draw's uniforms. A draw with the same inputs, and no constant
-  // change on its device since, binds the same slot.
+  // The uniform slots most recently written in this batch (UINT64_MAX:
+  // none). A draw binds them again while their inputs are unchanged: the
+  // device's constants (by serial) or the shared constants (by value).
   struct LastUniforms {
-    uint64_t offset = UINT64_MAX;  // None in this batch.
     uint32_t device = 0;
-    uint64_t constants_serial = 0;
-    bool pixel = false;
+    uint64_t vertex = UINT64_MAX, pixel = UINT64_MAX, shared = UINT64_MAX;
+    uint64_t vertex_serial = 0, pixel_serial = 0;
     uint32_t specialization = 0;
-    gta4_native::core::SharedConstants shared{};
+    gta4_native::core::SharedConstants constants{};
   } last_uniforms;
   wgpu::BindGroupLayout uniform_layout;
   wgpu::BindGroup uniform_group;  // Recreated when the uniform arena grows.
@@ -331,7 +327,8 @@ struct Renderer::State {
   // Title state carried by commands.
   // Guest device blocks by address, kept current from each draw's delta.
   std::unordered_map<uint32_t, std::vector<uint8_t>> devices;
-  uint64_t constants_serial = 0;  // Bumped when a delta changes shader constants.
+  // Bumped when a delta changes the vertex or pixel constants.
+  uint64_t vertex_constants_serial = 0, pixel_constants_serial = 0;
   std::unordered_map<uint32_t, const ShaderRecord*> shaders;
   std::unordered_map<uint32_t, std::vector<gta4_native::VertexElement>> declarations;
   struct Stream {
@@ -363,6 +360,7 @@ struct Renderer::State {
   std::unordered_map<Words, std::pair<wgpu::BindGroup, uint64_t>, WordsHash> texture_groups;
 
   uint64_t frame = 0;
+  uint64_t batches = 0;  // Flushes so far.
   uint32_t submitted_frame = 0;  // The title's number of the last presented frame.
   uint64_t content_serial = 0;
   uint64_t draws = 0, frame_draws = 0, skipped_draws = 0;
@@ -377,7 +375,10 @@ struct Renderer::State {
     double execute_ms = 0, pipeline_ms = 0, texture_ms = 0, geometry_ms = 0, submit_ms = 0;
     double encode_ms = 0, uniform_ms = 0, inputs_ms = 0, bind_ms = 0, draw_ms = 0;
     uint32_t frames = 0, draws = 0, new_pipelines = 0, new_textures = 0, new_buffers = 0;
-    uint32_t new_groups = 0, uniform_slots = 0, uniform_reused = 0, uniform_repeated = 0;
+    uint32_t new_groups = 0;
+    // New uniform slots written: vertex constants, pixel constants, shared.
+    uint32_t vertex_slots = 0, pixel_slots = 0, shared_slots = 0;
+    uint32_t redrawn = 0;  // Draws set up again after a flush interrupted them.
     // Render pass calls: pipelines, bind groups, vertex and index buffers,
     // fixed state (viewport, scissor, stencil reference, blend constant).
     uint32_t set_pipeline = 0, set_group = 0, set_vertex = 0, set_index = 0, set_state = 0;
