@@ -173,9 +173,11 @@ struct Renderer::State {
   void EndPass();
   bool Flush(std::string& error);
   bool BeginPass(const Targets& targets, std::string& error);
-  // A new uniform slot of at least `size` bytes (256-aligned) to fill in
-  // place; null on failure.
-  uint8_t* ReserveUniforms(uint64_t size, uint64_t& offset, std::string& error);
+  // A new uniform slot of at least `size` bytes to fill in place; null on
+  // failure. Title constants are registers (16-byte aligned); a utility
+  // pass's parameters are bound with a dynamic offset (256-aligned).
+  uint8_t* ReserveUniforms(uint64_t size, uint64_t& offset, std::string& error,
+                           uint64_t alignment = kUniformRegisterBytes);
   // Makes room for `size` more bytes of uniforms, flushing the batch (and so
   // forgetting its slots) when there is none.
   bool UniformSpace(uint64_t size, std::string& error);
@@ -279,8 +281,7 @@ struct Renderer::State {
   // and the objects outlive the pass).
   struct PassState {
     WGPURenderPipeline pipeline = nullptr;
-    bool uniforms_set = false;
-    std::array<uint32_t, kUniformBindings> uniform_offsets{};
+    WGPUBindGroup constants = nullptr;
     WGPUBindGroup textures = nullptr;
     struct VertexSlot {
       WGPUBuffer buffer = nullptr;
@@ -297,17 +298,24 @@ struct Renderer::State {
   } pass_state;
   Arena uniforms, geometry;
   // The uniform slots most recently written in this batch (UINT64_MAX:
-  // none). A draw binds them again while their inputs are unchanged: the
-  // device's constants (by serial) or the shared constants (by value).
+  // none). A draw uses them again while their inputs are unchanged: the
+  // device's constants (by serial) or the shared constants (by value). The
+  // draw record holding them is reused while all three are.
   struct LastUniforms {
     uint32_t device = 0;
     uint64_t vertex = UINT64_MAX, pixel = UINT64_MAX, shared = UINT64_MAX;
     uint64_t vertex_serial = 0, pixel_serial = 0;
     uint32_t specialization = 0;
     gta4_native::core::SharedConstants constants{};
+    uint64_t record = UINT64_MAX;
+    std::array<uint32_t, 4> record_registers{};
   } last_uniforms;
-  wgpu::BindGroupLayout uniform_layout;
-  wgpu::BindGroup uniform_group;  // Recreated when the uniform arena grows.
+  // Group 0 of title pipelines: the uniform arena as one storage buffer.
+  wgpu::BindGroupLayout constants_layout;
+  wgpu::BindGroup constants_group;  // Recreated with the uniform arena.
+  // Group 0 of utility pipelines: 64 bytes of parameters at a dynamic offset.
+  wgpu::BindGroupLayout utility_layout;
+  wgpu::BindGroup utility_group;
   wgpu::Buffer zero_vertices;
   wgpu::Texture fallback_2d, fallback_cube;
   wgpu::TextureView fallback_2d_view, fallback_cube_view;

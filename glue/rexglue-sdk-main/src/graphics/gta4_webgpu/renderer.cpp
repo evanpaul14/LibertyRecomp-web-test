@@ -24,8 +24,7 @@ namespace rex::graphics::gta4_webgpu {
 namespace {
 using namespace gta4_native;
 
-constexpr std::array<uint64_t, kUniformBindings> kUniformSizes{
-    kUniformVertexBytes, kUniformPixelBytes, kUniformSharedBytes};
+constexpr uint64_t kUtilityParamBytes = 64;
 constexpr uint64_t kInitialUniformArena = 16u * 1024u * 1024u;
 constexpr uint64_t kInitialGeometryArena = 8u * 1024u * 1024u;
 constexpr uint64_t kMaximumArena = 256u * 1024u * 1024u;
@@ -36,7 +35,7 @@ std::string_view View(wgpu::StringView text) {
                    : std::string_view{};
 }
 
-// Utility passes. Group 0 is the title uniform layout (params at its start).
+// Utility passes. Group 0 is the 64-byte params binding (utility_layout).
 constexpr char kUtilityCommon[] = R"(
 struct Params { a: vec4<f32>, b: vec4<f32>, c: vec4<f32>, d: vec4<f32> }
 @group(0) @binding(0) var<uniform> params: Params;
@@ -245,7 +244,12 @@ void Renderer::Initialize(std::function<void(bool, const std::string&)> done) {
                              : wgpu::TextureFormat::Depth24PlusStencil8;
         s.float32_blendable = has(wgpu::FeatureName::Float32Blendable);
         s.bc_textures = has(wgpu::FeatureName::TextureCompressionBC);
-        // Title vertex shaders pass up to 18 varyings.
+        if (supported.maxInterStageShaderVariables < kInterStageVariables) {
+          done(false, fmt::format("WebGPU adapter allows {} inter-stage variables; title "
+                                  "shaders need {}",
+                                  supported.maxInterStageShaderVariables, kInterStageVariables));
+          return;
+        }
         wgpu::Limits required{};
         required.maxInterStageShaderVariables = supported.maxInterStageShaderVariables;
         required.maxTextureDimension2D = supported.maxTextureDimension2D;
@@ -295,18 +299,18 @@ void Renderer::Initialize(std::function<void(bool, const std::string&)> done) {
 }
 
 void Renderer::State::InitializeDevice() {
-  std::array<wgpu::BindGroupLayoutEntry, kUniformBindings> uniform{};
-  for (uint32_t i = 0; i < kUniformBindings; ++i) {
-    uniform[i].binding = i;
-    uniform[i].visibility = wgpu::ShaderStage::Vertex | wgpu::ShaderStage::Fragment;
-    uniform[i].buffer.type = wgpu::BufferBindingType::Uniform;
-    uniform[i].buffer.hasDynamicOffset = true;
-    uniform[i].buffer.minBindingSize = kUniformSizes[i];
-  }
+  wgpu::BindGroupLayoutEntry entry{};
+  entry.binding = 0;
+  entry.visibility = wgpu::ShaderStage::Vertex | wgpu::ShaderStage::Fragment;
+  entry.buffer.type = wgpu::BufferBindingType::ReadOnlyStorage;
   wgpu::BindGroupLayoutDescriptor layout{};
-  layout.entryCount = uniform.size();
-  layout.entries = uniform.data();
-  uniform_layout = device.CreateBindGroupLayout(&layout);
+  layout.entryCount = 1;
+  layout.entries = &entry;
+  constants_layout = device.CreateBindGroupLayout(&layout);
+  entry.buffer.type = wgpu::BufferBindingType::Uniform;
+  entry.buffer.hasDynamicOffset = true;
+  entry.buffer.minBindingSize = kUtilityParamBytes;
+  utility_layout = device.CreateBindGroupLayout(&layout);
 
   constexpr uint64_t kPoolPage = 32u * 1024u * 1024u;
   vertex_pool.Initialize(device, wgpu::BufferUsage::Vertex | wgpu::BufferUsage::CopyDst, kPoolPage);
@@ -369,11 +373,12 @@ void Renderer::State::EndPass() {
   pass_state = {};
 }
 
-uint8_t* Renderer::State::ReserveUniforms(uint64_t size, uint64_t& offset, std::string& error) {
-  size = (size + 255) & ~uint64_t(255);
-  if (!UniformSpace(size, error)) return nullptr;
-  offset = uniforms.used;
-  uniforms.used += size;
+uint8_t* Renderer::State::ReserveUniforms(uint64_t size, uint64_t& offset, std::string& error,
+                                          uint64_t alignment) {
+  const auto aligned = [&] { return (uniforms.used + alignment - 1) & ~(alignment - 1); };
+  if (!UniformSpace(aligned() - uniforms.used + size, error)) return nullptr;
+  offset = aligned();
+  uniforms.used = offset + ((size + kUniformRegisterBytes - 1) & ~uint64_t(kUniformRegisterBytes - 1));
   return uniforms.bytes.data() + offset;
 }
 
@@ -386,19 +391,20 @@ bool Renderer::State::UniformSpace(uint64_t size, std::string& error) {
       uniforms.bytes.assign(uniforms.capacity, 0);
       wgpu::BufferDescriptor descriptor{};
       descriptor.size = uniforms.capacity;
-      descriptor.usage = wgpu::BufferUsage::Uniform | wgpu::BufferUsage::CopyDst;
+      descriptor.usage = wgpu::BufferUsage::Storage | wgpu::BufferUsage::Uniform |
+                         wgpu::BufferUsage::CopyDst;
       uniforms.buffer = device.CreateBuffer(&descriptor);
-      std::array<wgpu::BindGroupEntry, kUniformBindings> entries{};
-      for (uint32_t i = 0; i < kUniformBindings; ++i) {
-        entries[i].binding = i;
-        entries[i].buffer = uniforms.buffer;
-        entries[i].size = kUniformSizes[i];
-      }
+      wgpu::BindGroupEntry entry{};
+      entry.binding = 0;
+      entry.buffer = uniforms.buffer;
       wgpu::BindGroupDescriptor group{};
-      group.layout = uniform_layout;
-      group.entryCount = entries.size();
-      group.entries = entries.data();
-      uniform_group = device.CreateBindGroup(&group);
+      group.entryCount = 1;
+      group.entries = &entry;
+      group.layout = constants_layout;
+      constants_group = device.CreateBindGroup(&group);
+      entry.size = kUtilityParamBytes;
+      group.layout = utility_layout;
+      utility_group = device.CreateBindGroup(&group);
     }
   }
   return true;
@@ -454,6 +460,7 @@ bool Renderer::State::Flush(std::string& error) {
   EndPass();
   ++batches;
   last_uniforms.vertex = last_uniforms.pixel = last_uniforms.shared = UINT64_MAX;
+  last_uniforms.record = UINT64_MAX;
   if (!encoder) return true;
   ScopedTimer timer(timing.submit_ms);
   // Arena writes are ordered before the command buffer that reads them.
@@ -602,7 +609,7 @@ wgpu::RenderPipeline Renderer::State::UtilityPipeline(const std::string& name,
     return nullptr;
   }
   auto module = UtilityModule(kind->name, kind->code);
-  std::vector<wgpu::BindGroupLayout> groups{uniform_layout};
+  std::vector<wgpu::BindGroupLayout> groups{utility_layout};
   if (kind->source) {
     std::array<wgpu::BindGroupLayoutEntry, 2> entries{};
     entries[0].binding = 0;
@@ -666,12 +673,11 @@ bool Renderer::State::UtilityPass(const std::string& name, wgpu::TextureView tar
                                   target_is_depth ? format : wgpu::TextureFormat::Undefined, error);
   if (!pipeline) return false;
   const bool scene_coverage = FindUtility(name)->scene_coverage;
-  std::array<uint8_t, 64> params{};
+  std::array<uint8_t, kUtilityParamBytes> params{};
   std::memcpy(params.data(), parameters.data(), std::min(params.size(), parameters.size_bytes()));
   uint64_t offset;
-  // Every binding is bound at this slot, so it must hold the largest.
-  uint8_t* slot = ReserveUniforms(
-      *std::max_element(kUniformSizes.begin(), kUniformSizes.end()), offset, error);
+  uint8_t* slot = ReserveUniforms(params.size(), offset, error,
+                                  limits.minUniformBufferOffsetAlignment);
   if (!slot) return false;
   std::memcpy(slot, params.data(), params.size());
   EndPass();
@@ -704,10 +710,8 @@ bool Renderer::State::UtilityPass(const std::string& name, wgpu::TextureView tar
   }
   auto encoder_pass = encoder.BeginRenderPass(&descriptor);
   encoder_pass.SetPipeline(pipeline);
-  // Utility shaders read binding 0 only; the others bind the same slot.
-  std::array<uint32_t, kUniformBindings> dynamic_offsets;
-  dynamic_offsets.fill(uint32_t(offset));
-  encoder_pass.SetBindGroup(0, uniform_group, dynamic_offsets.size(), dynamic_offsets.data());
+  const uint32_t dynamic_offset = uint32_t(offset);
+  encoder_pass.SetBindGroup(0, utility_group, 1, &dynamic_offset);
   if (source) {
     std::array<wgpu::BindGroupEntry, 2> entries{};
     entries[0].binding = 0;

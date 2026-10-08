@@ -9,7 +9,7 @@ mapped); this file is for whoever continues the work.
 
 - The RexGlue runtime, FFmpeg and all 89 generated GTA IV translation units
   build to **wasm64** (Memory64, pthreads, wasm EH, SIMD128) and link into
-  `out/web/LibertyRecomp/LibertyRecomp.{js,wasm}` (about 116 MB, 12 MB of it the
+  `out/web/LibertyRecomp/LibertyRecomp.{js,wasm}` (about 112 MB, 11 MB of it the
   embedded WGSL shader archive).
 - In headless Chromium 141 the page is cross-origin isolated and the app
   starts and reaches the install check (there is no way to give it game files
@@ -131,6 +131,7 @@ mapped); this file is for whoever continues the work.
   `firstInstance` and storage-buffer reads in every shader, plus a flat varying
   to give the pixel shader the draw index; some vertex shaders already output
   18 varyings, so that needs checking against `maxInterStageShaderVariables`.
+  (Done since: see Constants by `firstInstance` below.)
 - **Chrome recheck (2026-10-07, after 4ca42b25).** Intro cutscenes: 28 passes
   a frame, render thread ~6–7 µs a draw (was 20–32), no pipeline stalls (0 ms
   pipelines, no draws waiting), longest frame 1–1.5× the average. Heavy
@@ -184,8 +185,42 @@ mapped); this file is for whoever continues the work.
   extension was not connected): run with `?arg=--diagnostics=true&arg=--diagnostics_categories=logging&arg=--log_level=warn&arg=--audio_perf_report=true`,
   click the page so audio starts, and look for `audio:` underrun lines (logged
   only when underruns happen) and `audio mixer:` lines near 938 frames.
-- Next step candidates, in suggested order: recheck audio in Chrome, the
-  `firstInstance` uniform selection, then a game-file picker. Ask the user.
+- **Constants by `firstInstance` (2026-10-08).** The per-draw uniform
+  `SetBindGroup` is gone. Title shaders read their constants from one
+  read-only storage buffer (the whole uniform arena, bound once per pass;
+  `tools/webgpu/draw_constants.py`, archive `LRWGSL04`). Each draw writes a
+  16-byte record (register indices of its vertex, pixel and shared slots,
+  reused while unchanged) and passes its index as `firstInstance`; the vertex
+  shader loads it with `instance_index` and hands it to the pixel shader as a
+  flat `vec4<u32>` at location 18. Vertex shaders now use 20 inter-stage
+  variables (18 locations, the record, a clip distance); device creation
+  fails with a clear message below that (Dawn on Metal reports 31). Utility
+  passes keep a 64-byte uniform binding with a dynamic offset into the same
+  buffer (`utility_layout`). All 2062 variants pass Tint, and every pixel
+  shader links with a vertex shader. Measured (Node + Dawn on Metal, same
+  7-minute intro run, before vs after): heavy stretch (≥4,500 draws) encode
+  3.0 → 2.15 µs a draw, render thread 7.55 → 6.75 µs a draw, bind-group calls
+  0.80 → 0.39 a draw (the rest are texture groups); the same closing shot
+  (~5,870 draws) went from 14.0–14.5 to 15.0–15.7 fps. Frame dumps look the
+  same (skinned characters, credits, lighting). Not checked in Chrome yet,
+  where storage reads could cost GPU time on GPU-bound scenes (Apple GPUs
+  preload uniform buffers but not storage reads at dynamic indices); compare
+  heavy-scene GPU frame latency there.
+- **Shader archive regenerated from SPIR-V (2026-10-08).** The archive was
+  rebuilt with the full pipeline on the user's Mac (naga-cli 30.0.1,
+  SPIRV-Cross 2026-09-16 from Homebrew, glslang 16.3.0, SPIRV-Tools
+  v2026.2) instead of converting the old one. Newer SPIRV-Cross
+  forward-declares the pointer types and loads each bindless index into a
+  temporary first; `rewrite_glsl` now accepts both forms (every variant
+  failed before). All 2062 variants convert and pass Tint; record metadata
+  (masks, attributes) is identical to the converted archive, and the WGSL is
+  ~9% smaller (archive 12.3 → 11.4 MB). In the intro benchmark run back to
+  back under the same machine load, converted vs regenerated: 15.3 vs
+  15.1 fps, GPU frame latency 66.2 vs 67.6 ms in the heavy stretch (noise);
+  frame dumps render correctly. Heavy scenes in Node are partly GPU-bound
+  too: most presents there wait for the GPU (latency ~60–70 ms).
+- Next step candidates, in suggested order: recheck audio and the renderer in
+  Chrome, then a game-file picker. Ask the user.
 - **Node graphics session (Dawn on Metal, M1 Mac, 2026-10-07).**
   - *Fixed: black loading screens.* Emscripten has no `CLOCK_MONOTONIC_RAW`;
     `clock_getres`/`clock_gettime` failed and, with asserts compiled out, the
@@ -263,7 +298,7 @@ mapped); this file is for whoever continues the work.
 | Fibers | Thread fibers only; `Create`/`SwitchTo` fail loudly (GTA IV uses none) | `src/core/fiber_web.cpp` |
 | GPU | Statically linked WebGPU title-command renderer (no `dlopen` on web); created in `GTA4App::OnPreSetup`. `--gpu_plugin=none` = headless | `src/graphics/gta4_webgpu/`, `include/rex/graphics/gta4_webgpu.h`, `gta4-recomp/src/gta4_app.cpp` |
 | GPU threading | One render pthread owns the device and runs from the JS event loop (needed for `mapAsync` and canvas presentation), woken via `emscripten_proxy_async`; at most two frames are in flight on the GPU (`TrackGpuFrame`); after each present it yields with a `MessageChannel` message, since a proxied wake can run in the same task and the canvas only updates when the task ends. Game threads capture device block/buffers/textures at submit (`Capture` in `graphics_system.cpp`) | `gta4_webgpu/graphics_system.cpp`, `work.h` |
-| Shaders | Stock SPIR-V → GLSL (SPIRV-Cross) → rewrite BDA constants to one UBO (VS 0, PS 4096, shared 8192, spec word 8192+0x500) and bindless to fixed slots → glslang → spirv-opt → naga → WGSL, then split the UBO into three group-0 bindings (VS, PS, shared + spec word 0x500), each with its own dynamic offset; dynamic register reads go through `xc_load`. naga undoes the Vulkan y-flip itself | `tools/webgpu/spirv_to_wgsl.py`, `tools/webgpu/split_uniforms.py`, `LibertyRecompLib/shader/webgpu_shader_archive.bin` |
+| Shaders | Stock SPIR-V → GLSL (SPIRV-Cross) → rewrite BDA constants to one UBO (VS 0, PS 4096, shared 8192, spec word 8192+0x500) and bindless to fixed slots → glslang → spirv-opt → naga → WGSL, then split the UBO into three parts (VS, PS, shared + spec word 0x500) read from one group-0 storage buffer at register indices from a per-draw record (`firstInstance` → `instance_index`, flat varying at location 18 for the pixel shader); dynamic register reads go through `xc_load`. naga undoes the Vulkan y-flip itself | `tools/webgpu/spirv_to_wgsl.py`, `tools/webgpu/split_uniforms.py`, `tools/webgpu/draw_constants.py`, `LibertyRecompLib/shader/webgpu_shader_archive.bin` |
 | Pipelines | Title pipelines by full state key, created with `CreateRenderPipelineAsync`; draws are skipped while pending (`--webgpu_async_pipelines`). Shader modules for registered shaders are made between frames (`WarmModules`, `--webgpu_shader_warmup_ms`), since module creation is synchronous. Utility-pass pipelines stay synchronous | `gta4_webgpu/draw.cpp` (`DrawPipeline`), `renderer.cpp` (`WarmModules`) |
 | Vertex data | Every attribute decoded to `float32x4` on the CPU per buffer generation (shaders read vec4 floats; WebGPU cannot feed integer formats to them) | `gta4_webgpu/vertex_decode.h`, `resources.cpp` |
 | Render targets | Single-sampled; resolved depth stored as `rg32float` (depth, stencil), with packed A8R8G8B8 aliases rebuilt on demand; resolves pick the latest surface at the same EDRAM placement, and map samples when its MSAA layout differs from the resolved view (`resolve_color`) | `gta4_webgpu/resources.cpp`, `passes.cpp`, `renderer.cpp` |
@@ -318,8 +353,15 @@ ninja -C out/web LibertyRecomp rex-web-memory-test
   game opens a socket). There is no GPU here: point `VK_ICD_FILENAMES` at
   `/opt/pw-browsers/chromium-*/chrome-linux/vk_swiftshader_icd.json`.
 - **Shader tools** (only to regenerate the archive): `naga-cli` via `cargo install`,
-  `spirv-tools spirv-cross glslang-tools` via apt, `pip install zstandard`. The
-  `tools/XenosRecomp` submodule provides SMOL-V. See WEB_BUILDING.md › Shaders.
+  `spirv-tools spirv-cross glslang-tools` via apt (or Homebrew), `pip install
+  zstandard`. The `tools/XenosRecomp` submodule provides SMOL-V. See
+  WEB_BUILDING.md › Shaders. On the user's Mac they are installed: spirv-cross
+  and Rust from Homebrew, naga in `~/.cargo/bin` (not on `PATH`; prepend it),
+  glslangValidator and spirv-opt in `/usr/local/bin`; `zstandard` needs a venv
+  (Homebrew Python is externally managed). The full run takes about 2 minutes.
+  To change only the WGSL layer of an existing archive, follow
+  `split_uniforms.py`/`draw_constants.py`: each converts an archive in place
+  to the next format version.
 - **Logs:** nothing at info level is printed without `--diagnostics=true`.
 
 ## Testing with game files
@@ -376,7 +418,7 @@ node out/web-node/LibertyRecomp/LibertyRecomp.js --diagnostics=true \
   (`stencil=enable/func/ref/mask/writemask ops=fail,depthfail,pass`); resolves
   log the requested/owner MSAA sample types, and handoffs their policy.
 - Shader hashes map to WGSL in the archive; the archive format is
-  `LRWGSL03` (zlib) with per-record hash, stage, variant and code, which a short
+  `LRWGSL04` (zlib) with per-record hash, stage, variant and code, which a short
   Python script can unpack to read a shader.
 
 ## Known gaps
@@ -389,8 +431,9 @@ node out/web-node/LibertyRecomp/LibertyRecomp.js --diagnostics=true \
 - Write watches (page-protection faults) never fire; the renderer trusts the
   title's `ResourceUnlock` notifications plus a byte compare when a capture is
   marked dirty. A buffer the title writes without unlocking would go stale.
-- Performance: each uniform binding (vertex, pixel, shared constants) keeps
-  its slot while its inputs are unchanged; redundant pass state is skipped;
+- Performance: each constants slot (vertex, pixel, shared) is reused while
+  its inputs are unchanged, and shaders select slots through `firstInstance`
+  (no per-draw bind group); redundant pass state is skipped;
   texture bind groups, samplers and vertex input layouts are cached; converted
   vertex and index data share pooled buffers; draws send only the 128-byte
   chunks of the device block that changed (the render thread keeps its own
@@ -409,19 +452,25 @@ node out/web-node/LibertyRecomp/LibertyRecomp.js --diagnostics=true \
   | + two GPU frames in flight (e8e98c5f) | ~6,600–8,800 draws | 8.1–12.1 | unchanged |
   | + async pipelines, shader warm-up | ~6,000–8,900 draws | 8.4–10.6 | ~9.7–11.6; longest frame ≤ 170 ms (was up to 860) |
   | + pass merging, timers only with the flag | ~5,500–8,800 draws | 7–14 (noisy machine) | ~10–15% below the previous row in the same conditions; ~28 passes a frame (was 330–490) |
+  | Before constants by `firstInstance` (same 7-min run, prior build) | ~5,600 draws | 13.8–19.1; closing shot 14.0–14.5 | ~7.6 (3.0 / 0.36 / 0.97 / 0.68 / 0.86) |
+  | + constants by `firstInstance` (storage buffer, no per-draw bind group) | ~5,600 draws | 13.9–20.1; closing shot 15.0–15.7 | ~6.8 (2.15 / 0.36 / 0.96 / 0.69 / 0.77) |
 
   Light scenes (300–850 draws) hold the 60 fps cap throughout. Converted
   vertex and index data now live in 32 MB pooled buffers (`BufferPool`): draws
   bind a pool buffer from its start and select their data with
   `firstIndex`/`baseVertex`, so vertex-buffer calls fell from ~1.0 to ~0.25 per
   draw and index-buffer calls from ~0.9 to ~0 (the perf line reports calls per
-  draw). The title's constants are three uniform bindings (vertex, pixel,
-  shared), each reused while unchanged: a new vertex slot is 4 KB where the
-  combined slot was ~9.7 KB, and uniforms fell from ~2 to ~0.4 µs a draw. A
+  draw). The title's constants are three slots (vertex, pixel, shared),
+  each reused while unchanged: a new vertex slot is 4 KB where the
+  combined slot was ~9.7 KB, and uniforms fell from ~2 to ~0.4 µs a draw.
+  Shaders find the slots through a draw record selected by `firstInstance`
+  (Where it stands › Constants by `firstInstance`), so there is no
+  per-draw bind-group call. A
   flush in the middle of a draw's setup (arena full) makes it set up again in
-  the new batch (`redrawn` in the perf line). What remains per draw: ~4 µs of
+  the new batch (`redrawn` in the perf line). What remained per draw before the
+  `firstInstance` change: ~4 µs of
   encode (mostly the uniform bind group, ~1 call a draw since vertex
-  constants change on most draws), ~1–2 µs of setup (fixed state,
+  constants change on most draws; now ~2.2 µs, see the table), ~1–2 µs of setup (fixed state,
   shared constants, targets, pipeline key; render passes and the timers
   themselves were most of what was untimed, see Where it stands) and ~1.4 µs of uploads (pixel
   constants change on ~75% as many draws as vertex constants). Pipeline
@@ -444,7 +493,7 @@ node out/web-node/LibertyRecomp/LibertyRecomp.js --diagnostics=true \
 - Chrome's audio crackled and ran slow in busier scenes; the causes found in
   Node are fixed, unconfirmed in Chrome (see Where it stands › Audio
   shortfall fixed in Node).
-- The shader archive is zlib (12 MB); zstd would be 4.7 MB but needs a wasm zstd.
+- The shader archive is zlib (11 MB); zstd would be 4.7 MB but needs a wasm zstd.
 - The `0x90000000` view does not mirror `0x80000000` on the web.
 - Guest FP rounding and flush modes are recorded but not applied.
 - Guest DNS is reported as host-not-found and the local IP as loopback; there is
@@ -463,9 +512,11 @@ node out/web-node/LibertyRecomp/LibertyRecomp.js --diagnostics=true \
    (see above). Per-draw cost is down to ~10 µs (Node, Dawn on Metal; see
    Known gaps › Performance), and pipelines are created asynchronously with
    shader modules made ahead of use; draws share render passes (~28 a frame).
+   The per-draw uniform bind-group call is gone (constants by
+   `firstInstance`, under Where it stands).
    Next: recheck the stutter in Chrome and record `perf` lines for a heavy
-   cutscene and gameplay in the benchmark table, then the per-draw uniform
-   bind-group call (`firstInstance` selection, under Where it stands).
+   cutscene and gameplay in the benchmark table, including GPU frame latency
+   before and after the storage-buffer constants.
    Later: close the fidelity gaps above.
 2. **In-browser game files.** A file or folder picker (File System Access API /
    OPFS), mounted so the existing `gta4::install::Install()` can read it;

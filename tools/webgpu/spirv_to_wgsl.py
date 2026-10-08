@@ -16,8 +16,9 @@ Both are rewritten here, on the GLSL that SPIRV-Cross produces:
 * The three blocks become one uniform buffer: vertex constants at byte 0,
   pixel constants at 4096 and shared constants at 8192. A pointer becomes a
   byte offset into it, and `.value` becomes a typed load. The final WGSL then
-  splits it into one binding per block (split_uniforms.py), so the renderer
-  can reuse each block on its own.
+  splits it into one part per block (split_uniforms.py), so the renderer can
+  reuse each block on its own, and reads the parts from one storage buffer
+  at register indices given by a per-draw record (draw_constants.py).
 * Every bindless index is a load from a constant shared-constants offset, so
   each one resolves to a fixed texture or sampler slot:
   @group(1) @binding(slot) for textures, @binding(32 + slot) for samplers.
@@ -43,6 +44,7 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 from spirv_patch import scalarize_sample_mask  # noqa: E402
 from split_uniforms import RewriteError, rewrite as split_uniforms  # noqa: E402
+from draw_constants import rewrite as draw_constants  # noqa: E402
 
 BLOCK_STRIDE = 4096
 UNIFORM_WORDS = (3 * BLOCK_STRIDE) // 16  # uvec4 registers
@@ -223,10 +225,11 @@ def rewrite_glsl(src: str) -> tuple[str, dict]:
     for k in range(3):
         src = src.replace(f"{inst}._m{k}", f"{k * BLOCK_STRIDE}u")
 
-    # Pointer struct declarations.
+    # Pointer struct declarations (newer SPIRV-Cross also forward-declares them).
     src = re.sub(
         r"layout\(buffer_reference[^)]*\) buffer (\w+Pointer)\s*\{[^}]*\};\n", "", src
     )
+    src = re.sub(r"layout\(buffer_reference[^)]*\) buffer \w+Pointer;\n", "", src)
     # 64-bit values are only buffer offsets (< 12 KB) and 32-bit boolean masks,
     # so they narrow to 32 bits.
     src = re.sub(r"\b(\d+)ul\b", r"\1u", src)
@@ -350,7 +353,9 @@ def rewrite_glsl(src: str) -> tuple[str, dict]:
                 if var_types[vm.group(1)] != "uint":
                     raise ConversionError("descriptor index is not a uint")
             else:
-                im = re.fullmatch(r"uintPointer\((.*)\)\.value", index, re.S)
+                # Newer SPIRV-Cross loads the index into a temporary first.
+                loaded = scalars.get(index, index) if re.fullmatch(r"_\w+", index) else index
+                im = re.fullmatch(r"uintPointer\((.*)\)\.value", loaded, re.S)
                 if im:
                     offset = constant_value(im.group(1))
             if offset is None:
@@ -462,7 +467,7 @@ def convert_one(spv: Path, stage: str, work: Path) -> tuple[str, dict]:
 
 def finish_wgsl_file(path: Path) -> str:
     try:
-        code = split_uniforms(finish_wgsl(path.read_text()))
+        code = draw_constants(split_uniforms(finish_wgsl(path.read_text())))
     except RewriteError as e:
         raise ConversionError(f"uniform split: {e}") from e
     path.write_text(code)
@@ -523,13 +528,13 @@ def main() -> int:
     return 0 if not failures else 1
 
 
-# Archive (zlib-compressed): "LRWGSL03", u32 count, then per record (little-endian):
+# Archive (zlib-compressed): "LRWGSL04", u32 count, then per record (little-endian):
 #   u64 hash, u32 stage (0 pixel, 1 vertex), u32 variant (0 early, 1 late),
 #   u32 texture mask, u32 cube mask, u32 sampler mask, u32 spec mask,
 #   u32 color output mask, u32 attribute count, u8 semantic location per
 #   attribute (WGSL @location(i) reads semantic attributes[i]), padding to
 #   four bytes, u32 WGSL length, WGSL bytes, padding to four bytes.
-MAGIC = b"LRWGSL03"
+MAGIC = b"LRWGSL04"
 
 
 def write_archive(path: Path, results: dict) -> None:

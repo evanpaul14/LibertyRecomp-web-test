@@ -148,7 +148,7 @@ Pipeline* Renderer::State::DrawPipeline(
   result.texture_mask = texture_mask;
   result.cube_mask = cube_mask;
   result.sampler_mask = sampler_mask;
-  std::vector<wgpu::BindGroupLayout> groups{uniform_layout};
+  std::vector<wgpu::BindGroupLayout> groups{constants_layout};
   if (texture_mask | sampler_mask) {
     result.textures = TextureLayout(texture_mask, cube_mask, sampler_mask);
     groups.push_back(result.textures);
@@ -549,7 +549,10 @@ bool Renderer::State::Draw(const Work& work, std::string& error, bool retry) {
   // Room for this draw's uniform slots first: a flush between pushing its
   // geometry (below) and choosing its slots would submit them with the old
   // batch, and flushing later forgets slots it already chose.
-  if (!UniformSpace(kUniformVertexBytes + kUniformPixelBytes + 1536, error)) return false;
+  if (!UniformSpace(kUniformVertexBytes + kUniformPixelBytes + kUniformSharedBytes +
+                        kUniformRegisterBytes,
+                    error))
+    return false;
 
   // Topology and index conversion (fans, quads and restart strips become
   // 32-bit lists or strips, as in the Metal renderer).
@@ -917,9 +920,19 @@ bool Renderer::State::Draw(const Work& work, std::string& error, bool retry) {
     last.constants = shared;
     ++timing.shared_slots;
   }
-  // Without a pixel shader the pixel binding is unread; any slot will do.
-  const std::array<uint32_t, kUniformBindings> uniform_offsets{
-      uint32_t(last.vertex), uint32_t(pixel ? last.pixel : last.vertex), uint32_t(last.shared)};
+  // The draw record: register indices of the three slots, selected by
+  // firstInstance. Without a pixel shader the pixel slot is unread.
+  const std::array<uint32_t, 4> registers{
+      uint32_t(last.vertex / kUniformRegisterBytes),
+      uint32_t((pixel ? last.pixel : last.vertex) / kUniformRegisterBytes),
+      uint32_t(last.shared / kUniformRegisterBytes), 0};
+  if (last.record == UINT64_MAX || last.record_registers != registers) {
+    uint8_t* record = ReserveUniforms(sizeof(registers), last.record, error);
+    if (!record) return false;
+    std::memcpy(record, registers.data(), sizeof(registers));
+    last.record_registers = registers;
+  }
+  const uint32_t first_instance = uint32_t(last.record / kUniformRegisterBytes);
   uniform_timer.reset();
 
   if (trace) {
@@ -994,11 +1007,10 @@ bool Renderer::State::Draw(const Work& work, std::string& error, bool retry) {
     bound.pipeline = pipeline->pipeline.Get();
     ++timing.set_pipeline;
   }
-  if (!bound.uniforms_set || bound.uniform_offsets != uniform_offsets) {
-    pass.SetBindGroup(0, uniform_group, uniform_offsets.size(), uniform_offsets.data());
+  if (bound.constants != constants_group.Get()) {
+    pass.SetBindGroup(0, constants_group);
     ++timing.set_group;
-    bound.uniforms_set = true;
-    bound.uniform_offsets = uniform_offsets;
+    bound.constants = constants_group.Get();
   }
   if (texture_group && bound.textures != texture_group.Get()) {
     pass.SetBindGroup(1, texture_group);
@@ -1059,9 +1071,9 @@ bool Renderer::State::Draw(const Work& work, std::string& error, bool retry) {
       bound.index_format = format;
     }
     pass.DrawIndexed(count, 1, uint32_t(index_offset / element),
-                     base_vertex + int32_t(vertex_shift), 0);
+                     base_vertex + int32_t(vertex_shift), first_instance);
   } else {
-    pass.Draw(count, 1, (up ? 0 : first) + vertex_shift, 0);
+    pass.Draw(count, 1, (up ? 0 : first) + vertex_shift, first_instance);
   }
   for (uint32_t i = 0; i < kRenderTargetCount; ++i)
     if (targets.colors[i]) targets.colors[i]->content_serial = ++content_serial;

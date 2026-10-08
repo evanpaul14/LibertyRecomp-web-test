@@ -41,7 +41,7 @@ ninja -C out/web LibertyRecomp
 ```
 
 Output goes to `out/web/LibertyRecomp/`: `LibertyRecomp.js` (the loader),
-`LibertyRecomp.wasm` (about 116 MB, including 12 MB of translated shaders) and
+`LibertyRecomp.wasm` (about 112 MB, including 11 MB of translated shaders) and
 `index.html`.
 
 The 89 generated translation units take a few minutes to compile. The final link
@@ -67,7 +67,10 @@ cache changes:
 ```bash
 pip install zstandard                       # reads the cache's compressed SPIR-V
 cargo install naga-cli                      # SPIR-V → WGSL
-# spirv-cross, glslangValidator and spirv-opt from your distribution or the Vulkan SDK
+# spirv-cross, glslangValidator and spirv-opt from your distribution, Homebrew or the
+# Vulkan SDK. Last built with naga-cli 30.0.1, SPIRV-Cross 2026-09-16 (Homebrew),
+# glslang 16.3.0 and SPIRV-Tools v2026.2; the GLSL rewrite also accepts the older
+# SPIRV-Cross output the first archive was built from.
 g++ -O2 -o /tmp/decode_smolv tools/decode_smolv.cpp \
     tools/XenosRecomp/thirdparty/smol-v/source/smolv.cpp -Itools/XenosRecomp/thirdparty/smol-v/source
 python3 tools/webgpu/extract_shader_cache.py --cache LibertyRecompLib/shader/shader_cache.cpp \
@@ -83,10 +86,12 @@ merges the three constant blocks into one uniform buffer (vertex constants at by
 to a fixed texture slot (`@group(1) @binding(slot)`, its sampler at `32 + slot`),
 turns the pipeline specialization constant into a uniform word, removes switch
 fall-through, and then runs `spirv-opt` and naga. Finally `split_uniforms.py`
-splits the uniform buffer into three bindings of group 0 (vertex constants,
-pixel constants, shared constants), each with its own dynamic offset, so the
-renderer can reuse each one while it is unchanged. All 2062 shader variants
-translate and pass Tint's validation in Dawn.
+splits the uniform buffer into three parts (vertex constants, pixel constants,
+shared constants), so the renderer can reuse each one while it is unchanged,
+and `draw_constants.py` makes the shaders read all three from one read-only
+storage buffer at register indices taken from a per-draw record (see
+Constants below). All 2062 shader variants translate and pass Tint's
+validation in Dawn.
 
 ## Run
 
@@ -218,9 +223,15 @@ data with `firstIndex` and `baseVertex`, so consecutive draws keep one binding
 (every WebGPU call crosses from wasm into the browser).
 
 **Constants.** The title's vertex constants, pixel constants and shared
-constants are three uniform bindings, each with its own dynamic offset. A draw
-writes a new slot only for a part whose inputs changed, judged by which chunks
-of the device block changed.
+constants live in slots of one per-batch arena, which shaders read as a single
+read-only storage buffer (bound once per render pass). A draw writes a new
+slot only for a part whose inputs changed, judged by which chunks of the
+device block changed, then a 16-byte draw record with the three slots'
+register indices, and passes the record's index as `firstInstance`. The
+vertex shader reads it through `instance_index` and passes it to the pixel
+shader in a flat varying (location 18), so selecting constants costs no
+WebGPU call. This needs 20 inter-stage variables; the renderer refuses an
+adapter with fewer.
 
 **Targets and resolves.** Every render target is single-sampled (WebGPU only has 1×
 and 4× MSAA). Color resolves copy directly or through a small conversion pass

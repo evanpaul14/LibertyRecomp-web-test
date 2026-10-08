@@ -12,9 +12,8 @@
 namespace rex::graphics::gta4_webgpu {
 
 // One translated title shader (tools/webgpu/spirv_to_wgsl.py). Constants are
-// read from one uniform buffer (vertex at 0, pixel at 4096, SharedConstants at
-// 8192, the specialization word at 8192 + 0x500). Texture slot s binds at
-// @group(1) @binding(s), its sampler at @binding(32 + s).
+// read from the storage buffer at @group(0) @binding(0) (see below). Texture
+// slot s binds at @group(1) @binding(s), its sampler at @binding(32 + s).
 struct ShaderRecord {
   uint64_t hash = 0;
   gta4_native::ShaderStage stage = gta4_native::ShaderStage::kPixel;
@@ -29,15 +28,21 @@ struct ShaderRecord {
   std::string_view late;  // Alpha-test/alpha-to-mask variant; may be empty.
 };
 
-// Group 0 holds the title's constants as three uniform bindings, each with
-// its own dynamic offset: vertex constants (256 registers), pixel constants
-// (256 registers, of which the title sets 224) and the shared constants with
-// the specialization word in their last register.
+// Group 0 is one read-only storage buffer of 16-byte registers: the
+// renderer's whole uniform arena (tools/webgpu/draw_constants.py). It holds
+// slots of vertex constants (256 registers), pixel constants (256 registers,
+// of which the title sets 224) and shared constants (with the specialization
+// word in their last register), and a draw record per draw: the register
+// index of its three slots. A draw passes its record's register index as
+// firstInstance; the vertex shader reads it with instance_index and hands it
+// to the pixel shader in a flat varying, so no bind group changes per draw.
 inline constexpr uint32_t kUniformVertexBytes = 4096;
 inline constexpr uint32_t kUniformPixelBytes = 4096;
 inline constexpr uint32_t kUniformSharedBytes = 81 * 16;
-inline constexpr uint32_t kUniformSpecializationOffset = 0x500;  // In the shared binding.
-inline constexpr uint32_t kUniformBindings = 3;
+inline constexpr uint32_t kUniformSpecializationOffset = 0x500;  // In the shared slot.
+inline constexpr uint32_t kUniformRegisterBytes = 16;
+// Title vertex shaders write 18 locations, the draw record and a clip distance.
+inline constexpr uint32_t kInterStageVariables = 20;
 inline constexpr uint32_t kSamplerBindingBase = 32;
 
 class ShaderArchive {
