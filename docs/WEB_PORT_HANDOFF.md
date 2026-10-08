@@ -151,12 +151,40 @@ mapped); this file is for whoever continues the work.
   210–234 silent (18–19 underruns, queue never above 16–18), even at 60 fps.
   So the title produces audio at ~75–80% of real time there; buffering cannot
   fix that. Likely the abrupt cutscene cuts with sped-up animation the user saw
-  come from the cutscene clock following this audio clock (not verified). Next:
-  pace Node's silent fallback by a real-time clock (it sleeps a fixed 5.3 ms
-  after each frame, so it always runs slow and hides the shortfall), then
-  profile the audio threads (XMA decode via FFmpeg, the title's mixer, or CPU
-  contention with the game thread's capture).
-- Next step candidates, in suggested order: the audio shortfall above, the
+  come from the cutscene clock following this audio clock (not verified).
+- **Audio shortfall fixed in Node (2026-10-08, b8b232d1).** Node's silent
+  fallback is now paced by a deadline (it slept a fixed 5.3 ms after each
+  frame and hid the shortfall); with that, Node shows the same shortfall in
+  the heavy intro stretch (680–760 of 938 frames per 5 s). `--audio_perf_report`
+  logs the guest mixer's frames and callback time and the XMA decoder's busy
+  time every 5 s (web only). A V8 CPU profile of all workers (`node --cpu-prof
+  --cpu-prof-dir=<dir>`, with a `-r` preload that calls `process.exit` after N
+  ms so the profiles are written; wasm futex waits count as samples, so
+  subtract `_do_futex_wait`) showed:
+  - XMA decoding is ~7% busy: not the cause.
+  - The audio worker's guest callback spends almost all its time in
+    `KeWaitForMultipleObjects`, waiting for the title's mixer thread, and
+    `PosixConditionBase::WaitMultiple` polled its handles with 1 ms sleeps.
+    On the web it now waits on a global epoch that every signal bumps
+    (`WakeMultipleWaiters` in `threading_posix.cpp`; a futex wake only when
+    someone waits, 50 ms safety cap). Desktop still polls.
+  - The title's mixer thread (~70% of a core) spent about a third of its time
+    in `fma`: every PowerPC `fmadd` is `std::fma`, which wasm lowers to musl's
+    software fma. `gta4-recomp/src/web/web_fma.cpp` overrides the symbol with
+    relaxed SIMD's `f64x2.relaxed_madd` (one hardware FMA on ARM64 and x86-64
+    with FMA3; multiply then add elsewhere), so the module now needs relaxed
+    SIMD (Chrome 114+). This speeds up every fmadd in the game, not only audio.
+  - The timer queue's disruptorplus spin-wait busy-looped (~16% of a core;
+    under Node each spin also called `os.cpus()`). On the web it uses the
+    blocking strategy, whose timed waits had their arguments in the wrong
+    order (never instantiated before; fixed).
+  Result (Node + Dawn on Metal, same intro): the heaviest stretch now holds
+  938 of 938 frames per 5 s with the mixer thread ~40% idle; renderer fps
+  unchanged (13–19 fps there). **Not rechecked in Chrome yet** (the browser
+  extension was not connected): run with `?arg=--diagnostics=true&arg=--diagnostics_categories=logging&arg=--log_level=warn&arg=--audio_perf_report=true`,
+  click the page so audio starts, and look for `audio:` underrun lines (logged
+  only when underruns happen) and `audio mixer:` lines near 938 frames.
+- Next step candidates, in suggested order: recheck audio in Chrome, the
   `firstInstance` uniform selection, then a game-file picker. Ask the user.
 - **Node graphics session (Dawn on Metal, M1 Mac, 2026-10-07).**
   - *Fixed: black loading screens.* Emscripten has no `CLOCK_MONOTONIC_RAW`;
@@ -242,6 +270,8 @@ mapped); this file is for whoever continues the work.
 | Depth handoff | Depth from the resolved snapshot (`source_texture`); `kRebuildSceneCoverage` clears stencil to 0x80 and writes 0xFF via stencil Replace where packed depth is nonzero, as the Metal renderer | `gta4_webgpu/passes.cpp` (`Handoff`) |
 | Canvas | `<canvas id="liberty-gpu">` is transferred to the render worker as an OffscreenCanvas (pre-js `res/web/webgpu_canvas.js`); SDL's `#canvas` stays on top for input | `gta4_webgpu/canvas.cpp`, `res/web/index.html` |
 | Main loop | `-sPROXY_TO_PTHREAD`; COOP/COEP needed (`tools/web/serve.py`) | `gta4-recomp/CMakeLists.txt` |
+| Fused multiply-add | musl's software `fma` replaced by relaxed SIMD `f64x2.relaxed_madd` (module needs relaxed SIMD) | `gta4-recomp/src/web/web_fma.cpp` |
+| Multi-object waits | Block on a global signal epoch (futex) instead of 1 ms polling; timer queue uses a blocking wait | `src/core/threading_posix.cpp`, `src/core/timer_queue.cpp` |
 | Apple-only bridges, community MP | Report unavailable / not built on web | `gta4-recomp/src/web/web_platform_bridges.cpp` |
 
 ## Rebuilding (cloud session gotchas)
@@ -411,8 +441,9 @@ node out/web-node/LibertyRecomp/LibertyRecomp.js --diagnostics=true \
   window's longest frame (render-thread busy and pipeline time in it), GPU
   frame latency (submit to completion, as seen by the render thread) and how
   many presents waited for the GPU.
-- Chrome's audio crackles and runs slow in busier scenes (see Where it
-  stands › Audio in Chrome).
+- Chrome's audio crackled and ran slow in busier scenes; the causes found in
+  Node are fixed, unconfirmed in Chrome (see Where it stands › Audio
+  shortfall fixed in Node).
 - The shader archive is zlib (12 MB); zstd would be 4.7 MB but needs a wasm zstd.
 - The `0x90000000` view does not mirror `0x80000000` on the web.
 - Guest FP rounding and flush modes are recorded but not applied.
@@ -442,6 +473,6 @@ node out/web-node/LibertyRecomp/LibertyRecomp.js --diagnostics=true \
    are 7–8 GB, so stream them rather than preloading into MEMFS. (Local runs
    already stream an installed game from `serve.py`; the lazy mount in
    `res/web/index.html` is a model for this.)
-3. **Audio, input and page lifecycle.** Audio plays but the title produces it
-   below real time in busier scenes (see Where it stands › Audio in Chrome);
+3. **Audio, input and page lifecycle.** Recheck audio in Chrome after the
+   real-time fixes (see Where it stands › Audio shortfall fixed in Node);
    then pointer lock and fullscreen.

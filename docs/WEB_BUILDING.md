@@ -21,7 +21,7 @@ need the user's own files (see [DUMPING-en.md](DUMPING-en.md)).
 - Dependency sources prepared as for desktop builds (`python3 tools/setup_repo.py`).
   The web build needs only the RexGlue SDK submodules; GPU, desktop-tool and
   console submodules are not used.
-- A browser with WebAssembly Memory64, threads and WebGPU: Chrome/Edge 133+.
+- A browser with WebAssembly Memory64, threads, relaxed SIMD and WebGPU: Chrome/Edge 133+.
   The renderer requires the WebGPU features `clip-distances` and
   `float32-filterable`, and uses `texture-compression-bc` for the game's
   compressed textures (desktop GPUs). Firefox and Safari are not supported yet.
@@ -182,6 +182,7 @@ for 15 seconds, the renderer logs every thread and what it is waiting on.
 | Page protection / write watches | `mprotect` + fault handler | Not available: protection calls succeed without effect, so access watches never fire |
 | Fibers | ucontext / Win32 fibers | Thread fibers only (`fiber_web.cpp`); GTA IV imports no guest fiber APIs |
 | FFmpeg (XMA) | Platform `config.h` | `thirdparty/ffmpeg-web/config.h`: portable C only |
+| Fused multiply-add (`std::fma`) | Hardware instruction | wasm has none, so libc's software `fma` is replaced by relaxed SIMD's `f64x2.relaxed_madd` (`src/web/web_fma.cpp`) |
 | Thread suspend / APC wake | Real-time signals | `pthread_kill`; delivered when the target worker services its mailbox |
 | Host clock | `CLOCK_MONOTONIC_RAW` (Linux), `mach_absolute_time` (macOS) | `CLOCK_MONOTONIC`: Emscripten has no raw clock (`src/core/clock_posix.cpp`) |
 | Community multiplayer | CURL + OpenSSL backend | Not built; selecting it reports an error |
@@ -321,14 +322,18 @@ Not working yet:
   it has its own backing; nothing is known to rely on the mirror.
 - **Game files.** The browser can only read game files from a local
   `serve.py`; there is no file or folder picker yet.
-- **Audio in Chrome.** Audio plays, but it crackles and runs slow in busier
-  scenes: the title's audio thread produces only ~75–80% of real time there,
-  and the gaps are filled with silence. SDL3's own pointer conversion broke on
-  wasm64 (every callback threw `Cannot mix BigInt and other types`);
+- **Audio in Chrome.** Audio plays. It used to crackle and run slow in busier
+  scenes because the title's audio was produced at only ~75–80% of real time.
+  Three web-specific costs caused that: multi-object waits polled every
+  millisecond, `fma` ran in software, and the timer thread spun. They are fixed,
+  and under Node the heaviest intro scenes now hold real time; this has not
+  been rechecked in Chrome yet. SDL3's own pointer conversion broke on wasm64
+  (every callback threw `Cannot mix BigInt and other types`);
   `res/web/sdl_wasm64.js` replaces it. After the queue runs dry, the SDL driver
   waits for `--audio_refill_frames` (12 on the web) before playing again, and
   logs `audio: … frames played, … silent (… underruns)` every 5 s while it
-  underruns.
+  underruns. `--audio_perf_report=true` logs the guest mixer's frames (938 per
+  5 s is real time) and the XMA decoder's busy time every 5 s.
 
 ## Roadmap
 
