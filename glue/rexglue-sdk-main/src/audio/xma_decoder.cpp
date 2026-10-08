@@ -9,10 +9,13 @@
  * @modified    Tom Clay, 2026 - Adapted for ReXGlue runtime
  */
 
+#include <algorithm>
 #include <bit>
+#include <chrono>
 
 #include <rex/audio/xma/context.h>
 #include <rex/audio/handoff_trace.h>
+#include <rex/audio/flags.h>
 #include <rex/audio/xma/decoder.h>
 #include <rex/cvar.h>
 #include <rex/dbg.h>
@@ -57,6 +60,31 @@ REXCVAR_DEFINE_BOOL(ffmpeg_verbose, false, "Audio", "Verbose FFmpeg output (debu
 // using the XMA* functions.
 
 namespace rex::audio {
+
+#ifdef __EMSCRIPTEN__
+namespace {
+// Logs every 5 s how many contexts the decoder serviced and how long that
+// took, to see whether XMA decoding holds back the guest mixer.
+void ReportDecodeTime(std::chrono::steady_clock::time_point begin,
+                      std::chrono::steady_clock::time_point end, bool worked) {
+  static std::chrono::steady_clock::time_point window;
+  static uint32_t serviced = 0, decoded = 0;
+  static std::chrono::steady_clock::duration busy{}, longest{};
+  if (window.time_since_epoch().count() == 0) window = begin;
+  ++serviced;
+  decoded += worked;
+  busy += end - begin;
+  longest = std::max(longest, end - begin);
+  if (end - window < std::chrono::seconds(5)) return;
+  using ms = std::chrono::duration<double, std::milli>;
+  REXAPU_WARN("xma decoder: {} contexts ({} decoded) in {:.0f} ms, busy {:.0f} ms (longest {:.1f} ms)",
+              serviced, decoded, ms(end - window).count(), ms(busy).count(), ms(longest).count());
+  window = end;
+  serviced = decoded = 0;
+  busy = longest = {};
+}
+}  // namespace
+#endif
 
 XmaDecoder::XmaDecoder(runtime::FunctionDispatcher* function_dispatcher)
     : memory_(function_dispatcher->memory()), function_dispatcher_(function_dispatcher) {}
@@ -166,7 +194,15 @@ void XmaDecoder::WorkerThreadMain() {
             diagnostics::gta4_transition::EventType::kXmaContextBegin, 0, 0,
             0, diagnostics::gta4_transition::kFlagBefore, context_index,
             context.guest_ptr(), word_index);
+#ifdef __EMSCRIPTEN__
+        const bool report = REXCVAR_GET(audio_perf_report);
+        const auto work_begin = report ? std::chrono::steady_clock::now()
+                                       : std::chrono::steady_clock::time_point{};
+#endif
         const bool worked = context.Work();
+#ifdef __EMSCRIPTEN__
+        if (report) ReportDecodeTime(work_begin, std::chrono::steady_clock::now(), worked);
+#endif
         if (worked) {
           context.SignalWorkDone();
           PROFILE_XMA_FRAME_DECODED();

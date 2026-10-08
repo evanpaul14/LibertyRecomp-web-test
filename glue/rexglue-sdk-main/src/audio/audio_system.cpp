@@ -11,6 +11,7 @@
 
 #include <algorithm>
 #include <array>
+#include <chrono>
 #include <optional>
 #include <rex/assert.h>
 #include <rex/audio/audio_driver.h>
@@ -35,6 +36,8 @@
 REXCVAR_DEFINE_INT32(
     audio_maxqframes, 64, "Audio",
     "Maximum buffered guest audio blocks (range 1-64). The backend selects the initial depth.");
+REXCVAR_DEFINE_BOOL(audio_perf_report, false, "Audio",
+                    "Log guest mixer and XMA decoder timing every 5 s (web only)");
 
 // As with normal Microsoft, there are like twelve different ways to access
 // the audio APIs. Early games use XMA*() methods almost exclusively to touch
@@ -51,6 +54,31 @@ REXCVAR_DEFINE_INT32(
 #include "handoff_trace.inc"
 
 namespace rex::audio {
+
+#ifdef __EMSCRIPTEN__
+namespace {
+// Logs every 5 s how many frames the guest mixer produced (~938 is real time)
+// and how long its callbacks took (including waits for the title's mixer
+// thread and, under Node, the silent fallback's pacing).
+void ReportMixerTime(std::chrono::steady_clock::time_point begin,
+                     std::chrono::steady_clock::time_point end) {
+  static std::chrono::steady_clock::time_point window;
+  static uint32_t frames = 0;
+  static std::chrono::steady_clock::duration busy{}, longest{};
+  if (window.time_since_epoch().count() == 0) window = begin;
+  ++frames;
+  busy += end - begin;
+  longest = std::max(longest, end - begin);
+  if (end - window < std::chrono::seconds(5)) return;
+  using ms = std::chrono::duration<double, std::milli>;
+  REXAPU_WARN("audio mixer: {} frames in {:.0f} ms, callbacks busy {:.0f} ms (longest {:.1f} ms)",
+              frames, ms(end - window).count(), ms(busy).count(), ms(longest).count());
+  window = end;
+  frames = 0;
+  busy = longest = {};
+}
+}  // namespace
+#endif
 
 AudioSystem::AudioSystem(runtime::FunctionDispatcher* function_dispatcher)
     : memory_(function_dispatcher->memory()),
@@ -189,8 +217,16 @@ void AudioSystem::WorkerThreadMain() {
             client_callback_arg);
         handoff::Span handoff_callback("guest-mixer", index, client_callback, client_callback_arg);
         uint64_t args[] = {client_callback_arg};
+#ifdef __EMSCRIPTEN__
+        const bool report = REXCVAR_GET(audio_perf_report);
+        const auto callback_begin = report ? std::chrono::steady_clock::now()
+                                           : std::chrono::steady_clock::time_point{};
+#endif
         function_dispatcher_->Execute(worker_thread_->thread_state(), client_callback, args,
                                       rex::countof(args));
+#ifdef __EMSCRIPTEN__
+        if (report) ReportMixerTime(callback_begin, std::chrono::steady_clock::now());
+#endif
         diagnostics::gta4_transition::RecordSteady(
             diagnostics::gta4_transition::EventSource::kAudio,
             diagnostics::gta4_transition::EventType::kAudioCallbackEnd,

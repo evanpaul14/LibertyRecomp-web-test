@@ -16,3 +16,4 @@
 REXCVAR_DECLARE(bool, audio_mute);
 REXCVAR_DECLARE(int32_t, audio_maxqframes);
 REXCVAR_DECLARE(bool, ffmpeg_verbose);
+REXCVAR_DECLARE(bool, audio_perf_report);

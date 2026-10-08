@@ -16,6 +16,7 @@ static_assert(REX_PLATFORM_LINUX || REX_PLATFORM_MAC, "This file is POSIX-only")
 #include <atomic>
 #include <array>
 #include <cerrno>
+#include <climits>
 #include <cstddef>
 #include <ctime>
 #include <deque>
@@ -232,6 +233,25 @@ bool SetTlsValue(TlsHandle handle, uintptr_t value) {
          0;
 }
 
+#if REX_PLATFORM_WEB
+// Waits on several conditions block on this epoch instead of polling them every
+// millisecond: every signal bumps it, and wakes the waiters if there are any.
+// Polling cost each wait up to a millisecond of latency, more under load; the
+// title's audio callback waits on its mixer thread for every 5.3 ms frame, so
+// this alone held audio below real time in busy scenes.
+std::atomic<uint32_t> wait_multiple_epoch_{0};
+std::atomic<uint32_t> wait_multiple_waiters_{0};
+
+void WakeMultipleWaiters() {
+  wait_multiple_epoch_.fetch_add(1);
+  if (wait_multiple_waiters_.load()) {
+    emscripten_futex_wake(&wait_multiple_epoch_, INT_MAX);
+  }
+}
+#else
+inline void WakeMultipleWaiters() {}
+#endif
+
 class PosixConditionBase {
  public:
   PosixConditionBase() {
@@ -301,6 +321,9 @@ class PosixConditionBase {
                         : start_time + timeout;
 
     while (true) {
+#if REX_PLATFORM_WEB
+      const uint32_t epoch = wait_multiple_epoch_.load();
+#endif
       size_t first_signaled = std::numeric_limits<size_t>::max();
       bool condition_met = false;
       bool all_locked = true;
@@ -376,6 +399,18 @@ class PosixConditionBase {
         return std::make_pair<WaitResult, size_t>(WaitResult::kTimeout, 0);
       }
 
+#if REX_PLATFORM_WEB
+      // A signal after the check above has already changed the epoch, so the
+      // wait returns at once. The cap only bounds a missed wake.
+      double wait_ms = 50;
+      if (timeout != std::chrono::milliseconds::max()) {
+        wait_ms = std::min(
+            wait_ms, std::chrono::duration<double, std::milli>(end_time - now).count());
+      }
+      wait_multiple_waiters_.fetch_add(1);
+      emscripten_futex_wait(&wait_multiple_epoch_, epoch, wait_ms);
+      wait_multiple_waiters_.fetch_sub(1);
+#else
       if (timeout == std::chrono::milliseconds::max()) {
         std::this_thread::sleep_for(std::chrono::milliseconds(1));
       } else {
@@ -383,6 +418,7 @@ class PosixConditionBase {
         auto sleep_time = std::min(remaining, std::chrono::milliseconds(1));
         std::this_thread::sleep_for(sleep_time);
       }
+#endif
     }
   }
 
@@ -415,6 +451,7 @@ class PosixCondition<Event> : public PosixConditionBase {
     auto lock = std::unique_lock<std::mutex>(mutex_);
     signal_ = true;
     cond_.notify_all();
+    WakeMultipleWaiters();
     return true;
   }
 
@@ -452,6 +489,7 @@ class PosixCondition<Semaphore> : public PosixConditionBase {
     }
     count_ += release_count;
     cond_.notify_all();
+    WakeMultipleWaiters();
     return true;
   }
 
@@ -484,6 +522,7 @@ class PosixCondition<Mutant> : public PosixConditionBase {
       // Free to be acquired by another thread
       if (count_ == 0) {
         cond_.notify_all();
+        WakeMultipleWaiters();
       }
       return true;
     }
@@ -516,6 +555,7 @@ class PosixCondition<Timer> : public PosixConditionBase {
     std::lock_guard<std::mutex> lock(mutex_);
     signal_ = true;
     cond_.notify_all();
+    WakeMultipleWaiters();
     return true;
   }
 
@@ -920,6 +960,7 @@ class PosixCondition<Thread> : public PosixConditionBase {
       exit_code_ = exit_code;
       signaled_ = true;
       cond_.notify_all();
+      WakeMultipleWaiters();
     }
     if (is_current_thread) {
       pthread_exit(reinterpret_cast<void*>(exit_code));
@@ -1368,6 +1409,7 @@ void* PosixCondition<Thread>::ThreadStartRoutine(void* parameter) {
     thread->handle_.exit_code_ = 0;
     thread->handle_.signaled_ = true;
     thread->handle_.cond_.notify_all();
+    WakeMultipleWaiters();
   }
 
   current_thread_ = nullptr;

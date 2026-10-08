@@ -12,16 +12,32 @@
 #include <algorithm>
 #include <forward_list>
 
+#include <rex/platform.h>
+
 #include <disruptorplus/multi_threaded_claim_strategy.hpp>
 #include <disruptorplus/ring_buffer.hpp>
 #include <disruptorplus/sequence_barrier.hpp>
 #include <disruptorplus/spin_wait_strategy.hpp>
+#if REX_PLATFORM_WEB
+#include <disruptorplus/blocking_wait_strategy.hpp>
+#endif
 
 #include <rex/assert.h>
 #include <rex/thread.h>
 #include <rex/thread/timer_queue.h>
 
 namespace dp = disruptorplus;
+
+namespace {
+#if REX_PLATFORM_WEB
+// The spin strategy sleeps only on every 20th try and yields otherwise, which
+// on the web is a busy loop (each spin also asks for the core count, which
+// Node answers with os.cpus()): the timer thread took ~16% of a core.
+using WaitStrategy = dp::blocking_wait_strategy;
+#else
+using WaitStrategy = dp::spin_wait_strategy;
+#endif
+}  // namespace
 
 namespace rex::thread {
 
@@ -142,9 +158,9 @@ class TimerQueue {
   // This ring buffer will be used to introduce timers queued by the public API
   static constexpr size_t kWaitCount = 512;
   dp::ring_buffer<std::shared_ptr<WaitItem>> buffer_;
-  dp::spin_wait_strategy wait_strategy_;
-  dp::multi_threaded_claim_strategy<dp::spin_wait_strategy> claim_strategy_;
-  dp::sequence_barrier<dp::spin_wait_strategy> consumed_;
+  WaitStrategy wait_strategy_;
+  dp::multi_threaded_claim_strategy<WaitStrategy> claim_strategy_;
+  dp::sequence_barrier<WaitStrategy> consumed_;
 
   // This is a _sorted_ (ascending due_) list of active timers managed by a
   // dedicated thread

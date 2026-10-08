@@ -172,7 +172,14 @@ bool SDLAudioDriver::Initialize() {
 
 void SDLAudioDriver::SubmitFrame(uint32_t frame_ptr) {
   if (silent_fallback_) {
-    rex::thread::Sleep(std::chrono::microseconds(silent_frame_duration_microseconds_));
+    // Pace by a deadline rather than a fixed sleep after each frame, so the
+    // guest's audio clock runs at real time while the mixer keeps up, and
+    // falls behind only when the mixer itself does.
+    const auto now = std::chrono::steady_clock::now();
+    const auto frame = std::chrono::nanoseconds(1'000'000'000ull * channel_samples_ / frame_frequency_);
+    if (silent_deadline_ < now - 8 * frame) silent_deadline_ = now;
+    silent_deadline_ += frame;
+    if (silent_deadline_ > now) rex::thread::Sleep(silent_deadline_ - now);
     const bool released = semaphore_->Release(1, nullptr);
     assert_true(released);
     return;

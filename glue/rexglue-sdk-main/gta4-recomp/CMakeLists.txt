@@ -337,7 +337,9 @@ elseif(EMSCRIPTEN)
     add_executable(LibertyRecomp
         ${GTA4_APP_SOURCES}
         src/web/web_platform_bridges.cpp
+        src/web/web_fma.cpp
     )
+    set_property(SOURCE src/web/web_fma.cpp APPEND PROPERTY COMPILE_OPTIONS -mrelaxed-simd)
     target_link_libraries(LibertyRecomp PRIVATE
         gta4_recomp_generated
         rex::runtime
