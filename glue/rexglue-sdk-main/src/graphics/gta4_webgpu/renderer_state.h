@@ -28,6 +28,7 @@
 
 REXCVAR_DECLARE(bool, webgpu_perf_report);
 REXCVAR_DECLARE(bool, webgpu_gpu_timing);
+REXCVAR_DECLARE(bool, webgpu_early_frame_ack);
 
 namespace rex::graphics::gta4_webgpu {
 
@@ -104,6 +105,9 @@ struct Targets {
     return !other.depth || other.depth == depth;
   }
 };
+// Guest device field holding the last frame the GPU completed.
+inline constexpr uint32_t kDeviceCompletedFrame = 16552;
+
 // Render passes timed per frame with --webgpu_gpu_timing (two queries each).
 inline constexpr uint32_t kMaximumPassTimers = 1024;
 
@@ -514,26 +518,50 @@ struct Renderer::State {
   void ProbePixel(const Targets& targets, uint64_t pixel_shader);
   void ReportPixelProbes(std::string& error);
   uint64_t texture_failures = 0;
+  uint64_t perf_commands = 0;  // For --webgpu_perf_report sampling.
 };
 
 // Performance reports (only with --webgpu_perf_report) go to the warning log,
 // so they show without the diagnostic flood.
 #define WEBGPU_PERF_LOG(...) REXLOG_WARN(__VA_ARGS__)
 
-// The clock for stage timing, or 0 without --webgpu_perf_report: each read
-// is a call out to JavaScript, and a draw's stage timers took about a tenth
-// of its render-thread time.
-inline double PerfNow() { return REXCVAR_GET(webgpu_perf_report) ? emscripten_get_now() : 0.0; }
+// With --webgpu_perf_report, per-command stage timers run on one command in
+// kPerfSampleRate (set per command on each thread) and their totals are
+// scaled: each clock read is a call out to JavaScript, ~2-3 us in a Chrome
+// worker, and timing every draw took almost half of the render thread there.
+inline constexpr uint32_t kPerfSampleRate = 16;
+inline thread_local bool perf_sample = false;
 
-// Adds the scope's wall time (ms) to `total`, with --webgpu_perf_report.
+// The clock for sampled stage timing, or 0 when this command is not sampled.
+inline double PerfNow() { return perf_sample ? emscripten_get_now() : 0.0; }
+
+// Adds the scope's wall time (ms), scaled for sampling, to `total`.
 class ScopedTimer {
  public:
   explicit ScopedTimer(double& total) : total_(total), start_(PerfNow()) {}
   ~ScopedTimer() {
-    if (start_) total_ += emscripten_get_now() - start_;
+    if (start_) total_ += (emscripten_get_now() - start_) * kPerfSampleRate;
   }
   ScopedTimer(const ScopedTimer&) = delete;
   ScopedTimer& operator=(const ScopedTimer&) = delete;
+
+ private:
+  double& total_;
+  double start_;
+};
+
+// Adds the scope's wall time (ms) to `total` on every occurrence, with
+// --webgpu_perf_report: for rare work (pipelines, uploads, submits) that
+// sampling would miss or exaggerate.
+class RareTimer {
+ public:
+  explicit RareTimer(double& total)
+      : total_(total), start_(REXCVAR_GET(webgpu_perf_report) ? emscripten_get_now() : 0.0) {}
+  ~RareTimer() {
+    if (start_) total_ += emscripten_get_now() - start_;
+  }
+  RareTimer(const RareTimer&) = delete;
+  RareTimer& operator=(const RareTimer&) = delete;
 
  private:
   double& total_;

@@ -27,7 +27,6 @@ namespace rex::graphics::gta4_webgpu {
 namespace {
 using namespace gta4_native;
 
-constexpr uint32_t kDeviceCompletedFrame = 16552;
 
 uint32_t TexelBytes(wgpu::TextureFormat format) {
   switch (format) {
@@ -334,6 +333,7 @@ Renderer::Status Renderer::State::Present(const Work& work, std::string& error) 
                             error);
   }
   const auto acknowledge = [&] {
+    if (REXCVAR_GET(webgpu_early_frame_ack)) return;  // Done at capture.
     if (c.device && uint64_t(c.device) + kDeviceCompletedFrame + 4 <= 0x100000000ull) {
       const uint32_t completed = __builtin_bswap32(c.submitted_frame);
       std::memcpy(memory->TranslateVirtual<uint8_t*>(c.device + kDeviceCompletedFrame),

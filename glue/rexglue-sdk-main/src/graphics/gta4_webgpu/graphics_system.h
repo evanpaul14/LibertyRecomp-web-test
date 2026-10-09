@@ -104,6 +104,7 @@ class Gta4WebGpuGraphicsSystem final : public system::IGraphicsSystem {
   // except blocked_ms_ (under queue_mutex_).
   double capture_ms_ = 0, snapshot_ms_ = 0, buffer_capture_ms_ = 0, texture_capture_ms_ = 0, report_start_ms_ = 0;
   uint64_t captured_bytes_ = 0, snapshots_ = 0, snapshot_bytes_ = 0;
+  uint64_t perf_commands_ = 0;  // For --webgpu_perf_report sampling.
   double blocked_ms_ = 0;
   double next_present_ms_ = 0;  // Earliest time of the next present (presenting thread).
   // Each device block as last sent to the render thread, by guest address.

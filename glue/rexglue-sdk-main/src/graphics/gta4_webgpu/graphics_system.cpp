@@ -34,6 +34,9 @@
 
 REXCVAR_DEFINE_UINT32(webgpu_frame_limit, 60, "GPU",
                       "Web build: most frames presented per second (0 = unlimited)");
+REXCVAR_DEFINE_BOOL(webgpu_early_frame_ack, false, "GPU",
+                    "Web build: report a frame complete to the title once its present is "
+                    "captured instead of when the render thread executes it");
 
 namespace rex::graphics::gta4_webgpu {
 // The render thread's pending yield (see YieldToEventLoop).
@@ -273,7 +276,7 @@ bool Gta4WebGpuGraphicsSystem::CaptureDevice(Work& work, uint32_t device, std::s
                              bytes + offset + kDeviceChunkBytes);
   }
   snapshot_bytes_ += work.device.bytes.size();
-  if (start) snapshot_ms_ += emscripten_get_now() - start;
+  if (start) snapshot_ms_ += (emscripten_get_now() - start) * kPerfSampleRate;
   return ReadTargets(work, device, error);
 }
 
@@ -307,7 +310,7 @@ std::shared_ptr<const BufferCapture> Gta4WebGpuGraphicsSystem::CaptureBuffer(
     double& total;
     double start;
     ~Elapsed() {
-      if (start) total += emscripten_get_now() - start;
+      if (start) total += (emscripten_get_now() - start) * kPerfSampleRate;
     }
   } elapsed{buffer_capture_ms_, PerfNow()};
   auto found = buffers_.find(handle);
@@ -348,13 +351,7 @@ std::shared_ptr<const TextureCapture> Gta4WebGpuGraphicsSystem::CaptureTexture(
       NativeTextureImageFetchEqual(found->second->fetch, fetch)) {
     return found->second;
   }
-  struct Elapsed {
-    double& total;
-    double start;
-    ~Elapsed() {
-      if (start) total += emscripten_get_now() - start;
-    }
-  } elapsed{texture_capture_ms_, PerfNow()};
+  RareTimer elapsed(texture_capture_ms_);
   TextureInfo info{};
   if (!TextureInfo::Prepare(fetch, &info) || info.mip_min_level > info.mip_max_level ||
       info.mip_max_level >= xenos::kTextureMaxMips) {
@@ -763,9 +760,10 @@ bool Gta4WebGpuGraphicsSystem::SubmitTitleCommand(uint32_t title_id, uint32_t ab
   // Queued under the capture lock: device deltas must reach the render
   // thread in the order they were taken.
   std::lock_guard lock(capture_mutex_);
+  perf_sample = REXCVAR_GET(webgpu_perf_report) && ++perf_commands_ % kPerfSampleRate == 0;
   const double start = PerfNow();
   const bool captured = Capture(command, size, *work, error);
-  if (start) capture_ms_ += emscripten_get_now() - start;
+  if (start) capture_ms_ += (emscripten_get_now() - start) * kPerfSampleRate;
   if (present && REXCVAR_GET(webgpu_perf_report)) {
     const double now = emscripten_get_now();
     if (!report_start_ms_) report_start_ms_ = now;
@@ -795,6 +793,16 @@ bool Gta4WebGpuGraphicsSystem::SubmitTitleCommand(uint32_t title_id, uint32_t ab
       REXLOG_ERROR("gta4-webgpu: capture rejected type={} count={} reason={}",
                    uint32_t(header.type), failures_, error);
     return false;
+  }
+  if (present && REXCVAR_GET(webgpu_early_frame_ack)) {
+    // Every draw's data was copied at capture, so the title may reuse its
+    // buffers now; it need not wait for the render thread to reach the frame.
+    const auto c = Read<PresentCommand>(command);
+    if (c.device && uint64_t(c.device) + kDeviceCompletedFrame + 4 <= 0x100000000ull) {
+      const uint32_t completed = __builtin_bswap32(c.submitted_frame);
+      std::memcpy(memory_->TranslateVirtual<uint8_t*>(c.device + kDeviceCompletedFrame), &completed,
+                  sizeof(completed));
+    }
   }
   Enqueue(std::move(work), present);
   return true;

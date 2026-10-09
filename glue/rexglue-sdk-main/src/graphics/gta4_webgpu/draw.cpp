@@ -136,7 +136,7 @@ Pipeline* Renderer::State::DrawPipeline(
   key.push_back(fixed.cull_mode);
   key.insert(key.end(), inputs.key.begin(), inputs.key.end());
   if (auto found = pipelines.find(key); found != pipelines.end()) return &found->second;
-  ScopedTimer timer(timing.pipeline_ms);
+  RareTimer timer(timing.pipeline_ms);
   ++timing.new_pipelines;
 
   auto vertex_module = Module(vertex, false, error);

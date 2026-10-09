@@ -233,7 +233,7 @@ bool Renderer::State::Upload(TextureResource& texture, const TextureCapture& cap
     error = "CPU-written packed depth textures are unsupported";
     return false;
   }
-  ScopedTimer timer(timing.texture_ms);
+  RareTimer timer(timing.texture_ms);
   ++timing.new_textures;
   std::vector<DecodedSlice> slices;
   if (!DecodeTexture(texture.info, capture, slices, error)) return false;
@@ -402,7 +402,7 @@ wgpu::Buffer Renderer::State::IndexBuffer(const BufferCapture& capture, bool& in
     base = found->second.range.offset;
     return pool.buffer(found->second.range.page);
   }
-  ScopedTimer timer(timing.geometry_ms);
+  RareTimer timer(timing.geometry_ms);
   ++timing.new_buffers;
   const size_t element = index32 ? 4 : 2;
   const size_t count = capture.bytes.size() / element;
@@ -458,7 +458,7 @@ bool Renderer::State::VertexBuffer(const BufferCapture& capture, uint32_t offset
     error = "Vertex stream holds no complete vertex";
     return false;
   }
-  ScopedTimer timer(timing.geometry_ms);
+  RareTimer timer(timing.geometry_ms);
   ++timing.new_buffers;
   const size_t output_stride = elements.size() * 16;
   const uint64_t size = vertices * output_stride;

@@ -496,7 +496,7 @@ bool Renderer::State::Flush(std::string& error) {
   last_uniforms.parts.fill(UINT64_MAX);
   last_uniforms.shared = last_uniforms.record = UINT64_MAX;
   if (!encoder) return true;
-  ScopedTimer timer(timing.submit_ms);
+  RareTimer timer(timing.submit_ms);
   // Arena writes are ordered before the command buffer that reads them.
   if (uniforms.used) queue.WriteBuffer(uniforms.buffer, 0, uniforms.bytes.data(), uniforms.used);
   if (geometry.used) queue.WriteBuffer(geometry.buffer, 0, geometry.bytes.data(), geometry.used);
@@ -788,6 +788,7 @@ Renderer::Status Renderer::Execute(Work& work, std::string& error) {
       work.execute->Finish(ok);
     }
   };
+  perf_sample = REXCVAR_GET(webgpu_perf_report) && ++s.perf_commands % kPerfSampleRate == 0;
   // Every delta is applied, so the copies stay in step with the game's.
   if (work.device.device) s.ApplyDeviceDelta(work.device);
   if (!s.ready) {
