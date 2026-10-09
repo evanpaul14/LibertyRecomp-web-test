@@ -379,6 +379,12 @@ elseif(EMSCRIPTEN)
         # Each guest call is a host call, so host stacks run deep.
         -sSTACK_SIZE=8MB
         -sDEFAULT_PTHREAD_STACK_SIZE=4MB
+        # dlmalloc has one global lock: game threads allocate each captured
+        # draw and the render thread frees it, and both spent a quarter of
+        # their time in malloc/free, mostly waiting on that lock. mimalloc
+        # keeps per-thread heaps (it sits on emmalloc, which also takes memory
+        # from sbrk and never lowers the break; see core/memory_web.cpp).
+        -sMALLOC=mimalloc
         -sENVIRONMENT=web,worker,node
         -sEXIT_RUNTIME=1
         "--pre-js=${CMAKE_CURRENT_SOURCE_DIR}/res/web/webgpu_canvas.js"
