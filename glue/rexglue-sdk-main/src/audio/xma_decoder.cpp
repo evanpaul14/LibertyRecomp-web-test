@@ -12,6 +12,7 @@
 #include <algorithm>
 #include <bit>
 #include <chrono>
+#include <mutex>
 
 #include <rex/audio/xma/context.h>
 #include <rex/audio/handoff_trace.h>
@@ -67,6 +68,9 @@ namespace {
 // took, to see whether XMA decoding holds back the guest mixer.
 void ReportDecodeTime(std::chrono::steady_clock::time_point begin,
                       std::chrono::steady_clock::time_point end, bool worked) {
+  // Kicks decode on the kicking thread, so more than one thread reports.
+  static std::mutex mutex;
+  std::lock_guard lock(mutex);
   static std::chrono::steady_clock::time_point window;
   static uint32_t serviced = 0, decoded = 0;
   static std::chrono::steady_clock::duration busy{}, longest{};
@@ -363,14 +367,34 @@ void XmaDecoder::WriteRegister(uint32_t addr, uint32_t value) {
         diagnostics::gta4_transition::EventType::kXmaKick, 0, 0, 0,
         diagnostics::gta4_transition::kFlagBefore, ready_word, kicked_value,
         base_context_id);
-    ready_context_words_[ready_word].fetch_or(kicked_value, std::memory_order_release);
-    // Signal the decoder thread to start processing.
-    work_event_->Set();
-    // Block until the worker finishes, so the game sees updated context data.
-    for (int i = 0; kicked_value && i < 32; ++i, kicked_value >>= 1) {
-      if (kicked_value & 1) {
-        uint32_t context_id = base_context_id + i;
-        contexts_[context_id].WaitForWorkDone();
+#ifdef __EMSCRIPTEN__
+    // The kicking thread would only block until the decoder thread finished,
+    // so it decodes the contexts itself. Each handoff took two thread wakes
+    // (~1,100 kicks a second); in busy browser scenes those delays held the
+    // guest mixer below real time while the decoder was ~80% idle.
+    if (!paused_) {
+      for (int i = 0; kicked_value && i < 32; ++i, kicked_value >>= 1) {
+        if (!(kicked_value & 1)) continue;
+        XmaContext& context = contexts_[base_context_id + i];
+        const bool report = REXCVAR_GET(audio_perf_report);
+        const auto work_begin = report ? std::chrono::steady_clock::now()
+                                       : std::chrono::steady_clock::time_point{};
+        const bool worked = context.Work();
+        if (report) ReportDecodeTime(work_begin, std::chrono::steady_clock::now(), worked);
+        if (worked) PROFILE_XMA_FRAME_DECODED();
+      }
+    } else
+#endif
+    {
+      ready_context_words_[ready_word].fetch_or(kicked_value, std::memory_order_release);
+      // Signal the decoder thread to start processing.
+      work_event_->Set();
+      // Block until the worker finishes, so the game sees updated context data.
+      for (int i = 0; kicked_value && i < 32; ++i, kicked_value >>= 1) {
+        if (kicked_value & 1) {
+          uint32_t context_id = base_context_id + i;
+          contexts_[context_id].WaitForWorkDone();
+        }
       }
     }
     diagnostics::gta4_transition::Record(
