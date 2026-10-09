@@ -35,6 +35,11 @@ uint64_t Clock::host_tick_frequency_platform() {
   mach_timebase_info_data_t info;
   mach_timebase_info(&info);
   return (uint64_t)((1000000000ull * (uint64_t)info.denom) / (uint64_t)info.numer);
+#elif defined(__EMSCRIPTEN__)
+  // host_tick_count_platform() counts nanoseconds whatever the clock's
+  // resolution. Browsers report performance.now()'s (1000 ns), which made
+  // this 1 MHz and ran guest time ~1000x fast; under Node it is 1 ns.
+  return 1000000000ull;
 #else
   timespec res;
   int error = clock_getres(kHostClock, &res);
