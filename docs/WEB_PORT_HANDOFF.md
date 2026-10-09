@@ -258,15 +258,71 @@ mapped); this file is for whoever continues the work.
   | ~4,000 | 17–19 | 55–60 ms | ~8 µs |
   | 7,600–8,800 | 10–12 | 85–100 ms | ~7.4 µs |
 
-  Heavy scenes are GPU-bound (nearly every present waits for the GPU). The
+  Heavy scenes looked GPU-bound (nearly every present waits for the GPU);
+  that was wrong, see the CPU session of 2026-10-08 below. The
   2026-10-07 Chrome recheck (before `firstInstance`) had 4,000–5,400-draw
   scenes at 13–18 fps with 40–80 ms latency, so the storage-buffer constants
   show no clear GPU cost; these runs are not an exact comparison (different
   tab and run). Gameplay in run 1 reached 10,000–11,000 draws at 6–8 fps
   with ~150 ms GPU latency. The synthetic click throws `WrongDocumentError`
   (pointer lock refused); harmless.
-- Next step candidates, in suggested order: reduce GPU time in heavy scenes,
-  find the intro skip (above), then a game-file picker. Ask the user.
+- **CPU session (2026-10-08, 077c40e7..695520e5).** The heavy scenes were
+  never GPU-bound, and the browser clock ran guest time ~1000x fast.
+  - *GPU timing:* `--webgpu_gpu_timing` (with `--webgpu_perf_report`) writes
+    timestamps around every render pass (needs `timestamp-query`; Chrome
+    quantizes it to 100 µs unless started with
+    `--enable-webgpu-developer-features`). It logs GPU busy time a frame,
+    idle time, and the passes that advanced the GPU timeline most (passes
+    overlap on Apple GPUs, so each pass is charged only for how far it moved
+    the end of the timeline). Heavy intro scenes (5,000–8,000 draws) keep the
+    GPU busy ~18–23 ms a frame in both Node and Chrome; the costliest pass is
+    the 1024x768 RGBA16F one (pixel shader 7B14CAC2A31D4199, ~50%). "GPU frame
+    latency" is not GPU time: the work-done callback waits for the busy
+    render worker's event loop.
+  - *Chrome trace and worker profiles* (DevTools protocol; scripts were in
+    the session scratchpad, easy to rewrite: `Tracing.start` on the browser
+    target, and `Target.setAutoAttach` + `Profiler.start` on each worker
+    session). The GPU process was ~8% busy; the render worker ~97%. Build
+    the browser build with `LIBERTY_WEB_FUNCTION_NAMES=ON` for readable
+    profiles. A wasm `atomic.wait` counts as busy time in V8 profiles, so
+    threads blocked on condition variables look 100% busy.
+  - *Fixes, in order of effect:* (1) the perf timers themselves: each clock
+    read is a call to JavaScript costing ~2–3 µs in a Chrome worker, and
+    per-draw timers took ~46% of the render thread; per-command stage timers
+    are now sampled (1 in 16, scaled). (2) `-sMALLOC=mimalloc`: the title's
+    render thread allocates each captured draw and the renderer frees it, and
+    both spent ~a quarter of their time in malloc/free waiting on dlmalloc's
+    lock. (3) Hot/cold constants (`tools/webgpu/hot_constants.py`, archive
+    `LRWGSL05`): the title rewrites vertex and pixel registers 0–15 on almost
+    every draw, so each stage now has a 16-register hot slot and a cold slot,
+    and uploads fell from ~20 to ~6 MB a frame. The perf report also counts
+    constant chunk changes. Chrome, heavy intro scenes: ~6,000–7,300 draws a
+    frame at ~24–27 fps (was ~10–14 at fewer draws).
+  - *Clock:* `host_tick_frequency_platform()` used `clock_getres`, which
+    browsers report as 1000 ns while the count is nanoseconds, so guest time
+    ran ~1000x fast in Chrome (Node reports 1 ns). The title clamps its frame
+    step, so the game ran at a fixed fast-forward that grew with the frame
+    rate; it went unnoticed at 3–10 fps. Fixed (1 GHz on Emscripten); the
+    user confirmed normal speed when driving.
+  - *Audio:* faster rendering made audio stutter: each XMA kick woke the
+    decoder thread and waited for it (two thread wakes, ~1,100 kicks a second),
+    and in busy scenes those delays held the guest mixer below real time
+    while the decoder was ~80% idle. Kicks now decode on the kicking thread
+    (web only): silent frames 9,999 -> 4,087 in the same run, and the user
+    reports clean cutscene audio. A 30 fps cap (`--webgpu_frame_limit=30`)
+    did not fix the old shortfall. The mixer still falls short in some
+    windows (median 890 of 938 frames per 5 s before the clock fix; not
+    measured since).
+  - *Experimental:* `--webgpu_early_frame_ack` (off) acknowledges a frame to
+    the title at capture instead of at execution. Measured only before the
+    XMA fix: somewhat better audio, no clear fps change.
+  - *Where the time goes now (Chrome, ~4,900 draws):* render worker ~60% busy
+    and the title's render (capturing) thread ~60% busy, each waiting on the
+    other part of the time; the capturing thread spends ~1.8 s of 5 s in a
+    guest wait (`sub_82A1A450` from `sub_828497D8`), likely for the main
+    thread's next frame. Per draw on the render worker: `Draw` itself, the
+    WebGPU calls (~2.2 a draw, mostly the texture bind group), `Work`
+    destruction, and hash lookups for pipelines and bind groups.
 - **Node graphics session (Dawn on Metal, M1 Mac, 2026-10-07).**
   - *Fixed: black loading screens.* Emscripten has no `CLOCK_MONOTONIC_RAW`;
     `clock_getres`/`clock_gettime` failed and, with asserts compiled out, the
@@ -558,7 +614,13 @@ node out/web-node/LibertyRecomp/LibertyRecomp.js --diagnostics=true \
 
 ## Next steps (pick with the user)
 
-1. **WebGPU renderer performance.** The renderer is done as a title-command
+1. **WebGPU renderer performance.** Heavy scenes are CPU-bound, not
+   GPU-bound (CPU session of 2026-10-08 under Where it stands). Next: measure
+   gameplay (not only the intro) with the new tools, find what the title's
+   threads wait on, cut per-draw render-worker cost (bind-group calls, hash
+   lookups, `Work` allocation), and the capture cost on the title's thread.
+   The older notes below predate that session.
+   The renderer is done as a title-command
    renderer (the same interface the desktop gta4-native and gta4-metal
    renderers use, not Xenos emulation), and Chrome renders the intro correctly
    (see above). Per-draw cost is down to ~10 µs (Node, Dawn on Metal; see
