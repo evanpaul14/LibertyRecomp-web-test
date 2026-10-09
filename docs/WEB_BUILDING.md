@@ -88,10 +88,12 @@ turns the pipeline specialization constant into a uniform word, removes switch
 fall-through, and then runs `spirv-opt` and naga. Finally `split_uniforms.py`
 splits the uniform buffer into three parts (vertex constants, pixel constants,
 shared constants), so the renderer can reuse each one while it is unchanged,
-and `draw_constants.py` makes the shaders read all three from one read-only
-storage buffer at register indices taken from a per-draw record (see
-Constants below). All 2062 shader variants translate and pass Tint's
-validation in Dawn.
+`draw_constants.py` makes the shaders read all three from one read-only
+storage buffer at register indices taken from a per-draw record, and
+`hot_constants.py` gives each stage's registers 0–15 a slot of their own (see
+Constants below). Each of these converts an existing archive in place to the
+next format version (now `LRWGSL05`). All 2062 shader variants translate and
+pass Tint's validation in Dawn.
 
 ## Run
 
@@ -157,8 +159,15 @@ constants and bound textures) and always dumps it; trace lines are info-level, s
 add `--log_level=info`. Every 60 frames the renderer logs its draw, clear and
 resolve counts. `--webgpu_perf_report=true` times the renderer's stages and logs
 every 5 s as warnings: fps, draws and render passes a frame, render-thread
-time per stage, WebGPU calls per draw, the longest frame and GPU frame latency.
-Without it no stage timing runs (each clock read is a call out to JavaScript).
+time per stage, WebGPU calls per draw, how often each constant chunk changed,
+the longest frame and the submit-to-completion latency (which includes time
+the busy render worker takes to see the completion, so it is not GPU time).
+Each clock read is a call out to JavaScript (~2–3 µs in a Chrome worker), so
+per-draw stages are timed on one command in 16 and scaled; without the flag no
+stage timing runs. `--webgpu_gpu_timing=true` adds GPU timestamps around every
+render pass (needs the `timestamp-query` feature) and reports GPU busy and
+idle time a frame and the costliest passes; Chrome quantizes the timestamps to
+100 µs unless it is started with `--enable-webgpu-developer-features`.
 `--webgpu_frame_limit` caps presents per second (default 60, 0 = unlimited).
 Title pipelines are created asynchronously, and a draw is skipped until its
 pipeline is ready (`--webgpu_async_pipelines=false` creates them synchronously;
@@ -189,7 +198,8 @@ for 15 seconds, the renderer logs every thread and what it is waiting on.
 | FFmpeg (XMA) | Platform `config.h` | `thirdparty/ffmpeg-web/config.h`: portable C only |
 | Fused multiply-add (`std::fma`) | Hardware instruction | wasm has none, so libc's software `fma` is replaced by relaxed SIMD's `f64x2.relaxed_madd` (`src/web/web_fma.cpp`) |
 | Thread suspend / APC wake | Real-time signals | `pthread_kill`; delivered when the target worker services its mailbox |
-| Host clock | `CLOCK_MONOTONIC_RAW` (Linux), `mach_absolute_time` (macOS) | `CLOCK_MONOTONIC`: Emscripten has no raw clock (`src/core/clock_posix.cpp`) |
+| Host clock | `CLOCK_MONOTONIC_RAW` (Linux), `mach_absolute_time` (macOS) | `CLOCK_MONOTONIC` at a fixed 1 GHz: Emscripten has no raw clock, and browsers report its resolution (1 µs) from `clock_getres`, which is not its tick rate (`src/core/clock_posix.cpp`) |
+| Allocator | System / mimalloc | `-sMALLOC=mimalloc`: dlmalloc's single lock stalled the threads that capture and free each draw |
 | Community multiplayer | CURL + OpenSSL backend | Not built; selecting it reports an error |
 | Game Center, user music, microphone | Objective-C++ bridges | Report unavailable (`src/web/web_platform_bridges.cpp`) |
 | RenderDoc | Optional | Not available |
@@ -222,15 +232,17 @@ Converted vertex and index data share large pooled buffers; a draw selects its
 data with `firstIndex` and `baseVertex`, so consecutive draws keep one binding
 (every WebGPU call crosses from wasm into the browser).
 
-**Constants.** The title's vertex constants, pixel constants and shared
-constants live in slots of one per-batch arena, which shaders read as a single
-read-only storage buffer (bound once per render pass). A draw writes a new
-slot only for a part whose inputs changed, judged by which chunks of the
-device block changed, then a 16-byte draw record with the three slots'
-register indices, and passes the record's index as `firstInstance`. The
-vertex shader reads it through `instance_index` and passes it to the pixel
-shader in a flat varying (location 18), so selecting constants costs no
-WebGPU call. This needs 20 inter-stage variables; the renderer refuses an
+**Constants.** The title's constants live in slots of one per-batch arena,
+which shaders read as a single read-only storage buffer (bound once per render
+pass). Each stage's registers are split into a hot slot (registers 0–15,
+which the title rewrites on almost every draw) and a cold slot (the rest), and
+shared constants have a slot of their own. A draw writes a new slot only for a
+part whose inputs changed, judged by which chunks of the device block changed,
+then a two-register draw record (hot, cold and shared slot indices for the
+vertex stage, then for the pixel stage), and passes the record's index as
+`firstInstance`. The vertex shader reads it through `instance_index` and
+passes the pixel stage's half to the pixel shader in a flat varying (location
+18), so selecting constants costs no WebGPU call. This needs 20 inter-stage variables; the renderer refuses an
 adapter with fewer.
 
 **Targets and resolves.** Every render target is single-sampled (WebGPU only has 1×
@@ -347,7 +359,11 @@ Not working yet:
   millisecond, `fma` ran in software, and the timer thread spun. They are fixed,
   and the heaviest intro scenes now hold real time under Node and in Chrome
   (931–958 frames per 5 s through the whole intro), except while Chrome compiles
-  a burst of new pipelines (619–870 frames, 5–22 underruns per 5 s). SDL3's own pointer conversion broke on wasm64
+  a burst of new pipelines (619–870 frames, 5–22 underruns per 5 s). Once
+  rendering got faster, the mixer fell behind again: each XMA context kick
+  woke the decoder thread and waited for it, and in busy scenes those thread
+  wakes took too long. Kicks now decode on the kicking thread on the web.
+  SDL3's own pointer conversion broke on wasm64
   (every callback threw `Cannot mix BigInt and other types`);
   `res/web/sdl_wasm64.js` replaces it. After the queue runs dry, the SDL driver
   waits for `--audio_refill_frames` (12 on the web) before playing again, and

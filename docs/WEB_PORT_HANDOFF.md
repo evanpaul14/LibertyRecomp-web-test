@@ -62,7 +62,9 @@ mapped); this file is for whoever continues the work.
     tab group (it stayed dark there while a normal tab rendered); use a tab
     opened normally (`open -a "Google Chrome" <url>`) and a screen capture.
 - **Profiling.** `--webgpu_perf_report=true` turns on stage timing (off
-  otherwise: the clock reads cost ~10% of a draw) and logs every 5 s as
+  otherwise: each clock read is a call to JavaScript, ~2–3 µs in a Chrome
+  worker, so per-draw stages are sampled on one command in 16 and scaled;
+  rare work is timed every time) and logs every 5 s as
   warnings: a `perf` line (fps, draws and render passes a frame, render-thread time per stage, new
   pipelines with how many became ready or failed, their latency and the draws
   that waited for them, shader modules warmed and still queued, new uniform
@@ -71,7 +73,11 @@ mapped); this file is for whoever continues the work.
   latency, presents that waited for the GPU), a `presents` line (presents
   shown on the canvas, those with new frontbuffer contents, those skipped: no
   source, no canvas, no surface texture with its status; canvas size,
-  frontbuffer, GPU error count) and the game thread's `capture` line. Use it
+  frontbuffer, GPU error count), a `constant chunk changes` line, the game
+  thread's `capture` line and, with `--webgpu_gpu_timing=true`, GPU pass
+  timing (CPU session of 2026-10-08 below). The stall line's "GPU frame
+  latency" includes the time the busy render worker takes to see the
+  completion; it is not GPU time. Use it
   with `--diagnostics=true
   --diagnostics_categories=logging --log_level=warn`: other diagnostics print
   a line per draw, and every line blocks the game thread until the page's
@@ -135,8 +141,9 @@ mapped); this file is for whoever continues the work.
 - **Chrome recheck (2026-10-07, after 4ca42b25).** Intro cutscenes: 28 passes
   a frame, render thread ~6–7 µs a draw (was 20–32), no pipeline stalls (0 ms
   pipelines, no draws waiting), longest frame 1–1.5× the average. Heavy
-  scenes (4,000–5,400 draws) run 13–18 fps and are GPU-bound: every present
-  waited for the GPU, GPU frame latency 40–80 ms. The game thread spends
+  scenes (4,000–5,400 draws) run 13–18 fps and looked GPU-bound: every present
+  waited for the GPU, GPU frame latency 40–80 ms (they were CPU-bound; see the
+  CPU session of 2026-10-08). The game thread spends
   ~40% of its time capturing draws (2.1 s per 5 s). Light scenes hold 60 fps.
 - **Audio in Chrome (2026-10-07).** SDL3's `CPtrToHeap32Index` divided an
   EM_ASM pointer (a Number) by `4n`, so every audio callback threw and nothing
@@ -400,7 +407,7 @@ mapped); this file is for whoever continues the work.
 | Fibers | Thread fibers only; `Create`/`SwitchTo` fail loudly (GTA IV uses none) | `src/core/fiber_web.cpp` |
 | GPU | Statically linked WebGPU title-command renderer (no `dlopen` on web); created in `GTA4App::OnPreSetup`. `--gpu_plugin=none` = headless | `src/graphics/gta4_webgpu/`, `include/rex/graphics/gta4_webgpu.h`, `gta4-recomp/src/gta4_app.cpp` |
 | GPU threading | One render pthread owns the device and runs from the JS event loop (needed for `mapAsync` and canvas presentation), woken via `emscripten_proxy_async`; at most two frames are in flight on the GPU (`TrackGpuFrame`); after each present it yields with a `MessageChannel` message, since a proxied wake can run in the same task and the canvas only updates when the task ends. Game threads capture device block/buffers/textures at submit (`Capture` in `graphics_system.cpp`) | `gta4_webgpu/graphics_system.cpp`, `work.h` |
-| Shaders | Stock SPIR-V → GLSL (SPIRV-Cross) → rewrite BDA constants to one UBO (VS 0, PS 4096, shared 8192, spec word 8192+0x500) and bindless to fixed slots → glslang → spirv-opt → naga → WGSL, then split the UBO into three parts (VS, PS, shared + spec word 0x500) read from one group-0 storage buffer at register indices from a per-draw record (`firstInstance` → `instance_index`, flat varying at location 18 for the pixel shader); dynamic register reads go through `xc_load`. naga undoes the Vulkan y-flip itself | `tools/webgpu/spirv_to_wgsl.py`, `tools/webgpu/split_uniforms.py`, `tools/webgpu/draw_constants.py`, `LibertyRecompLib/shader/webgpu_shader_archive.bin` |
+| Shaders | Stock SPIR-V → GLSL (SPIRV-Cross) → rewrite BDA constants to one UBO (VS 0, PS 4096, shared 8192, spec word 8192+0x500) and bindless to fixed slots → glslang → spirv-opt → naga → WGSL, then split the UBO into three parts (VS, PS, shared + spec word 0x500) read from one group-0 storage buffer at register indices from a two-register per-draw record (`firstInstance` → `instance_index`; the pixel stage's half goes to the pixel shader in a flat varying at location 18); each stage's registers 0–15 have their own hot slot (register r reads `hot + r` below 16, `cold + r` above); dynamic register reads go through `xc_load`. naga undoes the Vulkan y-flip itself. Archive `LRWGSL05` | `tools/webgpu/spirv_to_wgsl.py`, `split_uniforms.py`, `draw_constants.py`, `hot_constants.py`, `LibertyRecompLib/shader/webgpu_shader_archive.bin` |
 | Pipelines | Title pipelines by full state key, created with `CreateRenderPipelineAsync`; draws are skipped while pending (`--webgpu_async_pipelines`). Shader modules for registered shaders are made between frames (`WarmModules`, `--webgpu_shader_warmup_ms`), since module creation is synchronous. Utility-pass pipelines stay synchronous | `gta4_webgpu/draw.cpp` (`DrawPipeline`), `renderer.cpp` (`WarmModules`) |
 | Vertex data | Every attribute decoded to `float32x4` on the CPU per buffer generation (shaders read vec4 floats; WebGPU cannot feed integer formats to them) | `gta4_webgpu/vertex_decode.h`, `resources.cpp` |
 | Render targets | Single-sampled; resolved depth stored as `rg32float` (depth, stencil), with packed A8R8G8B8 aliases rebuilt on demand; resolves pick the latest surface at the same EDRAM placement, and map samples when its MSAA layout differs from the resolved view (`resolve_color`) | `gta4_webgpu/resources.cpp`, `passes.cpp`, `renderer.cpp` |
@@ -409,6 +416,9 @@ mapped); this file is for whoever continues the work.
 | Main loop | `-sPROXY_TO_PTHREAD`; COOP/COEP needed (`tools/web/serve.py`) | `gta4-recomp/CMakeLists.txt` |
 | Fused multiply-add | musl's software `fma` replaced by relaxed SIMD `f64x2.relaxed_madd` (module needs relaxed SIMD) | `gta4-recomp/src/web/web_fma.cpp` |
 | Multi-object waits | Block on a global signal epoch (futex) instead of 1 ms polling; timer queue uses a blocking wait | `src/core/threading_posix.cpp`, `src/core/timer_queue.cpp` |
+| Allocator | `-sMALLOC=mimalloc` (per-thread heaps; dlmalloc's lock stalled draw capture and the renderer). It sits on emmalloc, which also takes memory from `sbrk` and never lowers the break, so the guest region stays valid | `gta4-recomp/CMakeLists.txt` |
+| Host clock | `CLOCK_MONOTONIC` counted in nanoseconds at a fixed 1 GHz: browsers report 1000 ns from `clock_getres`, which made guest time run ~1000x fast | `src/core/clock_posix.cpp` |
+| XMA kicks | On the web a context kick decodes on the kicking thread instead of waking the decoder thread and waiting (worker path kept while paused) | `src/audio/xma_decoder.cpp` |
 | Apple-only bridges, community MP | Report unavailable / not built on web | `gta4-recomp/src/web/web_platform_bridges.cpp` |
 
 ## Rebuilding (cloud session gotchas)
@@ -462,8 +472,9 @@ ninja -C out/web LibertyRecomp rex-web-memory-test
   glslangValidator and spirv-opt in `/usr/local/bin`; `zstandard` needs a venv
   (Homebrew Python is externally managed). The full run takes about 2 minutes.
   To change only the WGSL layer of an existing archive, follow
-  `split_uniforms.py`/`draw_constants.py`: each converts an archive in place
-  to the next format version.
+  `split_uniforms.py`/`draw_constants.py`/`hot_constants.py`: each converts
+  an archive in place to the next format version (`hot_constants.py` makes
+  `LRWGSL05`); `spirv_to_wgsl.py` applies all of them when it builds one.
 - **Logs:** nothing at info level is printed without `--diagnostics=true`.
 
 ## Testing with game files
@@ -519,8 +530,18 @@ node out/web-node/LibertyRecomp/LibertyRecomp.js --diagnostics=true \
 - The draw trace logs each draw's stencil state
   (`stencil=enable/func/ref/mask/writemask ops=fail,depthfail,pass`); resolves
   log the requested/owner MSAA sample types, and handoffs their policy.
+- `--webgpu_gpu_timing=true` (with `--webgpu_perf_report`) adds GPU busy and
+  idle time a frame and the costliest render passes; `--audio_perf_report=true`
+  logs the guest mixer's frames (938 per 5 s is real time) and XMA decode time.
+- Driving Chrome for measurements: start a separate instance
+  (`--user-data-dir=<scratch>/profile --remote-debugging-port=9333
+  --enable-webgpu-developer-features`), serve with `tools/web/serve.py`, and
+  open `http://localhost:8080/?arg=...` over the DevTools protocol, logging
+  `Runtime.consoleAPICalled`; dispatch one mouse click so audio starts. Navigate
+  the tab to `about:blank` afterwards: a page left running keeps the game
+  going at ~400% CPU and skews builds and later runs.
 - Shader hashes map to WGSL in the archive; the archive format is
-  `LRWGSL04` (zlib) with per-record hash, stage, variant and code, which a short
+  `LRWGSL05` (zlib) with per-record hash, stage, variant and code, which a short
   Python script can unpack to read a shader.
 
 ## Known gaps
@@ -595,9 +616,15 @@ node out/web-node/LibertyRecomp/LibertyRecomp.js --diagnostics=true \
   window's longest frame (render-thread busy and pipeline time in it), GPU
   frame latency (submit to completion, as seen by the render thread) and how
   many presents waited for the GPU.
-- Chrome's audio now holds real time in heavy scenes, but underruns (5–22 per
-  5 s) while Chrome compiles a burst of new pipelines, worst with a cold
-  shader cache.
+  Measured since (CPU session of 2026-10-08): the benchmark table above
+  predates mimalloc, hot/cold constants and sampled timers. In Chrome the
+  heavy intro scenes (~6,000–7,300 draws) run ~24–27 fps and gameplay ~13–20
+  fps at 2,600–7,500 draws; both are CPU-bound.
+- Audio: with the XMA kick and clock fixes the guest mixer held real time in
+  the Chrome run checked afterwards (median 938 of 938 frames per 5 s; a few
+  windows down to ~730), and the user reports clean cutscene audio. Earlier
+  runs also underran while Chrome compiled a burst of new pipelines, worst
+  with a cold shader cache; not rechecked since.
 - The opening cutscene skipped to gameplay once in Chrome (first run after
   an archive change) and could not be reproduced; cause unknown (Where it
   stands › Chrome recheck 2026-10-08).
@@ -628,11 +655,9 @@ node out/web-node/LibertyRecomp/LibertyRecomp.js --diagnostics=true \
    shader modules made ahead of use; draws share render passes (~28 a frame).
    The per-draw uniform bind-group call is gone (constants by
    `firstInstance`, under Where it stands).
-   Chrome is GPU-bound in heavy scenes (10–12 fps at 7,600–8,800 draws, GPU
-   frame latency 85–100 ms; Where it stands › Chrome recheck 2026-10-08), so
-   next is GPU time: profile a heavy frame on the GPU (Xcode's Metal capture
-   of Chrome's GPU process, or timestamp queries) before cutting more CPU.
-   Later: close the fidelity gaps above.
+   If the GPU does become the limit, the costliest pass is the 1024x768
+   RGBA16F one (pixel shader 7B14CAC2A31D4199). Later: close the fidelity
+   gaps above.
 2. **In-browser game files.** A file or folder picker (File System Access API /
    OPFS), mounted so the existing `gta4::install::Install()` can read it;
    reuse the non-interactive install path in `GTA4App::OnFinalizePaths`. Files
@@ -640,6 +665,7 @@ node out/web-node/LibertyRecomp/LibertyRecomp.js --diagnostics=true \
    already stream an installed game from `serve.py`; the lazy mount in
    `res/web/index.html` is a model for this.)
 3. **Audio, input and page lifecycle.** Audio holds real time in Chrome
-   except during pipeline-compile bursts; the one-off intro skip is still
-   open. Then pointer lock (a DevTools-protocol click got `WrongDocumentError`;
+   after the XMA kick and clock fixes (pipeline-compile bursts not rechecked);
+   the one-off intro skip is still open. `--webgpu_early_frame_ack` is
+   experimental and off; retest it before enabling. Then pointer lock (a DevTools-protocol click got `WrongDocumentError`;
    not checked with a real click) and fullscreen.
