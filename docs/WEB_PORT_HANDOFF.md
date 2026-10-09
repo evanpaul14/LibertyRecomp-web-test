@@ -111,8 +111,9 @@ mapped); this file is for whoever continues the work.
   benchmark the longest frame of any 5 s window fell from 490–860 ms to at most
   ~170 ms, with pipeline time in it ≤ 10 ms; few draws wait (at most 7 a frame
   in a window, while ~45 new pipelines arrive) and the frame dumps show no
-  visible gaps. Per-draw cost is unchanged. Not yet checked in Chrome, where the
-  same costs land in the GPU process instead of the render thread.
+  visible gaps. Per-draw cost is unchanged. In Chrome the same costs land in
+  the GPU process instead of the render thread (checked since: see the Chrome
+  rechecks below).
 - **Pass merging and per-draw overhead (2026-10-07, after d7069cff).** A V8
   CPU profile of the render thread (`node --cpu-prof`; the build keeps wasm
   function names) showed the "untimed" per-draw time was mostly render passes
@@ -129,7 +130,7 @@ mapped); this file is for whoever continues the work.
   quad and UP conversions reuse scratch buffers. Measured under Node with a
   busy machine (a video call running), so only roughly: ~10–15% less
   render-thread time a draw with the timers still on; frame dumps unchanged
-  and no GPU errors. Not checked in Chrome yet.
+  and no GPU errors. Checked in Chrome since (Chrome recheck 2026-10-07).
   What remains a draw (Node profile): about half is calls into JavaScript;
   the largest is the uniform `SetBindGroup` (~1 µs, one a draw because vertex
   constants change on almost every draw), then the draw call (~0.9 µs). Removing
@@ -322,7 +323,8 @@ mapped); this file is for whoever continues the work.
     measured since).
   - *Experimental:* `--webgpu_early_frame_ack` (off) acknowledges a frame to
     the title at capture instead of at execution. Measured only before the
-    XMA fix: somewhat better audio, no clear fps change.
+    XMA fix: somewhat better audio, no clear fps change. Rechecked after it
+    (Chrome check of recipes below): no consistent gain; it stays off.
   - *Where the time goes now (Chrome, ~4,900 draws):* render worker ~60% busy
     and the title's render (capturing) thread ~60% busy, each waiting on the
     other part of the time; the capturing thread spends ~1.8 s of 5 s in a
@@ -341,10 +343,42 @@ mapped); this file is for whoever continues the work.
   under Node (Dawn on Metal, 4-minute intro runs): run 1 created ~280
   pipelines with up to 10 draws a frame waiting; run 2 compiled all 281
   recipes in its first 5 s (0 failed), then created no new pipelines and no
-  draw waited. Not yet measured in Chrome, where the cold-cache compiles
-  (1.5–5 s each) are the real target; look for the `pipeline recipes` perf
-  line. The idea came from reading a scraped GTA V web client; no code was
-  taken from it.
+  draw waited. The idea came from reading a scraped GTA V web client; no code
+  was taken from it.
+- **Chrome check of recipes, seed and early frame ack (2026-10-08, build of
+  e01de6ba).** Chrome 154, M1 Mac, flags as in the earlier rechecks, runs of
+  330 s (the intro ends and gameplay starts at ~310 s), driven over the
+  DevTools protocol (scratchpad script; fresh or kept `--user-data-dir`, a
+  click at 3 s, console to a file, a screenshot every 15 s).
+  - *Seed:* recorded under Node from an empty recipe file for 12 minutes,
+    through the intro into gameplay on the docks (61.6 KB, ~310 recipes),
+    and copied to `out/web/LibertyRecomp/pipeline_seed.bin` (not checked
+    in; the older 4-minute seed is beside it as `pipeline_seed_intro4min.bin`).
+  - *Results:*
+
+    | Run | Live pipelines | Recipes compiled | Frames x draws waiting | Max pipeline latency |
+    |---|---|---|---|---|
+    | Fresh profile, no seed | 319 | – | 6,532 (10 windows) | 491 ms |
+    | Same profile reloaded (IndexedDB) | 1 | 318 by 8 s, 0 failed | 884 (first window only) | 9 ms |
+    | Fresh profile, seed served | 12 | 308 by 8 s, 0 failed | 1,792 (first window only) | 302 ms |
+
+    The only waiting left is in the first 5 s, before the recipes are ready.
+  - *Not covered: a truly cold GPU cache.* macOS keeps a Metal shader cache
+    per app (`$(getconf DARWIN_USER_CACHE_DIR)com.google.Chrome.helper/com.apple.metal`),
+    shared by every Chrome profile, so a fresh profile no longer reproduces
+    the 1.5–5 s compiles once the archive's shaders have run once. To test
+    the first visit after an archive change, move that cache (and
+    `com.apple.metalfe`) aside with Chrome closed, or use a separate Chrome
+    build such as Chrome for Testing (not installed). Not done this session.
+  - *Early frame ack:* four runs on the warm profile, alternating off/on.
+    Heavy intro windows (≥4,000 draws, 160–310 s): off 21.5 and 22.9 fps
+    (8.6 and 8.4 µs a draw), on 24.8 and 22.7 fps (8.0 and 9.2 µs); silent
+    audio frames off 111 and 573, on 763 and 478; one 548 ms frame with it
+    on. Run-to-run spread is as large as any difference, so it stays off.
+  - *Audio:* every run underruns at the start of gameplay (~315 s, 750–860
+    frames per 5 s for 10–20 s) with no pipelines compiling: likely the
+    first gameplay streaming. Elsewhere the mixer holds 935–945 frames.
+  - The intro played through in every run (no skip).
 - **Node graphics session (Dawn on Metal, M1 Mac, 2026-10-07).**
   - *Fixed: black loading screens.* Emscripten has no `CLOCK_MONOTONIC_RAW`;
     `clock_getres`/`clock_gettime` failed and, with asserts compiled out, the
@@ -554,7 +588,14 @@ node out/web-node/LibertyRecomp/LibertyRecomp.js --diagnostics=true \
   open `http://localhost:8080/?arg=...` over the DevTools protocol, logging
   `Runtime.consoleAPICalled`; dispatch one mouse click so audio starts. Navigate
   the tab to `about:blank` afterwards: a page left running keeps the game
-  going at ~400% CPU and skews builds and later runs.
+  going at ~400% CPU and skews builds and later runs. Also pass
+  `--disable-background-timer-throttling --disable-renderer-backgrounding
+  --disable-backgrounding-occluded-windows` so a covered window is not
+  throttled. Single runs of the same build differ by ~10–15% in heavy-scene
+  fps, so compare settings with alternating repeats (off, on, off, on), and
+  keep the window untouched. A fresh `--user-data-dir` empties IndexedDB and
+  Chrome's own caches but not macOS's Metal shader cache (see Chrome check of
+  recipes).
 - Shader hashes map to WGSL in the archive; the archive format is
   `LRWGSL05` (zlib) with per-record hash, stage, variant and code, which a short
   Python script can unpack to read a shader.
@@ -625,8 +666,9 @@ node out/web-node/LibertyRecomp/LibertyRecomp.js --diagnostics=true \
   takes 1.5–5 s to compile each new pipeline, so their draws are missing for
   that long and the guest audio mixer falls behind meanwhile (Where it stands
   › Chrome recheck 2026-10-08). Pipeline recipes (Where it stands) now compile
-  pipelines seen in earlier runs ahead of their first draw; not yet measured
-  in Chrome.
+  pipelines seen in earlier runs ahead of their first draw: in Chrome no draw
+  waits after the first 8 s, on a reload or with the seed. A first visit with
+  a cold Metal cache is not measured yet.
   At most two frames are in flight on the GPU (`TrackGpuFrame`): a present
   waits for an earlier frame to finish, so the render thread cannot queue
   frames behind slow GPU work. The perf report's second line gives the
@@ -664,11 +706,9 @@ node out/web-node/LibertyRecomp/LibertyRecomp.js --diagnostics=true \
    gameplay (not only the intro) with the new tools, find what the title's
    threads wait on, cut per-draw render-worker cost (bind-group calls, hash
    lookups, `Work` allocation), and the capture cost on the title's thread.
-   First, check pipeline recipes in Chrome: load the page twice with
-   `--webgpu_perf_report=true` and compare draws waiting and audio underruns
-   in the opening shots; a fresh profile with `pipeline_seed.bin` served
-   tests the cold-cache case (record a longer seed under Node, through
-   gameplay, with `--webgpu_pipeline_recipe_file`).
+   Pipeline recipes and the seed are checked in Chrome (Where it stands ›
+   Chrome check of recipes); still open is the cold-Metal-cache first visit,
+   which needs the user's go-ahead to move Chrome's Metal cache aside.
    The older notes below predate that session.
    The renderer is done as a title-command
    renderer (the same interface the desktop gta4-native and gta4-metal
@@ -696,6 +736,8 @@ node out/web-node/LibertyRecomp/LibertyRecomp.js --diagnostics=true \
    `res/web/index.html` is a model for this.)
 3. **Audio, input and page lifecycle.** Audio holds real time in Chrome
    after the XMA kick and clock fixes (pipeline-compile bursts not rechecked);
-   the one-off intro skip is still open. `--webgpu_early_frame_ack` is
-   experimental and off; retest it before enabling. Then pointer lock (a DevTools-protocol click got `WrongDocumentError`;
+   the one-off intro skip is still open (not seen in 7 runs since). Audio
+   underruns for 10–20 s at the start of gameplay in every run; worth a
+   look. `--webgpu_early_frame_ack` was retested in Chrome and showed no
+   consistent gain, so it stays off. Then pointer lock (a DevTools-protocol click got `WrongDocumentError`;
    not checked with a real click) and fullscreen.

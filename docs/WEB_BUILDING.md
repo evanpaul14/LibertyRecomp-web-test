@@ -180,7 +180,12 @@ and compiled ahead, before their first draw, from the same per-frame budget
 browser keeps them in IndexedDB (database `liberty-webgpu`) and merges in
 `pipeline_seed.bin` from next to the page when it exists
 (`--webgpu_pipeline_seed_url`); Node test builds use
-`--webgpu_pipeline_recipe_file=<path>`, which is also how a seed is recorded.
+`--webgpu_pipeline_recipe_file=<path>`, which is also how a seed is recorded:
+run the Node build from an empty file through the intro into gameplay (about
+12 minutes with Dawn on Metal) and copy the file next to the page as
+`pipeline_seed.bin`. The seed is not checked in. A missing seed is simply
+skipped; to run without it, point `--webgpu_pipeline_seed_url` at a file that
+does not exist (an empty value is a command-line error).
 `--webgpu_pipeline_recipes=false` turns this off.
 With a traced frame, `--webgpu_trace_pixel=X,Y` logs every draw that changed
 that texel of its first color target, and `--webgpu_skip_pixel_shader=HASH,...`
@@ -290,15 +295,21 @@ Working:
   or GPU errors. Gameplay is playable: walking and driving around Liberty City
   works. Before the per-draw work of 2026-10-07, light scenes ran at 40–59 fps,
   the heaviest cutscene stretch (about 6,000 draws a frame) at 3–6 fps and
-  gameplay at about 3–10 fps. Measured on 2026-10-08 (with Chrome's shader
-  cache warm): light scenes hold 52–60 fps, scenes of about 4,000 draws run at
-  17–19 fps and the heaviest intro shots (7,600–8,800 draws) at 10–12 fps,
-  limited by the GPU (frame latency 85–100 ms); no GPU errors. Pipelines are
+  gameplay at about 3–10 fps. Measured late on 2026-10-08 (with Chrome's
+  shader cache warm): light scenes hold 60 fps and the heavy intro shots
+  (about 5,000–8,500 draws) run at about 21–26 fps, limited by the CPU (the
+  render worker and the title's capturing thread), not the GPU; no GPU
+  errors. Pipelines are
   created asynchronously, so the first run after the shader archive changes
   no longer stalls, but it compiles for longer: new pipelines take 1.5–5 s
   each, and the opening shots stutter while they do. Pipelines seen in
-  earlier runs are now compiled ahead (pipeline recipes, above); not yet
-  measured in Chrome.
+  earlier runs are now compiled ahead (pipeline recipes, above). In Chrome
+  (2026-10-08) a reload compiles all ~320 recipes in its first 8 s, after
+  which no draw waits for a pipeline for the whole intro; a fresh profile
+  with the seed served does the same and creates only ~12 pipelines live
+  (319 without the seed). These runs had macOS's Metal shader cache warm
+  (it is shared by every Chrome profile), so they do not show a first visit
+  after the shader archive changes.
 - **Intro skip (seen once).** On the first Chrome run after the archive
   changed, the opening cutscene ended about 30 s in and the game went straight
   to gameplay on the docks. A second run (warm cache) and a run with a fresh
