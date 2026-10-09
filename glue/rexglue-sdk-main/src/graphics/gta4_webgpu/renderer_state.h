@@ -82,6 +82,8 @@ struct Pipeline {
   // Null while an asynchronous creation is pending, or after it failed.
   wgpu::RenderPipeline pipeline;
   bool failed = false;
+  // Compiled ahead from a recipe and not drawn with yet.
+  bool ahead = false;
   wgpu::BindGroupLayout textures;  // Group 1; null when the shaders sample nothing.
   uint32_t texture_mask = 0, cube_mask = 0, sampler_mask = 0;
 };
@@ -251,9 +253,25 @@ struct Renderer::State {
                          uint32_t specialization, uint32_t topology, uint32_t strip_format,
                          const InputLayout& inputs, uint32_t requested_colors, uint32_t used,
                          std::string& error);
+  // Builds the pipeline that `key` (DrawPipeline's layout) describes.
+  // `ahead`: from a saved recipe, ahead of its first draw (always asynchronous).
+  Pipeline* CreatePipeline(const Words& key, const ShaderRecord& vertex, const ShaderRecord* pixel,
+                           bool ahead, std::string& error);
   const InputLayout* Inputs(const ShaderRecord& vertex, uint32_t declaration,
                             const std::vector<gta4_native::VertexElement>& elements, bool up,
                             uint32_t bound_streams, std::string& error);
+
+  // --- pipeline_recipes.cpp ---
+  // Pipeline keys seen in earlier runs (recipes), compiled ahead between
+  // frames so their first draws need not wait: a browser compiles a new
+  // pipeline in 1.5-5 s while its shader cache is cold.
+  void LoadRecipes();
+  // Takes loaded recipes in, and starts some of them until `deadline` (ms).
+  void PrecompileRecipes(double deadline);
+  void ParseRecipes(std::span<const uint8_t> bytes);
+  void RecordRecipe(const Words& key);
+  // Writes new recipes out (at most every few seconds unless `now`).
+  void SaveRecipes(bool now = false);
 
   // --- passes.cpp ---
   bool Resolve(const Work& work, std::string& error);
@@ -353,6 +371,15 @@ struct Renderer::State {
   // knows its entry is gone.
   uint64_t pipeline_generation = 0;
   std::unordered_map<std::string, wgpu::RenderPipeline> utility_pipelines;
+  // Recipes: loaded and waiting to be compiled, every key known (loaded or
+  // recorded), and how many are recorded but not saved.
+  std::deque<Words> recipe_queue;
+  std::unordered_map<Words, uint32_t, WordsHash> recipes_known;  // Key -> order seen.
+  std::vector<const Words*> recipe_order;  // Into recipes_known, in the order seen.
+  uint32_t recipes_unsaved = 0;
+  uint32_t recipes_in_flight = 0;
+  bool recipes_loading = false;
+  double recipes_saved_ms = 0;
   std::unordered_map<Words, wgpu::Sampler, WordsHash> samplers;
   // Samplers by raw fetch constant and texture mip count, ahead of decoding
   // the fetch into `samplers`' key.
@@ -445,6 +472,8 @@ struct Renderer::State {
     uint32_t waiting_draws = 0, pipelines_ready = 0, pipelines_failed = 0;
     double pipeline_latency_ms = 0, pipeline_latency_max_ms = 0;
     uint32_t warmed_modules = 0;
+    // Recipes started, compiled, failed, and drawn with.
+    uint32_t recipes_started = 0, recipes_ready = 0, recipes_failed = 0, recipes_used = 0;
     double warmup_ms = 0;
     // New uniform slots written, by ConstantPart, and shared.
     std::array<uint32_t, 4> part_slots{};

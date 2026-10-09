@@ -106,6 +106,8 @@ Pipeline* Renderer::State::DrawPipeline(
     uint32_t strip_format, const InputLayout& inputs, uint32_t requested_colors, uint32_t used,
     std::string& error) {
   (void)specialization;
+  // The key holds everything CreatePipeline needs (a saved recipe is a key);
+  // keep the two in step and bump kRecipeVersion when this layout changes.
   const uint32_t texture_mask = vertex.texture_mask | (pixel ? pixel->texture_mask : 0);
   const uint32_t cube_mask = vertex.cube_mask | (pixel ? pixel->cube_mask : 0);
   const uint32_t sampler_mask = vertex.sampler_mask | (pixel ? pixel->sampler_mask : 0);
@@ -135,9 +137,82 @@ Pipeline* Renderer::State::DrawPipeline(
   }
   key.push_back(fixed.cull_mode);
   key.insert(key.end(), inputs.key.begin(), inputs.key.end());
-  if (auto found = pipelines.find(key); found != pipelines.end()) return &found->second;
+  if (auto found = pipelines.find(key); found != pipelines.end()) {
+    if (found->second.ahead) {
+      found->second.ahead = false;
+      ++timing.recipes_used;
+    }
+    return &found->second;
+  }
+  return CreatePipeline(key, vertex, pixel, false, error);
+}
+
+Pipeline* Renderer::State::CreatePipeline(const Words& key, const ShaderRecord& vertex,
+                                          const ShaderRecord* pixel, bool ahead,
+                                          std::string& error) {
+  // Decode the key (DrawPipeline's layout).
+  constexpr size_t kColorWords = 10;
+  constexpr size_t kAfterColors = kColorWords + 2 * kRenderTargetCount;
+  const auto malformed = [&] {
+    error = "Malformed pipeline key";
+    return nullptr;
+  };
+  if (key.size() < kAfterColors + 5) return malformed();
+  const bool late = key[4] != 0;
+  const uint32_t topology = key[5], strip_format = key[6];
+  const uint32_t texture_mask = key[7], cube_mask = key[8], sampler_mask = key[9];
+  std::array<wgpu::TextureFormat, kRenderTargetCount> color_formats{};
+  FixedState fixed{};
+  for (uint32_t i = 0; i < kRenderTargetCount; ++i) {
+    color_formats[i] = wgpu::TextureFormat(key[kColorWords + 2 * i]);
+    fixed.blend_controls[i] = key[kColorWords + 2 * i + 1];
+  }
+  size_t at = kAfterColors;
+  fixed.color_write_mask = key[at++];
+  ++at;  // Requested colors: only part of the key.
+  const uint32_t used = key[at++];
+  const auto depth_format = wgpu::TextureFormat(key[at++]);
+  if (used & kUsesDepth) {
+    if (key.size() < at + 19) return malformed();
+    for (uint32_t* field :
+         {&fixed.depth_enable, &fixed.depth_function, &fixed.depth_write_enable,
+          &fixed.stencil_enable, &fixed.stencil_function, &fixed.stencil_fail,
+          &fixed.stencil_depth_fail, &fixed.stencil_pass, &fixed.two_sided_stencil,
+          &fixed.ccw_stencil_function, &fixed.ccw_stencil_fail, &fixed.ccw_stencil_depth_fail,
+          &fixed.ccw_stencil_pass, &fixed.stencil_mask, &fixed.stencil_write_mask})
+      *field = key[at++];
+    fixed.depth_bias_enable = key[at++] != 0;
+    fixed.depth_bias_bits = key[at++];
+    fixed.slope_scaled_depth_bias_bits = key[at++];
+  }
+  fixed.cull_mode = key[at++];
+  // The input layout: per buffer its stride, (location, offset) pairs and an
+  // end marker; every attribute is float32x4.
+  std::vector<wgpu::VertexBufferLayout> buffers;
+  std::vector<std::vector<wgpu::VertexAttribute>> attributes;
+  while (at < key.size()) {
+    wgpu::VertexBufferLayout buffer{};
+    buffer.arrayStride = key[at++];
+    buffer.stepMode = wgpu::VertexStepMode::Vertex;
+    std::vector<wgpu::VertexAttribute> list;
+    while (at + 1 < key.size() && key[at] != 0xFFFFFFFFu) {
+      list.push_back({nullptr, wgpu::VertexFormat::Float32x4, key[at + 1], key[at]});
+      at += 2;
+    }
+    if (at >= key.size() || key[at] != 0xFFFFFFFFu) return malformed();
+    ++at;
+    buffers.push_back(buffer);
+    attributes.push_back(std::move(list));
+  }
+  if (buffers.size() > limits.maxVertexBuffers) return malformed();
+  for (size_t i = 0; i < buffers.size(); ++i) {
+    buffers[i].attributeCount = attributes[i].size();
+    buffers[i].attributes = attributes[i].data();
+  }
+
   RareTimer timer(timing.pipeline_ms);
-  ++timing.new_pipelines;
+  if (ahead) ++timing.recipes_started;
+  else ++timing.new_pipelines;
 
   auto vertex_module = Module(vertex, false, error);
   wgpu::ShaderModule pixel_module;
@@ -148,6 +223,7 @@ Pipeline* Renderer::State::DrawPipeline(
   result.texture_mask = texture_mask;
   result.cube_mask = cube_mask;
   result.sampler_mask = sampler_mask;
+  result.ahead = ahead;
   std::vector<wgpu::BindGroupLayout> groups{constants_layout};
   if (texture_mask | sampler_mask) {
     result.textures = TextureLayout(texture_mask, cube_mask, sampler_mask);
@@ -157,11 +233,6 @@ Pipeline* Renderer::State::DrawPipeline(
   layout.bindGroupLayoutCount = groups.size();
   layout.bindGroupLayouts = groups.data();
 
-  std::vector<wgpu::VertexBufferLayout> buffers = inputs.layouts;
-  for (size_t i = 0; i < buffers.size(); ++i) {
-    buffers[i].attributeCount = inputs.attributes[i].size();
-    buffers[i].attributes = inputs.attributes[i].data();
-  }
   wgpu::RenderPipelineDescriptor descriptor{};
   const std::string label = fmt::format("title {:016X}/{:016X}", vertex.hash,
                                         pixel ? pixel->hash : 0);
@@ -181,9 +252,9 @@ Pipeline* Renderer::State::DrawPipeline(
       cull.front_face_clockwise ? wgpu::FrontFace::CW : wgpu::FrontFace::CCW;
 
   wgpu::DepthStencilState depth{};
-  if (targets.depth && !(used & kUsesDepth)) {
+  if (depth_format != wgpu::TextureFormat::Undefined && !(used & kUsesDepth)) {
     // Attached for the pass's other draws; this one leaves it alone.
-    depth.format = targets.depth->format;
+    depth.format = depth_format;
     depth.depthWriteEnabled = wgpu::OptionalBool::False;
     depth.depthCompare = wgpu::CompareFunction::Always;
     depth.stencilFront = depth.stencilBack = {
@@ -191,8 +262,8 @@ Pipeline* Renderer::State::DrawPipeline(
         wgpu::StencilOperation::Keep, wgpu::StencilOperation::Keep};
     depth.stencilReadMask = depth.stencilWriteMask = 0;
     descriptor.depthStencil = &depth;
-  } else if (targets.depth) {
-    depth.format = targets.depth->format;
+  } else if (depth_format != wgpu::TextureFormat::Undefined) {
+    depth.format = depth_format;
     depth.depthWriteEnabled = fixed.depth_enable && fixed.depth_write_enable
                                   ? wgpu::OptionalBool::True
                                   : wgpu::OptionalBool::False;
@@ -227,16 +298,15 @@ Pipeline* Renderer::State::DrawPipeline(
   std::array<wgpu::BlendState, kRenderTargetCount> blends{};
   uint32_t color_count = 0;
   for (uint32_t i = 0; i < kRenderTargetCount; ++i) {
-    const auto& surface = targets.colors[i];
-    if (!surface) continue;
+    if (color_formats[i] == wgpu::TextureFormat::Undefined) continue;
     color_count = i + 1;
-    colors[i].format = surface->format;
+    colors[i].format = color_formats[i];
     const uint32_t write = (pixel && (used & (1u << i)))
                                ? NativeColorWriteMaskForTarget(fixed.color_write_mask, i)
                                : 0;
     colors[i].writeMask = wgpu::ColorWriteMask(write);
     if (!write || !IsNativeBlendControlEnabled(fixed.blend_controls[i]) ||
-        !Blendable(surface->format, float32_blendable))
+        !Blendable(color_formats[i], float32_blendable))
       continue;
     const auto blend = DecodeNativeBlendControl(fixed.blend_controls[i]);
     auto& state = blends[i];
@@ -269,31 +339,48 @@ Pipeline* Renderer::State::DrawPipeline(
   if (pipelines.size() >= 8192) {
     pipelines.clear();
     ++pipeline_generation;
+    recipes_in_flight = 0;  // Their callbacks see the new generation.
     pass_state.pipeline = nullptr;  // A new pipeline could reuse the handle.
   }
-  if (!REXCVAR_GET(webgpu_async_pipelines) || trace) {
+  if (!ahead && (!REXCVAR_GET(webgpu_async_pipelines) || trace)) {
     result.pipeline = device.CreateRenderPipeline(&descriptor);
+    if (result.pipeline) RecordRecipe(key);
     return &pipelines.emplace(key, std::move(result)).first->second;
   }
   // A synchronous creation stalls everything after it (in the browser, the
   // GPU process compiles it before later commands; under Node, this thread
   // waits), so draws using it are skipped until the callback brings it.
   Pipeline* entry = &pipelines.emplace(key, std::move(result)).first->second;
+  if (ahead) ++recipes_in_flight;
   device.CreateRenderPipelineAsync(
       &descriptor, wgpu::CallbackMode::AllowSpontaneous,
-      [this, entry, generation = pipeline_generation, requested = emscripten_get_now(), label](
+      [this, entry, generation = pipeline_generation, requested = emscripten_get_now(), label,
+       ahead, recipe = ahead ? Words{} : key](
           wgpu::CreatePipelineAsyncStatus status, wgpu::RenderPipeline created,
           wgpu::StringView message) {
         // The cache was cleared since (or the renderer is shutting down).
         if (status == wgpu::CreatePipelineAsyncStatus::CallbackCancelled ||
             generation != pipeline_generation)
           return;
+        if (ahead) {
+          // Kept out of the draw-pipeline latency figures.
+          --recipes_in_flight;
+          if (status == wgpu::CreatePipelineAsyncStatus::Success && created) {
+            entry->pipeline = std::move(created);
+            ++timing.recipes_ready;
+          } else {
+            entry->failed = true;
+            ++timing.recipes_failed;
+          }
+          return;
+        }
         const double latency = emscripten_get_now() - requested;
         timing.pipeline_latency_ms += latency;
         timing.pipeline_latency_max_ms = std::max(timing.pipeline_latency_max_ms, latency);
         if (status == wgpu::CreatePipelineAsyncStatus::Success && created) {
           entry->pipeline = std::move(created);
           ++timing.pipelines_ready;
+          if (!recipe.empty()) RecordRecipe(recipe);
           return;
         }
         entry->failed = true;

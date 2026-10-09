@@ -174,6 +174,14 @@ pipeline is ready (`--webgpu_async_pipelines=false` creates them synchronously;
 a traced frame always does). Shader modules for registered shaders are created
 ahead of their first draw, `--webgpu_shader_warmup_ms` (default 4) of
 render-thread time a frame, mostly during the first loading screens.
+Pipelines are also remembered between runs as recipes (their full state keys)
+and compiled ahead, before their first draw, from the same per-frame budget
+(at most `--webgpu_pipeline_recipes_in_flight`, default 4, at once). The
+browser keeps them in IndexedDB (database `liberty-webgpu`) and merges in
+`pipeline_seed.bin` from next to the page when it exists
+(`--webgpu_pipeline_seed_url`); Node test builds use
+`--webgpu_pipeline_recipe_file=<path>`, which is also how a seed is recorded.
+`--webgpu_pipeline_recipes=false` turns this off.
 With a traced frame, `--webgpu_trace_pixel=X,Y` logs every draw that changed
 that texel of its first color target, and `--webgpu_skip_pixel_shader=HASH,...`
 drops draws by pixel shader, to see what an effect contributes.
@@ -288,7 +296,9 @@ Working:
   limited by the GPU (frame latency 85–100 ms); no GPU errors. Pipelines are
   created asynchronously, so the first run after the shader archive changes
   no longer stalls, but it compiles for longer: new pipelines take 1.5–5 s
-  each, and the opening shots stutter while they do.
+  each, and the opening shots stutter while they do. Pipelines seen in
+  earlier runs are now compiled ahead (pipeline recipes, above); not yet
+  measured in Chrome.
 - **Intro skip (seen once).** On the first Chrome run after the archive
   changed, the opening cutscene ended about 30 s in and the game went straight
   to gameplay on the docks. A second run (warm cache) and a run with a fresh

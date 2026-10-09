@@ -330,6 +330,21 @@ mapped); this file is for whoever continues the work.
     thread's next frame. Per draw on the render worker: `Draw` itself, the
     WebGPU calls (~2.2 a draw, mostly the texture bind group), `Work`
     destruction, and hash lookups for pipelines and bind groups.
+- **Pipeline recipes (2026-10-08).** Every title pipeline's state key is
+  saved (`pipeline_recipes.cpp`) and compiled ahead in later runs, so draws
+  stop waiting for pipelines that earlier runs already met. `DrawPipeline`
+  only builds the key now; `CreatePipeline` builds the descriptor from the key
+  alone, so a saved key and a live draw take the same path (bump
+  `kRecipeVersion` when the key layout changes). Storage: IndexedDB in the
+  browser plus an optional served `pipeline_seed.bin` (for a cold first
+  visit), or a file under Node (`--webgpu_pipeline_recipe_file`). Measured
+  under Node (Dawn on Metal, 4-minute intro runs): run 1 created ~280
+  pipelines with up to 10 draws a frame waiting; run 2 compiled all 281
+  recipes in its first 5 s (0 failed), then created no new pipelines and no
+  draw waited. Not yet measured in Chrome, where the cold-cache compiles
+  (1.5–5 s each) are the real target; look for the `pipeline recipes` perf
+  line. The idea came from reading a scraped GTA V web client; no code was
+  taken from it.
 - **Node graphics session (Dawn on Metal, M1 Mac, 2026-10-07).**
   - *Fixed: black loading screens.* Emscripten has no `CLOCK_MONOTONIC_RAW`;
     `clock_getres`/`clock_gettime` failed and, with asserts compiled out, the
@@ -408,7 +423,7 @@ mapped); this file is for whoever continues the work.
 | GPU | Statically linked WebGPU title-command renderer (no `dlopen` on web); created in `GTA4App::OnPreSetup`. `--gpu_plugin=none` = headless | `src/graphics/gta4_webgpu/`, `include/rex/graphics/gta4_webgpu.h`, `gta4-recomp/src/gta4_app.cpp` |
 | GPU threading | One render pthread owns the device and runs from the JS event loop (needed for `mapAsync` and canvas presentation), woken via `emscripten_proxy_async`; at most two frames are in flight on the GPU (`TrackGpuFrame`); after each present it yields with a `MessageChannel` message, since a proxied wake can run in the same task and the canvas only updates when the task ends. Game threads capture device block/buffers/textures at submit (`Capture` in `graphics_system.cpp`) | `gta4_webgpu/graphics_system.cpp`, `work.h` |
 | Shaders | Stock SPIR-V → GLSL (SPIRV-Cross) → rewrite BDA constants to one UBO (VS 0, PS 4096, shared 8192, spec word 8192+0x500) and bindless to fixed slots → glslang → spirv-opt → naga → WGSL, then split the UBO into three parts (VS, PS, shared + spec word 0x500) read from one group-0 storage buffer at register indices from a two-register per-draw record (`firstInstance` → `instance_index`; the pixel stage's half goes to the pixel shader in a flat varying at location 18); each stage's registers 0–15 have their own hot slot (register r reads `hot + r` below 16, `cold + r` above); dynamic register reads go through `xc_load`. naga undoes the Vulkan y-flip itself. Archive `LRWGSL05` | `tools/webgpu/spirv_to_wgsl.py`, `split_uniforms.py`, `draw_constants.py`, `hot_constants.py`, `LibertyRecompLib/shader/webgpu_shader_archive.bin` |
-| Pipelines | Title pipelines by full state key, created with `CreateRenderPipelineAsync`; draws are skipped while pending (`--webgpu_async_pipelines`). Shader modules for registered shaders are made between frames (`WarmModules`, `--webgpu_shader_warmup_ms`), since module creation is synchronous. Utility-pass pipelines stay synchronous | `gta4_webgpu/draw.cpp` (`DrawPipeline`), `renderer.cpp` (`WarmModules`) |
+| Pipelines | Title pipelines by full state key, created with `CreateRenderPipelineAsync`; draws are skipped while pending (`--webgpu_async_pipelines`). Shader modules for registered shaders are made between frames (`WarmModules`, `--webgpu_shader_warmup_ms`), since module creation is synchronous. Keys seen in earlier runs (recipes: IndexedDB, a served seed, or a file under Node) are compiled ahead from the same budget. Utility-pass pipelines stay synchronous | `gta4_webgpu/draw.cpp` (`DrawPipeline`, `CreatePipeline`), `renderer.cpp` (`WarmModules`), `pipeline_recipes.cpp` |
 | Vertex data | Every attribute decoded to `float32x4` on the CPU per buffer generation (shaders read vec4 floats; WebGPU cannot feed integer formats to them) | `gta4_webgpu/vertex_decode.h`, `resources.cpp` |
 | Render targets | Single-sampled; resolved depth stored as `rg32float` (depth, stencil), with packed A8R8G8B8 aliases rebuilt on demand; resolves pick the latest surface at the same EDRAM placement, and map samples when its MSAA layout differs from the resolved view (`resolve_color`) | `gta4_webgpu/resources.cpp`, `passes.cpp`, `renderer.cpp` |
 | Depth handoff | Depth from the resolved snapshot (`source_texture`); `kRebuildSceneCoverage` clears stencil to 0x80 and writes 0xFF via stencil Replace where packed depth is nonzero, as the Metal renderer | `gta4_webgpu/passes.cpp` (`Handoff`) |
@@ -609,7 +624,9 @@ node out/web-node/LibertyRecomp/LibertyRecomp.js --diagnostics=true \
   ≤ 140 ms with the render thread busy ≤ 111 ms of it), but a cold cache still
   takes 1.5–5 s to compile each new pipeline, so their draws are missing for
   that long and the guest audio mixer falls behind meanwhile (Where it stands
-  › Chrome recheck 2026-10-08).
+  › Chrome recheck 2026-10-08). Pipeline recipes (Where it stands) now compile
+  pipelines seen in earlier runs ahead of their first draw; not yet measured
+  in Chrome.
   At most two frames are in flight on the GPU (`TrackGpuFrame`): a present
   waits for an earlier frame to finish, so the render thread cannot queue
   frames behind slow GPU work. The perf report's second line gives the
@@ -624,7 +641,8 @@ node out/web-node/LibertyRecomp/LibertyRecomp.js --diagnostics=true \
   the Chrome run checked afterwards (median 938 of 938 frames per 5 s; a few
   windows down to ~730), and the user reports clean cutscene audio. Earlier
   runs also underran while Chrome compiled a burst of new pipelines, worst
-  with a cold shader cache; not rechecked since.
+  with a cold shader cache; not rechecked since (pipeline recipes should
+  shorten those bursts on later runs).
 - The opening cutscene skipped to gameplay once in Chrome (first run after
   an archive change) and could not be reproduced; cause unknown (Where it
   stands › Chrome recheck 2026-10-08).
@@ -646,19 +664,31 @@ node out/web-node/LibertyRecomp/LibertyRecomp.js --diagnostics=true \
    gameplay (not only the intro) with the new tools, find what the title's
    threads wait on, cut per-draw render-worker cost (bind-group calls, hash
    lookups, `Work` allocation), and the capture cost on the title's thread.
+   First, check pipeline recipes in Chrome: load the page twice with
+   `--webgpu_perf_report=true` and compare draws waiting and audio underruns
+   in the opening shots; a fresh profile with `pipeline_seed.bin` served
+   tests the cold-cache case (record a longer seed under Node, through
+   gameplay, with `--webgpu_pipeline_recipe_file`).
    The older notes below predate that session.
    The renderer is done as a title-command
    renderer (the same interface the desktop gta4-native and gta4-metal
    renderers use, not Xenos emulation), and Chrome renders the intro correctly
    (see above). Per-draw cost is down to ~10 µs (Node, Dawn on Metal; see
    Known gaps › Performance), and pipelines are created asynchronously with
-   shader modules made ahead of use; draws share render passes (~28 a frame).
+   shader modules made ahead of use and pipelines from earlier runs compiled
+   ahead (recipes); draws share render passes (~28 a frame).
    The per-draw uniform bind-group call is gone (constants by
    `firstInstance`, under Where it stands).
    If the GPU does become the limit, the costliest pass is the 1024x768
    RGBA16F one (pixel shader 7B14CAC2A31D4199). Later: close the fidelity
    gaps above.
-2. **In-browser game files.** A file or folder picker (File System Access API /
+2. **In-browser game files.** On hold: the user prefers serving the
+   installed folder with `serve.py` as now. Note for later: the page's main
+   thread does every file read (Emscripten's JS filesystem lives there, and
+   reads are synchronous XHR with a byte-by-byte `responseText` decode), so
+   it competes with logging, input and SDL's audio callback. If that shows up
+   in profiles, move reads to an IO worker that game threads wait on through
+   shared memory. A file or folder picker (File System Access API /
    OPFS), mounted so the existing `gta4::install::Install()` can read it;
    reuse the non-interactive install path in `GTA4App::OnFinalizePaths`. Files
    are 7–8 GB, so stream them rather than preloading into MEMFS. (Local runs

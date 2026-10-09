@@ -399,6 +399,13 @@ Renderer::Status Renderer::State::Present(const Work& work, std::string& error) 
                       timing.part_slots[kPixelCold], timing.shared_slots, timing.redrawn,
                       timing.set_pipeline / draws, timing.set_group / draws,
                       timing.set_vertex / draws, timing.set_index / draws, timing.set_state / draws);
+      if (!recipe_queue.empty() || recipes_in_flight || timing.recipes_started ||
+          timing.recipes_used)
+        WEBGPU_PERF_LOG("gta4-webgpu: pipeline recipes started={} ready={} failed={} drawn={} "
+                        "queued={} compiling={} known={}",
+                        timing.recipes_started, timing.recipes_ready, timing.recipes_failed,
+                        timing.recipes_used, recipe_queue.size(), recipes_in_flight,
+                        recipes_known.size());
       WEBGPU_PERF_LOG("gta4-webgpu: presents shown={} new-content={} no-source={} no-canvas={} "
                       "no-surface-texture={} (status {}); canvas {}x{}; frontbuffer {:08X} "
                       "({}, {}x{}, serial {}); gpu errors {}",

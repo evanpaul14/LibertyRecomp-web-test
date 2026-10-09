@@ -296,6 +296,7 @@ void Renderer::Initialize(std::function<void(bool, const std::string&)> done) {
               device.GetLimits(&s.limits);
               s.InitializeDevice();
               s.ready = true;
+              s.LoadRecipes();
               wgpu::AdapterInfo info{};
               s.adapter.GetInfo(&info);
               REXLOG_INFO("gta4-webgpu: device ready; adapter='{}' '{}' depth={} bc={}",
@@ -575,6 +576,9 @@ void Renderer::State::WarmModules() {
   const double budget = REXCVAR_GET(webgpu_shader_warmup_ms);
   if (budget <= 0 || !ready) return;
   const double start = emscripten_get_now();
+  // Recipes first: they come in the order earlier runs drew with them, and
+  // make the modules they need.
+  PrecompileRecipes(start + budget);
   std::string error;
   for (auto* queue : {&module_queue, &late_module_queue}) {
     const bool late = queue == &late_module_queue;
@@ -816,6 +820,7 @@ Renderer::Status Renderer::Execute(Work& work, std::string& error) {
       return Status::kDone;
     }
     case CommandType::kDeviceDestroyed:
+      s.SaveRecipes(true);
       s.Flush(error);
       s.ClearResources();
       s.shaders.clear();

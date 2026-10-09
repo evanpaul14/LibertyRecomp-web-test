@@ -152,6 +152,7 @@ if(EMSCRIPTEN)
     add_library(rex-gta4-webgpu STATIC
         gta4_webgpu/canvas.cpp
         gta4_webgpu/draw.cpp
+        gta4_webgpu/pipeline_recipes.cpp
         gta4_webgpu/graphics_system.cpp
         gta4_webgpu/passes.cpp
         gta4_webgpu/renderer.cpp

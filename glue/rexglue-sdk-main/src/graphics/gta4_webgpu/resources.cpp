@@ -563,6 +563,7 @@ void Renderer::State::ClearResources() {
 void Renderer::State::BeginFrame() {
   ++frame;
   WarmModules();
+  SaveRecipes();
   std::erase_if(texture_groups,
                 [&](const auto& entry) { return frame - entry.second.second > kGroupRetainFrames; });
   // Freed ranges are reused by later queue writes, which run after every
